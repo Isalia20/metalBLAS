@@ -761,6 +761,7 @@ using namespace mpp::tensor_ops;
 #define RELAXED     __RELAXED__
 #define SWIZZLE_LOG __SWIZZLE_LOG__
 #define MN_ALIGNED  __MN_ALIGNED__
+#define STATIC_SLICE __STATIC_SLICE__
 
 kernel void m5_tensor_gemm(
     device IN_T   *A   [[buffer(0)]],
@@ -799,25 +800,61 @@ kernel void m5_tensor_gemm(
     int m_off = tgy * BM;
     int n_off = tgx * BN;
 
+#if STATIC_SLICE
+    // Non-transposed fast path.  Give matmul2d *static-extent* tile slices so
+    // it knows each interior tile is exactly BM x BN and fully in-bounds; it
+    // then drops the per-tile edge/predication logic the dynamic slice() path
+    // emits unconditionally.  Apple's MPPTensorOpsMatMul2d.h recommends this
+    // "inside threadgroup" fast path (it calls it static_slice; the real
+    // spelling is the templated slice<E0,E1>).  Measured: a broad win — 2048³
+    // 0.97→1.00, 4097³ 0.98→1.07, 1023³ 1.15→1.20, with no precision change
+    // (matmul2d still accumulates the K-reduction in fp32 internally).
+  #if !MN_ALIGNED
+    // Partial edge tiles (only exist when M%BM or N%BN != 0): fall back to a
+    // dynamic slice with the per-element validity mask.  Interior tiles — the
+    // vast majority for any large shape — still take the static path below.
+    bool inside = (m_off + BM <= gM) && (n_off + BN <= gN);
+    if (!inside) {
+        auto mA = tA.slice(0, m_off);
+        auto mB = tB.slice(n_off, 0);
+        auto mC = tC.slice(n_off, m_off);
+        auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+        op.run(mA, mB, cT_f32);
+        auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
+        for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
+            if (cT_f32.is_valid_element(i)) cT_out[i] = (OUT_T)cT_f32[i];
+        cT_out.store(mC);
+        return;
+    }
+  #endif
+    auto mA = tA.slice<dynamic_extent, BM>(0, m_off);
+    auto mB = tB.slice<BN, dynamic_extent>(n_off, 0);
+    auto mC = tC.slice<BN, BM>(n_off, m_off);
+    auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+    op.run(mA, mB, cT_f32);
+    auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
+    for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
+        cT_out[i] = (OUT_T)cT_f32[i];
+    cT_out.store(mC);
+#else
+    // Transposed operands keep the dynamic-slice path: the static slice<>
+    // extent order would need the transposed layout, and this orientation is
+    // off the hot path (auto-dispatch routes transposed inputs to m5_gemm).
     auto mA = tA.slice(0, m_off);
     auto mB = tB.slice(n_off, 0);
     auto mC = tC.slice(n_off, m_off);
-
     auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
     op.run(mA, mB, cT_f32);
-
-    // Convert to OUT_T cooperative tensor and store.  When the kernel is
-    // compiled for MN_ALIGNED inputs we skip the per-element validity check
-    // — every slot maps to a valid output position, so no branch is needed.
     auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
-#if MN_ALIGNED
+  #if MN_ALIGNED
     for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
         cT_out[i] = (OUT_T)cT_f32[i];
-#else
+  #else
     for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
         if (cT_f32.is_valid_element(i)) cT_out[i] = (OUT_T)cT_f32[i];
-#endif
+  #endif
     cT_out.store(mC);
+#endif
 }
 """
 
@@ -886,13 +923,20 @@ using namespace metal;
 #define OUT_T       __OUT_T__
 #define BLOCK_N     __BLOCK_N__
 #define NWARPS      __NWARPS__
+#define VEC         __VEC__
 
-// Memory-bandwidth bound GEMV with coalesced reads.
+// Memory-bandwidth bound GEMV with coalesced, cache-line-wide reads.
 //   B is K x N row-major; we compute y[n] = sum_k B[k, n] * x[k].
-//   - Each threadgroup handles BLOCK_N consecutive cols (== 32 cols, one per lane).
-//   - NWARPS simdgroups split the K dimension; each lane accumulates locally.
-//   - Per-thread accumulators are summed via threadgroup-shared reduction.
+//   - Each lane owns VEC consecutive columns; a warp's 32 lanes read
+//     32*VEC = BLOCK_N consecutive elements per k.  With VEC=2 (bf16) that is
+//     a full 128-B cache line, so each line is consumed by exactly one
+//     threadgroup — no half-line waste / cross-TG re-fetch (the residual that
+//     left the K>=4096 band 0.87-0.97x).  VEC=1 reproduces the old 32-col,
+//     half-line layout (best when N is small and we need every TG for occupancy).
+//   - NWARPS simdgroups split the K dimension; partials reduced in tgroup mem.
 //   - Reads at fixed k are CONSECUTIVE across lanes (perfect coalescing).
+struct alignas(sizeof(IN_T) * VEC) VecT { IN_T v[VEC]; };
+
 kernel void gemv_t(
     device const IN_T   *B   [[buffer(0)]],
     device const IN_T   *x   [[buffer(1)]],
@@ -904,41 +948,72 @@ kernel void gemv_t(
     uint         sgid        [[simdgroup_index_in_threadgroup]],
     uint         lane        [[thread_index_in_simdgroup]])
 {
-    static_assert(BLOCK_N == 32, "BLOCK_N must equal SG_WIDTH = 32");
+    static_assert(BLOCK_N == 32 * VEC, "BLOCK_N must equal 32*VEC");
     threadgroup ACC_T partials[NWARPS][BLOCK_N];
 
     int col0 = int(tgid.x) * BLOCK_N;
-    int n    = col0 + int(lane);
-    bool n_valid = (n < gN);
+    int n0   = col0 + int(lane) * VEC;     // first column this lane owns
 
     // Distribute K across warps: warp `sgid` handles k in [start, end) striding 1.
     int k_per_warp = (gK + NWARPS - 1) / NWARPS;
     int k_start    = int(sgid) * k_per_warp;
     int k_end      = min(gK, k_start + k_per_warp);
 
-    ACC_T acc = (ACC_T)0;
-    if (n_valid) {
+    ACC_T acc[VEC];
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) acc[i] = (ACC_T)0;
+
+    bool full = (n0 + VEC) <= gN;
+    if (full) {
+        // Vectorized full-line path: one aligned VEC-wide load per k, 4x unrolled.
         int k = k_start;
-        // 4-way unroll
         for (; k + 4 <= k_end; k += 4) {
-            acc += (ACC_T)B[(k+0) * gLdb + n] * (ACC_T)x[k+0];
-            acc += (ACC_T)B[(k+1) * gLdb + n] * (ACC_T)x[k+1];
-            acc += (ACC_T)B[(k+2) * gLdb + n] * (ACC_T)x[k+2];
-            acc += (ACC_T)B[(k+3) * gLdb + n] * (ACC_T)x[k+3];
+            VecT b0 = *((const device VecT*)(&B[(k+0) * gLdb + n0]));
+            VecT b1 = *((const device VecT*)(&B[(k+1) * gLdb + n0]));
+            VecT b2 = *((const device VecT*)(&B[(k+2) * gLdb + n0]));
+            VecT b3 = *((const device VecT*)(&B[(k+3) * gLdb + n0]));
+            ACC_T x0 = (ACC_T)x[k+0], x1 = (ACC_T)x[k+1];
+            ACC_T x2 = (ACC_T)x[k+2], x3 = (ACC_T)x[k+3];
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) {
+                acc[i] += (ACC_T)b0.v[i] * x0;
+                acc[i] += (ACC_T)b1.v[i] * x1;
+                acc[i] += (ACC_T)b2.v[i] * x2;
+                acc[i] += (ACC_T)b3.v[i] * x3;
+            }
         }
         for (; k < k_end; ++k) {
-            acc += (ACC_T)B[k * gLdb + n] * (ACC_T)x[k];
+            VecT bv = *((const device VecT*)(&B[k * gLdb + n0]));
+            ACC_T xk = (ACC_T)x[k];
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) acc[i] += (ACC_T)bv.v[i] * xk;
+        }
+    } else {
+        // Edge block: scalar with per-column bounds (handles non-VEC-aligned N).
+        for (int k = k_start; k < k_end; ++k) {
+            ACC_T xk = (ACC_T)x[k];
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) {
+                int n = n0 + i;
+                if (n < gN) acc[i] += (ACC_T)B[k * gLdb + n] * xk;
+            }
         }
     }
-    partials[sgid][lane] = acc;
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) partials[sgid][int(lane) * VEC + i] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First warp aggregates the partials.
+    // First warp aggregates the partials; each lane writes its VEC columns.
     if (sgid == 0) {
-        ACC_T s = (ACC_T)0;
         #pragma unroll
-        for (int w = 0; w < NWARPS; ++w) s += partials[w][lane];
-        if (n_valid) y[n] = (OUT_T)s;
+        for (int i = 0; i < VEC; ++i) {
+            int c = int(lane) * VEC + i;
+            ACC_T s = (ACC_T)0;
+            #pragma unroll
+            for (int w = 0; w < NWARPS; ++w) s += partials[w][c];
+            int n = col0 + c;
+            if (n < gN) y[n] = (OUT_T)s;
+        }
     }
 }
 """
@@ -1015,6 +1090,10 @@ def m5_tensor_gemm(in_t: str, out_t: str,
                    relaxed: bool = True,
                    swizzle_log: int = 0,
                    mn_aligned: bool = False):
+    # Static-extent tile slices are only correct/used for the non-transposed
+    # orientation (the only one auto-dispatch routes here); transposed keeps
+    # the dynamic-slice path.
+    static_slice = (not trans_a) and (not trans_b)
     src = _subst(
         M5_TENSOR_GEMM_SRC,
         IN_T=in_t, OUT_T=out_t,
@@ -1024,6 +1103,7 @@ def m5_tensor_gemm(in_t: str, out_t: str,
         RELAXED=("true" if relaxed else "false"),
         SWIZZLE_LOG=swizzle_log,
         MN_ALIGNED=int(mn_aligned),
+        STATIC_SLICE=int(static_slice),
     )
     lib = _compile(src)
     return lib.m5_tensor_gemm, src
@@ -1037,7 +1117,10 @@ def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int
 
 
 @functools.lru_cache(maxsize=None)
-def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4):
+def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4,
+           VEC: int = 1):
+    # Each lane owns VEC columns, so a threadgroup spans BLOCK_N == 32*VEC cols.
+    assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
     src = _subst(GEMV_T_SRC, IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 BLOCK_N=BLOCK_N, NWARPS=NWARPS)
+                 BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC)
     return _compile(src).gemv_t, src
