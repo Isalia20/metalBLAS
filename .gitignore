@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+reproduce.md
+temp.md
+
+# private dev notes — kept locally, never published
+optimizations_done.md
+followup.md

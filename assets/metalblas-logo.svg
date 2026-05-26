@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" width="760" height="220"
+     font-family="'Helvetica Neue',Arial,sans-serif">
+  <defs>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f7fa"/><stop offset=".18" stop-color="#cdd7e1"/>
+      <stop offset=".5" stop-color="#8a97a6"/><stop offset=".52" stop-color="#7b8898"/>
+      <stop offset=".82" stop-color="#b9c4cf"/><stop offset="1" stop-color="#e6edf3"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e2e9f0"/><stop offset="1" stop-color="#97a4b2"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#54a6ff"/><stop offset="1" stop-color="#0a84ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="760" height="220" rx="28" fill="#0d1117"/>
+
+  <!-- 3x3 matrix mark; diagonal in Apple system blue -->
+  <g>
+    <rect x="52"  y="48"  width="36" height="36" rx="9" fill="url(#accent)"/>
+    <rect x="96"  y="48"  width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="140" y="48"  width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="52"  y="92"  width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="96"  y="92"  width="36" height="36" rx="9" fill="url(#accent)"/>
+    <rect x="140" y="92"  width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="52"  y="136" width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="96"  y="136" width="36" height="36" rx="9" fill="url(#tile)"/>
+    <rect x="140" y="136" width="36" height="36" rx="9" fill="url(#accent)"/>
+  </g>
+
+  <text x="210" y="122" font-size="76" letter-spacing="-2">
+    <tspan fill="#9fb0c0" font-weight="500">metal</tspan><tspan fill="url(#accent)" font-weight="800">BLAS</tspan>
+  </text>
+  <text x="214" y="160" font-size="17" fill="#6a7682" font-weight="600" letter-spacing="4">HIGH-PERFORMANCE METAL GEMM</text>
+</svg>
