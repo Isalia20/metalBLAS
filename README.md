@@ -63,6 +63,13 @@ tests/       test_basic.py
 
 ## Running
 
+Install the package and its single dependency (PyTorch 2.12+):
+
+```bash
+uv venv
+pip install -e .
+```
+
 ```bash
 python tests/test_basic.py
 python bench/bench_matmul.py --dtype bf16

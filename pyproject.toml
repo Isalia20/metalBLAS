@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metalblas"
+version = "0.1.0"
+description = "Hand-tuned Metal matmul kernels for Apple Silicon, callable from PyTorch on mps."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Irakli Salia", email = "irakli.salia854@gmail.com" }]
+keywords = ["metal", "mps", "matmul", "gemm", "apple-silicon", "pytorch"]
+dependencies = ["torch>=2.12"]
+
+[project.urls]
+Homepage = "https://github.com/Isalia20/metalBLAS"
+Repository = "https://github.com/Isalia20/metalBLAS.git"
+
+[tool.setuptools]
+packages = ["metalblas"]
+
+[tool.setuptools.package-data]
+metalblas = ["shaders/*.h", "shaders/*.metal"]
