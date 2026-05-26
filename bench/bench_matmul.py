@@ -11,32 +11,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import metalblas
 
 
-def bench(M, N, K, dtype, fn, iters=200, warmup=50):
+def bench(M, N, K, dtype, fn, iters=100, trials=10, warmup=50):
     torch.manual_seed(0)
     a = torch.randn(M, K, device='mps', dtype=dtype)
     b = torch.randn(K, N, device='mps', dtype=dtype)
     for _ in range(warmup):
         c = fn(a, b)
     torch.mps.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        c = fn(a, b)
-    torch.mps.synchronize()
-    t1 = time.perf_counter()
-    sec = (t1 - t0) / iters
+    best = float('inf')
+    for _ in range(trials):
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            c = fn(a, b)
+        torch.mps.synchronize()
+        t1 = time.perf_counter()
+        sec = (t1 - t0) / iters
+        if sec < best:
+            best = sec
     flops = 2.0 * M * N * K
-    tflops = flops / sec / 1e12
-    return sec, tflops
+    tflops = flops / best / 1e12
+    return best, tflops
 
 
-def run(shapes: List[Tuple[int, int, int]], dtype: torch.dtype, *, label: str = ""):
+def run(shapes: List[Tuple[int, int, int]], dtype: torch.dtype, *, label: str = "", cool: float = 0.0):
     print(f"\n=== {label}  dtype={dtype} ===")
     print(f"{'M':>5} {'N':>5} {'K':>5} | {'torch ms':>9} {'TFLOPS':>7} | {'mb ms':>9} {'TFLOPS':>7} | speedup")
     print("-" * 80)
     speedups = []
     for (M, N, K) in shapes:
+        if cool > 0:
+            time.sleep(cool)
         torch_s, torch_t = bench(M, N, K, dtype, torch.matmul)
         try:
+            if cool > 0:
+                time.sleep(cool)
             mb_s, mb_t = bench(M, N, K, dtype, metalblas.matmul)
             ratio = torch_s / mb_s
             speedups.append(ratio)
@@ -69,6 +77,8 @@ def main():
     p.add_argument("--dtype", default="all", choices=["fp32", "fp16", "bf16", "all"])
     p.add_argument("--group", default="all",
                    choices=list(SHAPES.keys()) + ["all"])
+    p.add_argument("--cool", type=float, default=0.0,
+                   help="Seconds to sleep before each bench() call to let the GPU cool")
     args = p.parse_args()
 
     dtypes = []
@@ -80,7 +90,7 @@ def main():
 
     for dt in dtypes:
         for g in groups:
-            run(SHAPES[g], dt, label=g)
+            run(SHAPES[g], dt, label=g, cool=args.cool)
 
 
 if __name__ == "__main__":
