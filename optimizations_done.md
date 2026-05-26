@@ -1,5 +1,252 @@
 # GEMM optimization notes
 
+## Session 11 — small-batch decode (2≤M≤63): the M≥64 gate that hid a 0.45× regime
+
+Goal: benchmark bf16 across real LLM-inference shapes (decode / batched decode /
+prefill / attention for Llama-3-8B, Qwen2.5-7B, Llama-3-70B) and fix what loses.
+The suite was parity-or-better almost everywhere (overall median 1.03×, 33/45 at
+≥0.99×) with **one clear loser: small-batch decode at M=16** — Llama-8B o_proj
+0.45×, down_proj 0.49×, qkv 0.70×, gate/up 0.79× (group median 0.60×).
+
+**Root cause — an untuned dispatch gate, not a kernel limit.** Two `M >= 64`
+gates (the lean contiguous fast path and the `backend=="auto"` branch) routed
+*every* 2≤M≤63 GEMM to the manual ALU `m5` kernel instead of the tensor-coprocessor
+`m5_tensor` path. M==1 was fine (it has its own GEMV path) and M≥64 was fine
+(already `m5_tensor` + autotuner), so only the small-batched-M band fell through —
+exactly the regime that serves a handful of concurrent decode sequences. Prior
+sessions tuned M==1 GEMV and large-M thin-N exhaustively but never this band, so
+it was never measured. Forcing `backend="m5_tensor"` confirmed the kernel handles
+small M correctly and faster (o_proj M=16 0.46→0.72× with the default tile).
+
+**The tile crossover (isolated sweep, speedup vs torch).** Why 0.72× and not
+parity: the *default* picker hands M<N large shapes `(64,64,2)`, which at M=16
+throws away 48 of every 64 MMA rows. A short BM the few rows nearly fill is the
+fix, and the best BM flips at M≈32:
+
+| shape          | M  | (16,64,2) | (32,64,2) | (32,128,4) | (64,64,2) |
+| -------------- | -- | --------- | --------- | ---------- | --------- |
+| o_proj 4096²   | 16 | **1.01×** | 0.96×     | 0.98×      | 0.74×     |
+| o_proj 4096²   | 48 | 0.86×     | **1.13×** | 1.10×      | 0.89×     |
+| down 4096×14336| 16 | **1.05×** | 1.03×     | 1.04×      | 0.77×     |
+| down 4096×14336| 48 | 0.91×     | **1.21×** | 1.16×      | 0.95×     |
+
+M≤16 wants BM=16 (exact — 1 M-fragment, FM=16); 32≤M≤48 wants BM=32 (covers M in
+one tile without over-splitting). The same thin-dimension underfill as thin-N,
+now on the M axis (see Session 10 / the private-16×16×16 ceiling) — but here the
+short-BM tiles reach parity, so it is *not* at that ceiling.
+
+**The fix (3 edits, all `dispatch.py`).**
+- Lowered both `M >= 64` gates to **`M >= 2`** (M==1 still returns earlier via the
+  GEMV path; the `packed_ab` guard still pins non-contiguous inputs to `m5`, so
+  correctness is unchanged).
+- `_pick_m5_tensor_tile`: a **thin-M branch** (`M≤48 and N≥1024` → `(16,64,2)` if
+  M≤16 else `(32,64,2)`), mirroring the M==1 padded-GEMV BM=16 logic. Gated on N
+  being the wide axis so thin-N (large M, small N) keeps its tall-narrow BN=32 path.
+- `_m5_tensor_tile_candidates`: in the `mn≤256 and mx≥1024` regime, when `mn≤48`
+  prepend `[(16,64,2),(32,64,2),(32,128,4)]` so the autotuner probes the short-BM
+  family and picks the per-shape winner (this is what gets the *full* win, not the
+  0.72× the static default gave).
+
+**Results.** M=16 group **0.60× → 1.04× median** (o_proj 0.45→1.00, qkv 0.70→1.05,
+gate/up 0.79→1.07, down 0.49→1.04). The whole bf16 suite: median **1.03→1.05×**,
+shapes at ≥0.99× **33/45 → 39/45**, worst case **0.45× → 0.90×**. Everything else
+is unchanged within noise — M=1 decode 1.04–1.06×, M=64 1.15×, prefill M=512/2048
+0.99–1.04× (3 models), attention 1.01× (the residual sub-0.99 are now *only* the
+thin-K/N attention shapes, A@V s≥2048 ~0.90×, the documented coprocessor ceiling).
+
+**Verified.** All 58 correctness tests pass. Precision is **bit-identical** old vs
+new: fp32 small-M went `m5`→`m5_tensor`, both TF32-relaxed (e.g. fp32 M=16 4096²
+max_err 0.2517 on both); bf16/fp16 unchanged. M≥64 routing is byte-for-byte
+unchanged (the thin-M picker branch is `M≤48`, and `mn≤48` adds no candidates at
+M=64). Benchmark harness in `agent_space/` (out of repo).
+
+## Session 10 — disassembled MPSGraph (the thin-N root cause) + conv2d/N=32 wins
+
+Goal: close the residual large-M thin-N gap (N=64/128, ~0.76-0.88x).  Per user
+direction, this session DISASSEMBLED what torch.matmul (MPSGraph) actually runs,
+to find why it wins, then shipped the genuine metal gains the finding enabled.
+
+**The disassembly (definitive root cause).**  Captured the live dispatch with a
+DYLD-injected Metal pipeline spy (swizzles `newComputePipelineStateWithDescriptor`
++ the encoder's `setComputePipelineState`/`dispatchThreadgroups` on the venv
+python, which is adhoc/linker-signed so DYLD_INSERT works) and disassembled the
+kernel with `metal-objdump --arch-name=air64` on `MPSNDArray.framework`'s 75 MB
+`default.metallib`.  torch.matmul -> MPSGraph -> kernel **`gemm_a18`** -> templated
+`gemm<float,bfloat,...>`.  Tile **(BM=64, BN=32, NSG=2)** (triangulated: every
+shape has exactly BM*BN=2048 output elems/tile, 64 threads/tg), used uniformly for
+thin-N AND the 4096^3 square.  **The decisive instruction is
+`air.simdgroup_matrix_16x16x16_multiply_accumulate`** (601 calls; bf16 sig
+`(<8 x bfloat> A, i1 transA, <8 x bfloat> B, i1 transB, <8 x float> C) -> <8 x
+float>`) -- a 16x16x16 MMA, the M5 coprocessor's native op.  It uses ZERO
+`matmul2d`.
+
+**Why we can't copy it.**  The 16x16x16 intrinsic is not in the public Metal API:
+MSL `simdgroup_matrix` is hardcoded to 8x8 (`_valid_simdgroup_matrix_size`; only
+`__metal_simdgroup_matrix_8x8_*` builtins exist), and 8x8 is the ALU path (~6 TF
+on 4096^3 vs matmul2d's 25 -- it does NOT use the coprocessor).  asm-label
+injection of the air intrinsic fails (the Metal lexer rejects dots in asm strings;
+and asm labels resolve to LINK symbols, not frontend-lowered intrinsics -- a
+dotless label compiles but fails link).  `torch.mps` only accepts MSL source
+(`_mps_compileShader`); no custom-metallib loader.  So `matmul2d` (16x**32**x16)
+is our only public coprocessor entry: it hits ~25 TF on the square (BN=64 = 2
+N-fragments) but caps ~22 TF at N=128 / ~13 TF at N=64 because a 1-fragment-wide
+N tile underfills.  MPS's 16x16x16 (FN=16) gets 2x the N-fragments at the same N
+(25 vs 22).  **The thin-N gap is a private Apple intrinsic, not a tiling trick.**
+Per user decision: accept this ceiling for N=128 and ship the gains below.
+
+**Gain 1 -- N=32 was catastrophic (0.5x), FIXED.**  Very-thin-N (N=32/48) fell
+through the `N>=64` auto-dispatch gate to the slow manual `m5` kernel (0.38-0.89x).
+Lowered both gates (lean fast path + auto) to **N>=32** so N=32/48 use the
+tensor-unit `m5_tensor` autotuner: 256x32x256 0.46->1.18x, 512x32x512 0.38->1.31x,
+1024x32x1024 0.89->2.50x, 4096x32x4096 0.52->0.78x, 8192x32x4096 0.65->0.78x.
+This is byte-for-byte unchanged for N>=64 (the gate was already satisfied there).
+
+**Gain 2 -- conv2d-1x1 path for very-thin-N.**  `convolution2d` is the OTHER public
+coprocessor entry (a 1x1 conv == GEMM, M as spatial width, N as output channels).
+Empirically it schedules thin output-channels a bit better than matmul2d does
+thin-N for N<=64 (4096x64x4096 0.79->0.84, N=32 ties m5_tensor; N>=96 still prefers
+matmul2d).  Added `conv1x1_gemm` (kernels.py; K baked into the conv descriptor as a
+constexpr, so specialized per K) + `_Conv1x1Plan`/`_is_conv_regime` (N<=64, N%32==0,
+M>=512)/`_conv_specs` (dispatch.py), wired into the autotuner alongside split-K:
+conv candidates are correctness-checked vs the single-pass primary and TIMED, kept
+only when they win, so this never regresses a shape matmul2d already nails.  conv
+narrows the thin-N gap but does not close it (the private 16x16x16 still wins).
+
+All 58 correctness tests pass; the giant-vocab GEMV / lm_head / llm / square wins
+all hold (guard bench unchanged within noise).  Remaining sub-0.99: N=128 thin-N
+(~0.83-0.94x, the matmul2d ceiling above) and 4095^3 (~0.96x, odd-dimension edge).
+
+## Session 9 — tall-narrow tiles for thin shapes + split-K for deep-K
+
+Goal: push the four residual sub-0.99x shapes from Session 8 to >=0.99x with real
+kernel work (no MPSGraph fallback).  Two new mechanisms landed; two shapes remain
+at the matmul2d primitive ceiling.
+
+**Tall-narrow tiles (fixes the thin shapes).** A sweep found thin shapes want a
+TALL-NARROW tile the candidate list never offered: BN=32 with a tall BM (or the
+mirror, BM=32 + wide BN) makes many small tiles where the square `(64,64,2)`
+underfills the few output tiles along the short axis.
+- `128x4096x4096` (thin M=128): 0.96 -> ~1.00x on `(128,32,2)`.
+- `256x4096x4096`: ~0.98x; `4096x256x4096`: ~1.00x (keeps `(64,64,2)` -- tall-narrow
+  is *bad* here at 0.87x, and the autotuner correctly avoids it).
+- `4096x128x4096` (thin N=128): 0.80 -> ~0.92x avg (0.88-0.97, high variance).
+  Still <0.99 -- this is the matmul2d microkernel ceiling for N=128 (see below).
+
+Implementation in `_m5_tensor_tile_candidates`: a thin regime (`min(M,N)<=256 and
+max>=1024`) offering both orientations `[(128,32,2),(256,32,4),(32,128,2),
+(32,256,4),(64,64,2)]`, and a deep-K-small regime (`max<=1024 and K>=8*max`)
+offering `[(128,32,4),(128,32,2),(192,32,2),...]`.  The best tile FLIPS with size
+(512^2x32768 -> (128,32,4); 1024^2x16384 -> (128,32,2)), so these are probed, not
+gated.  The wins are only ~1-2% over the square default, under the 3% autotune
+margin, so a `_TALL_NARROW_MARGIN=0.01` applies to these regimes (with doubled
+probe iters/reps so a 1% gap resolves above the noise; bad tiles in each family
+lose by 15-25%, far outside any tie).
+
+**Split-K (beats MPSGraph across the deep-K family).** A single `op.run` over the
+full K underfills the GPU when M,N are small (few output tiles) but K is huge:
+each of the few tiles carries a long serial K-reduction.  Split-K runs G K-chunks
+per output tile (G x the tiles, filling the cores) and reduces the partials.  The
+atomic-accumulation prototype lost to contention; the winning design writes each
+chunk's partial to its OWN buffer -- chunk 0 straight to C (bf16), chunks 1.. to
+fp32 planes -- then a cheap second pass does `C += sum(planes)`.  New shaders
+`splitk_gemm`/`splitk_reduce` (kernels.py), a `_SplitKPlan` class, and
+`_is_splitk_regime` (low-precision, `K>=2048`, `min(M,N)>=64`, `M*N<=1.5M`, and
+`min<=256 or K>=8*max` -- few output tiles) + `_splitk_specs` ((128,32,2)/(64,64,2)/
+(32,64,2) x G in {2,4}).  The autotuner times split-K candidates alongside the
+single-pass tiles (after a one-time check that the result matches the single-pass
+output within 2%, guarding chunk 0's extra bf16 rounding) and keeps whichever
+wins, so split-K is used ONLY where it helps -- two sub-cases:
+- *deep-K squares*: `256x256x32768` -> **1.90x**, `256x256x16384` -> **1.82x**
+  (MPSGraph badly underfills a tiny+deep output), `512x512x32768` 0.96 -> **0.99x**,
+  `512x512x16384` 0.96 -> 0.98x.  `768^2/1024^2/2048^2 x16384` use single-pass
+  (1.05-1.13x; split-K timed but not chosen).
+- *thin-N* (small N -> few n-tiles): `256x128x16384` -> **2.28x**, `512x128x8192`
+  -> **1.62x**, `1024x128x4096` -> **1.01x**, `2048x128x8192` 0.67 -> **0.81x**,
+  `2048x128x4096` 0.86 -> **0.91x**.  (The `M*N<=1.5M` cap is what now lets thin-N
+  in -- the earlier `max<=1024` cap, tuned for deep-K squares, wrongly excluded it.)
+
+The hot path stays lean: the cached plan is the `(fn, thr, grp)` tuple for the
+common single-pass tile (inlined), only the few-tile regime gets a `_SplitKPlan`
+(dispatched via a `type(plan) is tuple` check, ~0.05us).  58/58 correctness tests
+pass; small-shape parity (512^3, 333x444x555) unchanged.
+
+**What still loses: large-M thin-N, and 4095^3 (edge case).**  thin-N with LARGE M
+(`4096x128x4096` ~0.88x, `8192x128x4096` ~0.83x, `4096x128x8192` ~0.82x,
+`4096x64x4096` ~0.76x) stays under MPSGraph.  Split-K does NOT help here -- with
+large M there are already plenty of m-tiles to fill the cores, so the K-split adds
+only reduction overhead; the autotuner keeps single-pass.  A FULL tile sweep of
+`8192x128x4096` caps at 0.83x (20.6 TF) while MPSGraph hits 24.9 TF (near the
+~25.7 TF bf16 peak).  ~16 approaches were exhausted (Sessions 8-9): every tile;
+tall-narrow tiles; split-K (atomic + two-pass); the **transpose/C^T trick**
+(compute C^T=B^T@A^T in the faster thin-M orientation -- built correctly after
+deriving the transposed extents from the impl static_asserts, but it lands 0.917x,
+WORSE than direct: the transposed matmul2d reads cost more than the orientation
+saves, and C^T re-reads big A ~4x anyway); manual K-chunking; static-K;
+direct-bf16-store; swizzle; 1D/persistent grid; manual m5_gemm/simd_gemm
+(0.15-0.62x, ALU-bound).
+
+NB on framing (corrected): it is NOT that MPSGraph has a universally better
+tensor-engine kernel -- BOTH paths drive the same matrix engine, and we BEAT
+MPSGraph by up to 1.9x where its heuristic underfills (256^2x32768 it runs at only
+10.9 TF, 4096x64x4096 15.3 TF -- it doesn't split K, so cores sit idle).  Per-shape
+performance is a TILING/SCHEDULING-heuristic game, and MPSGraph's heuristic is
+sometimes worse (we win) and sometimes better (large-M thin-N, where it IS
+near-peak ~24.9 TF and we cap ~20.6 TF).  For large-M thin-N the honest statement
+is "I could not find a matmul2d tiling that matches MPSGraph," NOT "proven
+impossible."  A plausible-but-unverified cause is that a BN=32 tile is 1 N-fragment
+wide, giving matmul2d few independent MMA chains to overlap (a scheduling effect
+that would only bite narrow tiles -- consistent with us matching/winning wider
+shapes).  OPEN LEAD not yet tried: one threadgroup issuing several op.run calls to
+widen the effective tile / expose more ILP, register-blocking multiple tiles.
+4095^3 (~0.92x) is edge-bound: 4095 (odd) has no fragment-aligned divisor so
+partial edge tiles are unavoidable; our ALIGNED 4096-padded matmul alone (5.37ms)
+BEATS MPSGraph's 4095^3 (5.67ms) but the ~0.3-0.6ms pad-copy negates it.
+
+## Session 8 — the 11 followup regressions: wide-N GEMV, (128,64,4), and the kernel ceiling
+
+`followup.md` listed 11 bf16 shapes under MPSGraph. Fixed the impactful ones with
+genuine kernel/dispatch changes (no MPSGraph fallback — this is metalBLAS).
+
+**Wide-N GEMV (the two giant-vocab hits, 0.72x/0.84x).** The M==1, N>=4096 bf16/fp16
+path routed to a *padded* `m5_tensor` `(16,128,4)` tile that computes a 16-row MMA
+for one real row — 15/16 of the work thrown away. An isolated sweep showed the
+dedicated `gemv_t` with **VEC=8** (a full 16-byte/lane coalesced load) is the
+bandwidth winner across the *entire* N>=4096 band: 1.07x at N=4096 -> 1.16x at
+128256x14336, beating both MPSGraph and the padded tile. Fix: added `(8,8)`/`(8,16)`
+to `_GEMV_T_VARIANTS`, a VEC=8 tier in `_gemv_pick` (cols>=4096 & K>=2048: VEC=8,
+NWARPS=16 if K>=8192 else 8), and extended the contiguous fast path to send *all*
+M==1 through `gemv_t` (the padded m5_tensor branch is now only the
+non-contiguous/explicit-backend fallback). The whole M=1 N>=4096 band is now
+1.04-1.16x.
+
+**`(128,64,4)` — the missing large-shape tile (0.94-0.96x -> 1.01x).** A tall,
+narrow-BN tile none of the prior large candidates `[(64,64,2),(48,128,4),(64,128,4)]`
+offered. It is the winner for moderate square / llm shapes: 1024x4096x4096
+0.97->1.01, 1024x5120x13824 0.94->1.11 (isolated), lm_head 1024x152064x4096. Added
+to the large (`mx>1024`) candidate list.
+
+**Stable giant probe (lm_head 0.75x).** `_probe_params` top tier `(1,1,3)`->`(2,3,3)`.
+One timed iter on a ~50 ms kernel was too noisy to rank tiles and flipped lm_head
+between ~18.5 and ~21.5 TF run to run; the noisy probe sometimes shipped the 0.75x
+tile. Averaging 3 iters / min of 3 reps stabilizes the ranking (now always >1.0x).
+
+**`4095^3` (0.89x -> 0.94x).** Added `(128,128,8)` as a candidate for large
+non-64-divisible shapes (`mx>=2048 and not div64`). 4095 = 3^2*5*7*13 has no
+MMA-friendly divisor, so it always has partial edge tiles; the big tile amortizes
+the edge waste best. Still <1.0 (see ceiling below).
+
+**The ceiling (residual losers, all sub-ms or edge-bound).** `4096x128x4096`
+(~0.85x, thin N=128), `128x4096x4096` (~0.97x, thin M=128), `512x512x32768`
+(~0.96x, deep-K few-tile), `4095^3` (0.94x). These are at the genuine MPP
+`matmul2d` ceiling — ruled out by sweeping every tile, all three backends
+(m5_gemm/simd_gemm are 0.15-0.7x here), and a split-K prototype (fp32 atomic
+accumulation gives 0.956x on 512x512x32768, *no better* than non-split: atomic
+contention + accumulator bandwidth + the cast pass negate the occupancy gain).
+MPSGraph's edge here is its MMA microkernel/scheduling for few-tile and
+partial-edge shapes, not occupancy — beating it needs a better microkernel.
+NOTE: `4097^3` *wins* 1.14x with the same `(128,128,8)` tile; MPSGraph is just
+erratically fast at exactly 4095.
+
 ## Session 7 — the runtime tile autotuner (and 8192³, the loser hiding past 4096³)
 
 Starting state: `followups.md` listed five bf16 GEMM shapes still under torch —

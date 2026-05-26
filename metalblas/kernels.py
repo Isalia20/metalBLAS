@@ -860,6 +860,178 @@ kernel void m5_tensor_gemm(
 
 
 # ---------------------------------------------------------------------------
+# Split-K m5_tensor GEMM (for deep-K, few-tile shapes).
+#
+# A single op.run over the full K underfills the GPU when M,N are small (few
+# output tiles) but K is huge: each of the handful of tiles carries a very long
+# serial K-reduction.  Splitting K across G threadgroups per output tile gives
+# G x the tiles, filling the cores; the G partial sums are then reduced.  We
+# avoid the atomic-accumulation contention that sank an earlier prototype by
+# writing each chunk's partial to its OWN buffer (no contention) and summing in
+# a cheap second pass: chunk g==0 writes C directly (bf16), chunks g>=1 write
+# fp32 planes of Cp, and `reduce` does C += sum(planes).  Wins the deep-K band
+# (512x512x32768 0.96->0.99, 256x256x32768 1.9x where MPSGraph underfills,
+# 2048x2048x16384 1.04x); the dispatcher only routes deep-K here (see
+# _is_splitk_regime) and the autotuner confirms it beats the single-pass tile.
+# ---------------------------------------------------------------------------
+SPLITK_GEMM_SRC = r"""
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_cooperative_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+#define IN_T    __IN_T__
+#define OUT_T   __OUT_T__
+#define BM      __BM__
+#define BN      __BN__
+#define NSG     __NSG__
+#define KCHUNK  __KCHUNK__
+#define RELAXED __RELAXED__
+
+// tgid.z = K-chunk index g.  g==0 writes C (OUT_T) directly; g>=1 writes fp32
+// partial plane (g-1) of Cp.  Each tile's K range is [g*KCHUNK, (g+1)*KCHUNK).
+kernel void splitk_gemm(
+    device IN_T   *A   [[buffer(0)]],
+    device IN_T   *B   [[buffer(1)]],
+    device OUT_T  *C   [[buffer(2)]],
+    device float  *Cp  [[buffer(3)]],
+    constant int& gM   [[buffer(4)]],
+    constant int& gN   [[buffer(5)]],
+    constant int& gK   [[buffer(6)]],
+    uint3 tgid         [[threadgroup_position_in_grid]])
+{
+    int g  = int(tgid.z);
+    int k0 = g * KCHUNK;
+    if (k0 >= gK) return;
+    int tiles_n = (gN + BN - 1) / BN;
+    int tgx = int(tgid.x);
+    int tgy = int(tgid.y);
+    if (tgx >= tiles_n) return;
+    int m_off = tgy * BM;
+    int n_off = tgx * BN;
+
+    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(gK, gM));
+    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tB(B, dextents<int32_t, 2>(gN, gK));
+
+    constexpr auto desc = matmul2d_descriptor(
+        BM, BN, KCHUNK, false, false, RELAXED, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+
+    // KCHUNK divides gK, so every chunk is a full static-extent K slice.
+    auto mA = tA.slice<KCHUNK, BM>(k0, m_off);
+    auto mB = tB.slice<BN, KCHUNK>(n_off, k0);
+    auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+    op.run(mA, mB, cT);
+
+    if (g == 0) {
+        tensor<device OUT_T, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(gN, gM));
+        auto mC = tC.slice<BN, BM>(n_off, m_off);
+        auto cO = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) cO[i] = (OUT_T)cT[i];
+        cO.store(mC);
+    } else {
+        device float *Cg = Cp + (size_t)(g - 1) * gM * gN;
+        tensor<device float, dextents<int32_t, 2>, tensor_inline> tCp(Cg, dextents<int32_t, 2>(gN, gM));
+        auto mC = tCp.slice<BN, BM>(n_off, m_off);
+        cT.store(mC);
+    }
+}
+
+// C[i] += sum_{p<Gm1} Cp[p, i].  C already holds chunk 0 (bf16); accumulate the
+// remaining fp32 planes.  One thread per output element.
+kernel void splitk_reduce(
+    device const float *Cp [[buffer(0)]],
+    device OUT_T *C        [[buffer(1)]],
+    constant int& n        [[buffer(2)]],
+    constant int& Gm1      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int i = int(gid);
+    if (i >= n) return;
+    float s = (float)C[i];
+    size_t off = (size_t)i;
+    for (int p = 0; p < Gm1; ++p) { s += Cp[off]; off += (size_t)n; }
+    C[i] = (OUT_T)s;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# 1x1 convolution as GEMM (very-thin-N path).
+#
+# Disassembling MPSGraph's bf16 GEMM (gemm_a18) showed it drives the M5 tensor
+# coprocessor through the PRIVATE air.simdgroup_matrix_16x16x16 MMA (a 16-wide
+# N-fragment), which the public matmul2d op (16x32x16, FN=32) and MSL builtins
+# (8x8 only) cannot emit -- so matmul2d underfills on a 1-fragment-wide N tile
+# (N<=64: ~0.5-0.8x).  convolution2d is the OTHER public coprocessor entry; a
+# 1x1 conv is exactly C=A@B with M as spatial width and N as output channels.
+# Empirically conv2d schedules thin output-channels better than matmul2d does
+# thin-N for N<=64 (e.g. 4096x32x4096 0.53->0.74x, 8192x32x4096 0.76->0.86x;
+# marginal at N=64).  N>=96 still prefers matmul2d, so the autotuner only adds
+# conv as a candidate for N<=64 and keeps it only when it actually wins.
+#
+# Layouts map with no data movement: A (MxK row-major) = activation NHWC
+# [1,1,M,K]; B (KxN) = weights HWIO [1,1,K,N]; C (MxN) = dest NHWO [1,1,M,N].
+# K (input channels) must be a compile-time constant in the conv descriptor, so
+# the kernel is specialized per K (cached).
+# ---------------------------------------------------------------------------
+CONV1X1_GEMM_SRC = r"""
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_cooperative_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+#define IN_T   __IN_T__
+#define OUT_T  __OUT_T__
+#define BMW    __BMW__
+#define BNO    __BNO__
+#define NSG    __NSG__
+#define KCONST __KCONST__
+
+kernel void conv1x1_gemm(
+    device IN_T   *A   [[buffer(0)]],
+    device IN_T   *B   [[buffer(1)]],
+    device OUT_T  *C   [[buffer(2)]],
+    constant int& gM   [[buffer(3)]],
+    constant int& gN   [[buffer(4)]],
+    constant int& gK   [[buffer(5)]],
+    uint3 tgid         [[threadgroup_position_in_grid]])
+{
+    tensor<device IN_T, dextents<int32_t, 4>, tensor_inline> tA(A, dextents<int32_t, 4>(gK, gM, 1, 1));
+    tensor<device IN_T, dextents<int32_t, 4>, tensor_inline> tW(B, dextents<int32_t, 4>(gN, gK, 1, 1));
+    tensor<device OUT_T, dextents<int32_t, 4>, tensor_inline> tC(C, dextents<int32_t, 4>(gN, gM, 1, 1));
+
+    constexpr auto desc = convolution2d_descriptor(
+        int4(BNO, BMW, 1, 1), int4(KCONST, BMW, 1, 1), int2(1, 1),
+        convolution2d_activation_layout::nhwc, convolution2d_weights_layout::hwio,
+        int2(1, 1), int2(1, 1), 1, true, convolution2d_descriptor::mode::multiply);
+    convolution2d<desc, execution_simdgroups<NSG>> op;
+
+    int tiles_o = (gN + BNO - 1) / BNO;
+    int tiles_w = (gM + BMW - 1) / BMW;
+    if (int(tgid.x) >= tiles_o || int(tgid.y) >= tiles_w) return;
+    int o_off = int(tgid.x) * BNO;
+    int w_off = int(tgid.y) * BMW;
+
+    auto mA = tA.slice(0, w_off, 0, 0);
+    auto mW = tW.slice(o_off, 0, 0, 0);
+    auto mC = tC.slice(o_off, w_off, 0, 0);
+    auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mW), float>();
+    op.run(mA, mW, cT);
+    auto cO = op.get_destination_cooperative_tensor<decltype(mA), decltype(mW), OUT_T>();
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) cO[i] = (OUT_T)cT[i];
+    cO.store(mC);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # GEMV kernels
 # ---------------------------------------------------------------------------
 
@@ -1107,6 +1279,34 @@ def m5_tensor_gemm(in_t: str, out_t: str,
     )
     lib = _compile(src)
     return lib.m5_tensor_gemm, src
+
+
+@functools.lru_cache(maxsize=None)
+def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
+                relaxed: bool = True):
+    """Split-K m5_tensor GEMM.  Returns (splitk_fn, reduce_fn).  KCHUNK must
+    divide K (the caller guarantees this); the per-chunk K slice is static."""
+    src = _subst(
+        SPLITK_GEMM_SRC,
+        IN_T=in_t, OUT_T=out_t,
+        BM=BM, BN=BN, NSG=NSG, KCHUNK=KCHUNK,
+        RELAXED=("true" if relaxed else "false"),
+    )
+    lib = _compile(src)
+    return lib.splitk_gemm, lib.splitk_reduce
+
+
+@functools.lru_cache(maxsize=None)
+def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
+                 relaxed: bool = True):
+    """1x1-conv GEMM for very-thin-N (see CONV1X1_GEMM_SRC).  K (input channels)
+    is baked into the conv descriptor, so the kernel is specialized per K."""
+    src = _subst(
+        CONV1X1_GEMM_SRC,
+        IN_T=in_t, OUT_T=out_t,
+        BMW=BMW, BNO=BNO, NSG=NSG, KCONST=K,
+    )
+    return _compile(src).conv1x1_gemm, src
 
 
 @functools.lru_cache(maxsize=None)

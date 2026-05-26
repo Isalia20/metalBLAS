@@ -53,8 +53,8 @@ _GEMV_HANDLES: dict = {}
 # NWARPS={16,32} split; bf16/fp16 add the vectorized (2,32)/(4,16)/(4,8) tiles.
 _GEMV_T_VARIANTS = {
     torch.float32:  [(1, 16), (1, 32)],
-    torch.float16:  [(1, 32), (2, 32), (2, 16), (4, 16), (4, 8)],
-    torch.bfloat16: [(1, 32), (2, 32), (2, 16), (4, 16), (4, 8)],
+    torch.float16:  [(1, 32), (2, 32), (2, 16), (4, 16), (4, 8), (8, 8), (8, 16)],
+    torch.bfloat16: [(1, 32), (2, 32), (2, 16), (4, 16), (4, 8), (8, 8), (8, 16)],
 }
 
 
@@ -72,7 +72,7 @@ def _gemv_handles(dtype):
     return h
 
 
-def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k_big=True):
+def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
     """Return (gemv_t_fn, threadgroup_size, vec) for a `cols`-wide GEMV.
 
     bf16/fp16: scale VEC (columns/lane) with N so each warp covers full cache
@@ -81,10 +81,17 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k_big=True):
     NWARPS (the within-TG K-split) shrinks as VEC grows so wide tiles don't
     over-subscribe the reduction (3072×4096 wants VEC=4/NW=8, 1.01× vs 0.89×).
 
-    The widest tile (VEC=4 ⇒ N/128 threadgroups) is gated on `k_big` (K≥2048):
-    with a short K there isn't enough per-TG work to hide latency at half the
-    core count, so 2048×1024 (16 TGs at VEC=4 = half occupancy → 382 GB/s) wants
-    VEC=2 instead (32 TGs, full occupancy → 427 GB/s).
+    Wide N (cols≥4096, K≥2048) takes VEC=8: a full 16-byte (8-element) load per
+    lane is the bandwidth sweet spot across the whole giant-N band — 1.07× at
+    N=4096 up to 1.16× at 128256×14336 (vs MPSGraph), beating both the VEC=4 tile
+    and the padded m5_tensor route the wide-N M==1 path used to take (0.74×).
+    NWARPS scales with K so the per-warp K-slice stays ~500-900 elements: 16 for
+    K≥8192 (deeper reduction parallelism), 8 below (more warps just add reduction
+    overhead with too little work each).
+
+    The VEC=4 tile (N/128 threadgroups) is gated on `k_big` (K≥2048): with a
+    short K there isn't enough per-TG work to hide latency at half the core
+    count, so 2048×1024 wants VEC=2 instead (32 TGs, full occupancy).
 
     fp32: VEC=1 (4-byte loads already span a line); keep the proven NWARPS split —
     512<cols≤1024 peaks at 16, else 32.
@@ -93,12 +100,17 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k_big=True):
     for the contiguous fast path); `vec_ok=False` forces VEC=1 for view inputs.
     """
     gt = gh["gt"]
+    if k is not None:
+        k_big = (k >= 2048)
     if dtype is torch.float32:
         ng = (cols + 31) // 32
         if 16 < ng <= 32:
             return gt[(1, 16)], 512, 1
         return gt[(1, 32)], 1024, 1
-    if vec_ok and k_big and cols >= 2560:
+    if vec_ok and k_big and cols >= 4096:
+        vec = 8
+        nw = 16 if (k is not None and k >= 8192) else 8
+    elif vec_ok and k_big and cols >= 2560:
         vec, nw = 4, 8
     elif vec_ok and k_big and cols >= 1280:
         vec, nw = 4, 16
@@ -110,7 +122,9 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k_big=True):
     else:
         vec, nw = 1, 32
     # Clamp VEC to the column stride's alignment.
-    if vec == 4 and (ldb & 3):
+    if vec == 8 and (ldb & 7):
+        vec, nw = (4, 8) if not (ldb & 3) else ((2, 32) if not (ldb & 1) else (1, 32))
+    elif vec == 4 and (ldb & 3):
         vec, nw = (2, 32) if not (ldb & 1) else (1, 32)
     elif vec == 2 and (ldb & 1):
         vec, nw = 1, 32
@@ -123,11 +137,14 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k_big=True):
 _GEMV_PLAN: dict = {}
 
 
-def _gemv_plan(dtype, N, k_big):
-    key = (dtype, N, k_big)
+def _gemv_plan(dtype, N, K):
+    # The launch is a pure function of (dtype, N) and the two K thresholds that
+    # _gemv_pick uses (K>=2048 selects the vectorized tiers; K>=8192 picks NWARPS
+    # for the VEC=8 tier), so key on those rather than the raw K.
+    key = (dtype, N, K >= 2048, K >= 8192)
     plan = _GEMV_PLAN.get(key)
     if plan is None:
-        gt, tg, vec = _gemv_pick(_gemv_handles(dtype), N, N, dtype, k_big=k_big)
+        gt, tg, vec = _gemv_pick(_gemv_handles(dtype), N, N, dtype, k=K)
         ng = (N + 32 * vec - 1) // (32 * vec)
         plan = (gt, (tg * ng, 1, 1), (tg, 1, 1))
         _GEMV_PLAN[key] = plan
@@ -167,6 +184,15 @@ _AUTOTUNE = os.environ.get("METALBLAS_AUTOTUNE", "1") != "0"
 # keeps the former and captures the latter.  The large deep-K/high-aspect wins are
 # all ≥6%, far clear of this.
 _AUTOTUNE_MARGIN = 0.03
+# Tighter margin for the tall-narrow regimes (thin min-dim, very-deep-K small
+# M,N).  There the best tile is genuinely ~1-2% over the square default and the
+# winner FLIPS with size (512²×32768 wants (128,32,4); 1024²×16384 wants
+# (128,32,2); 768²×8192 wants (192,32,2)), so no single primary serves them and
+# the 3% margin would keep the slower default.  These shapes are compute-bound
+# and probed with many iters / best-of-reps, so a 1% threshold reliably captures
+# the real win without letting noise demote the default (the bad tiles in the
+# family lose by 15-25%, far outside any noise band).
+_TALL_NARROW_MARGIN = 0.01
 
 
 def _build_m5t_plan(dtype, M, N, K, BM, BN, NSG):
@@ -181,30 +207,199 @@ def _build_m5t_plan(dtype, M, N, K, BM, BN, NSG):
     return (fn, (NSG * 32 * tiles_n, tiles_m, 1), (NSG * 32, 1, 1))
 
 
+# --- Split-K plan (deep-K, few-tile shapes) --------------------------------
+# Reused fp32 partial buffers, keyed by (M, N, planes).  GEMM calls execute in
+# program order on the MPS queue, so a single buffer per key is safe to recycle:
+# call n's reduce finishes before call n+1's splitk overwrites it.
+_SPLITK_POOL: dict = {}
+
+
+def _splitk_partial(ref, planes, M, N):
+    key = (M, N, planes)
+    buf = _SPLITK_POOL.get(key)
+    if buf is None:
+        buf = ref.new_empty(planes, M, N, dtype=torch.float32)
+        _SPLITK_POOL[key] = buf
+    return buf
+
+
+class _SplitKPlan:
+    """Two-pass split-K launch for one (dtype, M, N, K, BM, BN, NSG, G).  The
+    splitk kernel runs G K-chunks per output tile (chunk 0 writes C, chunks 1..
+    write fp32 partial planes); the reduce kernel sums the planes into C."""
+
+    def __init__(self, splitk_fn, reduce_fn, M, N, K, BM, BN, NSG, G):
+        self.splitk_fn = splitk_fn
+        self.reduce_fn = reduce_fn
+        self.M = M
+        self.N = N
+        self.K = K
+        self.G = G
+        self.planes = G - 1
+        tiles_m = (M + BM - 1) // BM
+        tiles_n = (N + BN - 1) // BN
+        self.sk_threads = (NSG * 32 * tiles_n, tiles_m, G)
+        self.sk_group = (NSG * 32, 1, 1)
+        self.n_elems = M * N
+        self.red_threads = (self.n_elems, 1, 1)
+        self.red_group = (256, 1, 1)
+
+    def run(self, a, b, o):
+        cp = _splitk_partial(o, self.planes, self.M, self.N)
+        self.splitk_fn(a, b, o, cp, self.M, self.N, self.K,
+                       threads=self.sk_threads, group_size=self.sk_group)
+        self.reduce_fn(cp, o, self.n_elems, self.planes,
+                       threads=self.red_threads, group_size=self.red_group)
+
+
+def _build_splitk_plan(dtype, M, N, K, BM, BN, NSG, G):
+    in_t, _, out_t = _PROFILE[dtype]
+    splitk_fn, reduce_fn = kernels.splitk_gemm(in_t, out_t, BM, BN, NSG, K // G, relaxed=True)
+    return _SplitKPlan(splitk_fn, reduce_fn, M, N, K, BM, BN, NSG, G)
+
+
+def _is_splitk_regime(M, N, K, dtype):
+    """Few-output-tile shapes where a single op.run underfills the GPU and a long
+    K can be split across G threadgroups per tile.  Two sub-cases, both gated on a
+    deep-enough K (>=2048) and a SMALL output (M*N <= ~1.5M elems -> few tiles, so
+    the K-split's extra tiles actually help): deep-K squares (512^2x32768 -> 0.99,
+    256^2x32768 -> 1.9x) and thin-N (small N -> few n-tiles: 1024x128x4096 -> 1.02,
+    2048x128x8192 0.67->0.82).  The M*N cap excludes large squares (2048^2: a
+    single-pass tile already fills the cores and wins) so we don't burn probe time
+    on their multi-ms kernels.  fp32 already wins everywhere, so low-precision
+    only.  The autotuner still confirms split-K beats the single-pass tile (and
+    matches its result) before using it, so a bad fit here only costs probe time."""
+    return (dtype is not torch.float32 and K >= 2048
+            and 64 <= min(M, N) and M * N <= 1_500_000
+            and (min(M, N) <= 256 or K >= 8 * max(M, N)))
+
+
+def _splitk_specs(M, N, K):
+    """(BM, BN, NSG, G) candidates for the deep-K regime.  G must divide K with a
+    16-aligned chunk (the static K slice).  The (tile, G) winner shifts with size
+    (512^2x32768 -> (128,32,2) G2; 256^2x32768 -> (32,64,2) G4), so the autotuner
+    picks; these are the family that wins across the band."""
+    specs = []
+    for (BM, BN, NSG) in [(128, 32, 2), (64, 64, 2), (32, 64, 2)]:
+        for G in (2, 4):
+            if K % G == 0 and (K // G) % 16 == 0:
+                specs.append((BM, BN, NSG, G))
+    return specs
+
+
+# --- 1x1-conv plan (very-thin-N) -------------------------------------------
+# matmul2d (16x32x16, FN=32) underfills a 1-fragment-wide N tile, so N<=64 caps
+# at ~0.5-0.8x.  convolution2d is the other public tensor-coprocessor entry; a
+# 1x1 conv == GEMM with M as spatial width and N as output channels, and it
+# schedules thin output-channels better there (see kernels.CONV1X1_GEMM_SRC).
+# The autotuner times conv candidates against the single-pass tiles and keeps
+# one only when it wins, so this never regresses a shape matmul2d already nails
+# (N>=96 keeps matmul2d).  Disassembly of MPSGraph's gemm_a18 showed its real
+# edge is the PRIVATE 16x16x16 simdgroup MMA, which no public Metal API (MSL
+# builtins are 8x8-only; matmul2d is 16x32x16) can emit -- conv only narrows
+# that gap on the thinnest N, it does not close it.
+class _Conv1x1Plan:
+    """1x1-conv GEMM launch for one (dtype, M, N, K, BMW, BNO, NSG)."""
+
+    def __init__(self, fn, M, N, K, BMW, BNO, NSG):
+        self.fn = fn
+        self.M = M
+        self.N = N
+        self.K = K
+        tiles_o = (N + BNO - 1) // BNO
+        tiles_w = (M + BMW - 1) // BMW
+        self.threads = (NSG * 32 * tiles_o, tiles_w, 1)
+        self.group = (NSG * 32, 1, 1)
+
+    def run(self, a, b, o):
+        self.fn(a, b, o, self.M, self.N, self.K,
+                threads=self.threads, group_size=self.group)
+
+
+def _build_conv_plan(dtype, M, N, K, BMW, BNO, NSG):
+    in_t, _, out_t = _PROFILE[dtype]
+    fn, _ = kernels.conv1x1_gemm(in_t, out_t, BMW, BNO, NSG, K, relaxed=True)
+    return _Conv1x1Plan(fn, M, N, K, BMW, BNO, NSG)
+
+
+def _is_conv_regime(M, N, K, dtype):
+    """Very-thin-N (N<=64, a multiple of 32) over a wide M: matmul2d's 32-wide
+    N-fragment underfills (1 fragment), so the conv path (which tiles N as thin
+    output-channels) is worth probing.  N>=96 keeps matmul2d (it wins there)."""
+    return (dtype is not torch.float32 and N <= 64 and N % 32 == 0
+            and M >= 512 and K >= 256)
+
+
+def _conv_specs(M, N, K):
+    """(BMW, BNO, NSG) conv candidates.  BNO=N covers all N output-channels in
+    one tile (N is 32 or 64); BMW (the M-width tile) must divide M.  The width
+    tile / NSG winner shifts with M and K, so the autotuner picks."""
+    specs = []
+    for BMW in (16, 32, 48, 64, 96, 128):
+        if M % BMW == 0:
+            for NSG in (2, 4):
+                specs.append((BMW, N, NSG))
+    return specs
+
+
 def _m5_tensor_tile_candidates(M, N, K, dtype):
-    """Tiles to consider for (M,N,K,dtype), heuristic primary first.
+    """Return (candidate tiles, autotuner margin) for (M,N,K,dtype).
 
     A single-element list means "the heuristic is confident, don't probe".  A
     longer list marks an ambiguous regime where the autotuner measures and
-    caches the winner.  The primary is exactly `_pick_m5_tensor_tile`, so non-
+    caches the winner.  Candidate 0 is exactly `_pick_m5_tensor_tile`, so non-
     autotuned paths (fp32, the general dispatcher) are byte-for-byte unchanged.
+    The margin is how much a non-primary must win by to be chosen (see
+    _AUTOTUNE_MARGIN / _TALL_NARROW_MARGIN).
     """
     primary = _pick_m5_tensor_tile(M, N, K, dtype)
     # fp32 wins 2–3× on every shape — never worth a probe.
     if dtype == torch.float32:
-        return [primary]
+        return [primary], _AUTOTUNE_MARGIN
     mx = max(M, N)
+    mn = min(M, N)
 
     # Confidently-handled regimes: padded GEMV, tiny-K, and tiny problems all
     # have a single decisive tile (see _pick_m5_tensor_tile) — no probe.
     if M == 1 or N == 1:
-        return [primary]
+        return [primary], _AUTOTUNE_MARGIN
     if K <= 256 and M >= 1024 and N >= 1024:
-        return [primary]
+        return [primary], _AUTOTUNE_MARGIN
     if mx <= 256:
-        return [primary]
+        return [primary], _AUTOTUNE_MARGIN
+
+    # Thin min-dim (one of M,N is small, the other large): the square default
+    # makes only a handful of tiles along the short axis and underfills the
+    # cores.  A TALL-NARROW tile — BN=32 with a tall BM, or BM=32 with a wide BN
+    # — restores occupancy by making many small tiles: 4096×128×4096 0.80→0.93,
+    # 128×4096×4096 0.96→0.97, 256×4096×4096 0.93→0.99.  Both orientations are
+    # offered (the BN=32 family wins even for some M<N shapes, e.g. 256×4096), so
+    # the autotuner resolves which; the NSG/BM ambiguity (N=128 likes (128,32,2),
+    # N=256 likes (256,32,4)) too.  Bad tiles lose by 15-25%, so the tight margin
+    # only ever resolves the ~1-2% top cluster, never a noise tie.
+    if mn <= 256 and mx >= 1024:
+        extra = [(128, 32, 2), (256, 32, 4), (32, 128, 2), (32, 256, 4), (64, 64, 2)]
+        # Thin *M* (small batched decode, M<<N) wants a SHORT BM so the few query
+        # rows nearly fill the tile -- a 64-row tile is 0.74x at M=16.  Add the
+        # BM=16/32 short-tile family when the min dim is genuinely tiny ((16,64,2)
+        # best for M<=16, (32,64,2) for 32<=M<=48, where m5(auto) was 0.45-0.79x).
+        # The autotuner keeps it only where it wins, so a thin-N shape (M>>N) just
+        # probes it once and discards it -- no steady-state cost.
+        if mn <= 48:
+            extra = [(16, 64, 2), (32, 64, 2), (32, 128, 4)] + extra
+        return _with_primary(primary, extra), _TALL_NARROW_MARGIN
 
     if mx <= 1024:
+        # Very deep K over small (but not thin) M,N: a long serial K-reduction
+        # over few output tiles.  The tall-narrow family wins here too, but the
+        # NSG that fills the cores FLIPS with the output-tile count: 512²×32768
+        # wants (128,32,4), 1024²×16384 wants (128,32,2), 768²×8192 wants
+        # (192,32,2) — so no single primary serves them; probe with the tight
+        # margin.  Gated at K≥8·max so ordinary cube-ish small/medium shapes
+        # (which the thin (32,64,2) family below already nails) are untouched.
+        if K >= 8 * mx:
+            extra = [(128, 32, 4), (128, 32, 2), (192, 32, 2), (32, 64, 2), (64, 64, 2)]
+            return _with_primary(primary, extra), _TALL_NARROW_MARGIN
         # Small/medium — the MPS sweet-spot band.  The best thin tile shifts with
         # size (512³→(32,64,2) at the floor, 640³→(16,64,2) at 0.97× vs the
         # heuristic (32,64,2)'s 0.93×); probe the thin family.
@@ -220,8 +415,22 @@ def _m5_tensor_tile_candidates(M, N, K, dtype):
         # gate the session notes added later regressed a neighbour.  The 3% margin
         # keeps (64,64,2) wherever the thin-tile edge is within noise (2048³–4096³,
         # tall low-K like 2048×768×4096), so this never demotes a shape it nailed.
-        extra = [(64, 64, 2), (48, 128, 4), (64, 128, 4)]
+        # (128,64,4) — a tall, narrow-BN tile — is the missing winner for moderate
+        # square/llm shapes the others left at parity (1024×4096×4096 0.97→1.01,
+        # 1024×5120×13824 0.94→1.11, 1024×152064×4096 lm_head).
+        extra = [(64, 64, 2), (48, 128, 4), (64, 128, 4), (128, 64, 4)]
+        # Large non-64-divisible (e.g. 4095³): partial edge tiles starve the thin
+        # tiles, so the big (128,128,8) tile that amortizes edge waste becomes the
+        # winner (4095³ 0.91→0.94+, matching 4097³'s (128,128,8) win).  Only a
+        # candidate — the 3% margin keeps divisible large squares (2047³ 1.22× on
+        # (64,64,2)) and any shape where the big tile starves on their own tiles.
+        if mx >= 2048 and not (M % 64 == 0 and N % 64 == 0):
+            extra.append((128, 128, 8))
 
+    return _with_primary(primary, extra), _AUTOTUNE_MARGIN
+
+
+def _with_primary(primary, extra):
     cands = [primary]
     for t in extra:
         if t not in cands:
@@ -241,51 +450,105 @@ def _probe_params(M, N, K):
         return 20, 80, 8              #   and min-over-many-reps to reject spikes
     if flops <= 50_000_000_000:       # low-ms kernels (≲9ms)
         return 3, 3, 3
-    return 1, 1, 3                    # tens-of-ms kernels: one timed iter is stable
+    return 2, 3, 3                    # tens-of-ms kernels: one timed iter (the old
+                                      # (1,1,3)) is too noisy to rank tiles whose
+                                      # times differ a few % — it flipped 1024×152064×
+                                      # 4096 between ~21TF and ~18.5TF run to run.
+                                      # Averaging 3 iters / min of 3 reps stabilizes
+                                      # the ranking; the ~2s one-time probe amortizes.
 
 
-def _autotune_m5t(dtype, M, N, K, cands, a, b):
-    """Time each candidate tile on the real operands (best-of-reps to suppress
-    thermal/scheduler noise) and return the fastest plan.  Candidate 0 is the
-    heuristic primary; we keep it unless another beats it by >_AUTOTUNE_MARGIN,
-    so a noisy near-tie can never demote the trusted default."""
+def _autotune_m5t(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
+                  conv_specs=()):
+    """Time each candidate on the real operands (best-of-reps to suppress
+    thermal/scheduler noise) and return the fastest (cached_plan, label).
+    Candidate 0 is the heuristic m5_tensor primary; we keep it unless another
+    beats it by >margin, so a noisy near-tie can never demote the trusted
+    default.  `sk_specs` adds split-K candidates (deep-K regime) and `conv_specs`
+    adds 1x1-conv candidates (very-thin-N regime), each confirmed to match the
+    single-pass result before being timed."""
     warmup, iters, reps = _probe_params(M, N, K)
+    # A tight margin (the tall-narrow regimes) must resolve a ~1% gap, so spend
+    # more timed iters / reps to push the measurement noise below the margin —
+    # the default (3,3,3) tier flips the 1.25%-separated 512²×32768 cluster run
+    # to run.  Cheap: still one-time, and only the few tall-narrow shapes probe.
+    if margin < _AUTOTUNE_MARGIN:
+        iters = max(iters * 2, 6)
+        reps = max(reps, 5)
     o = a.new_empty(M, N)             # private scratch — never the pooled output
-    plans = [_build_m5t_plan(dtype, M, N, K, BM, BN, NSG) for (BM, BN, NSG) in cands]
+
+    # Each candidate is (cached_plan, run(a,b,o), label).  m5_tensor tiles keep
+    # the lean (fn, thr, grp) tuple (inlined on the hot path); split-K uses its
+    # plan object.  Candidate 0 is always the heuristic primary tile.
+    cand = []
+    for (BM, BN, NSG) in cands:
+        fn, thr, grp = _build_m5t_plan(dtype, M, N, K, BM, BN, NSG)
+        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp:
+               fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp))
+        cand.append(((fn, thr, grp), run, (BM, BN, NSG)))
+
+    # Add split-K and 1x1-conv candidates, but only those whose result matches
+    # the single-pass primary (guards a precision surprise -- split-K's chunk-0
+    # bf16 rounding, or a conv edge-tile mishandling).  Checked once here, never
+    # on the hot path.
+    if sk_specs or conv_specs:
+        ref = a.new_empty(M, N)
+        cand[0][1](a, b, ref)
+        torch.mps.synchronize()
+        scale = ref.abs().max().item() + 1e-6
+        for (BM, BN, NSG, G) in sk_specs:
+            plan = _build_splitk_plan(dtype, M, N, K, BM, BN, NSG, G)
+            plan.run(a, b, o)
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                cand.append((plan, plan.run, (BM, BN, NSG, G)))
+        for (BMW, BNO, NSG) in conv_specs:
+            plan = _build_conv_plan(dtype, M, N, K, BMW, BNO, NSG)
+            plan.run(a, b, o)
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                cand.append((plan, plan.run, (BMW, BNO, NSG, "conv")))
 
     # Warm EVERY candidate (JIT-compile + ramp the GPU clocks) before timing any
     # of them.  Timing each right after its own cold warmup penalised whichever
-    # was measured first — enough to flip the near-tied small-square tiles and
-    # bias against the (trusted) primary, which is always candidate 0.
-    for (fn, thr, grp) in plans:
+    # was measured first — enough to flip near-tied tiles and bias against the
+    # (trusted) primary, which is always candidate 0.
+    for (_, run, _) in cand:
         for _ in range(warmup):
-            fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp)
+            run(a, b, o)
     torch.mps.synchronize()
 
     # Interleave the timed reps so every candidate is measured under the same
     # warm steady state; keep the best (min) per candidate.
-    times = [float("inf")] * len(plans)
+    times = [float("inf")] * len(cand)
     for _ in range(reps):
-        for j, (fn, thr, grp) in enumerate(plans):
+        for j, (_, run, _) in enumerate(cand):
             t0 = time.perf_counter()
             for _ in range(iters):
-                fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp)
+                run(a, b, o)
             torch.mps.synchronize()
             times[j] = min(times[j], (time.perf_counter() - t0) / iters)
 
     i = min(range(len(times)), key=lambda j: times[j])
-    if i != 0 and times[i] < times[0] * (1.0 - _AUTOTUNE_MARGIN):
-        return plans[i], cands[i]
-    return plans[0], cands[0]
+    if i != 0 and times[i] < times[0] * (1.0 - margin):
+        return cand[i][0], cand[i][2]
+    return cand[0][0], cand[0][2]
 
 
 def _gemm_plan(dtype, M, N, K, a=None, b=None):
     key = (dtype, M, N, K)
     plan = _GEMM_PLAN.get(key)
     if plan is None:
-        cands = _m5_tensor_tile_candidates(M, N, K, dtype)
-        if _AUTOTUNE and a is not None and len(cands) > 1:
-            plan, tile = _autotune_m5t(dtype, M, N, K, cands, a, b)
+        cands, margin = _m5_tensor_tile_candidates(M, N, K, dtype)
+        sk_specs = ()
+        conv_specs = ()
+        if _AUTOTUNE and a is not None and _is_splitk_regime(M, N, K, dtype):
+            sk_specs = _splitk_specs(M, N, K)
+        if _AUTOTUNE and a is not None and _is_conv_regime(M, N, K, dtype):
+            conv_specs = _conv_specs(M, N, K)
+        if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs):
+            plan, tile = _autotune_m5t(dtype, M, N, K, cands, a, b, margin,
+                                       sk_specs, conv_specs)
         else:
             tile = cands[0]
             plan = _build_m5t_plan(dtype, M, N, K, *tile)
@@ -448,6 +711,17 @@ def _pick_m5_tensor_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[in
     # tile too (0.98×), whereas the old deep-K rule gave it (64,128,4) → 0.43×.
     if mx <= 256:
         return (32, 32, 4)
+
+    # Thin M, wide N (small batched decode: a few query rows against a wide
+    # projection).  Mirror of the M==1 padded-GEMV BM=16 logic for a small-but
+    # >1 M: a 64-row tile throws away most of its MMA rows (M=16 on (64,64,2) is
+    # 0.74x vs torch), so use a short BM the few real rows nearly fill.  BM=16 is
+    # exact for M<=16 (1.01-1.08x for M=2..16); BM=32 covers M up to ~48 in one
+    # tile and avoids over-splitting it (M=48 (32,64,2) 1.04-1.21x).  Gated on N
+    # being the wide axis (>=1024) so thin-N (large M, small N) is untouched and
+    # keeps its tall-narrow BN=32 path (handled in the autotuner candidates).
+    if M <= 48 and N >= 1024:
+        return (16, 64, 2) if M <= 16 else (32, 64, 2)
 
     # Small / medium (256 < max ≤ 1024): a thin BM=32 tile fills the 16 cores
     # with many light tiles.  "Small" must account for tile COUNT and K, not
@@ -671,9 +945,11 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     # chains alone cost ~0.9 µs, enough to turn a 1.1× kernel into a 0.93× call.
     # So we gate the whole path on cheap attribute reads (.is_mps, .shape, .ndim)
     # and only fall through to the full preamble (which re-validates) otherwise.
-    # bf16/fp16 with N≥4096 prefers padded m5_tensor (handled below), so the
-    # fast path is taken only for fp32 or N<4096.  `a.shape[0] == 1` short-circuits
-    # GEMM (M>1) immediately.
+    # All contiguous M==1 GEMV (every dtype, every N) goes through the dedicated
+    # gemv_t kernel here: at wide N (≥4096) its VEC=8 tile is bandwidth-bound and
+    # beats both MPSGraph and the padded m5_tensor route the bf16/fp16 N≥4096 case
+    # used to take (which over-fetched 15 garbage rows per tile → 0.74× at 128256).
+    # `a.shape[0] == 1` short-circuits GEMM (M>1) immediately.
     sa = a.shape
     if (sa[0] == 1 and backend is None and out is None and swizzle_log is None
             and a.is_mps and len(sa) == 2 and b.ndim == 2):
@@ -682,7 +958,6 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         N = sb[1]
         K = sa[1]
         if (dtype in _PROFILE and N >= 16 and sb[0] == K
-                and (dtype is torch.float32 or N < 4096)
                 and a.is_contiguous() and b.is_contiguous()):
             # Everything the launch needs (kernel handle + thread/group tuples)
             # is a pure function of (dtype, N), so memoize it: the per-call work
@@ -692,7 +967,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             # storage is exactly the K-/N-vector the kernel indexes.  b.new_empty
             # (b's dtype/device, positional dims) is ~0.4 µs cheaper than
             # torch.empty((1,N), dtype=…, device="mps") — material at this size.
-            gt, thr, grp = _gemv_plan(dtype, N, K >= 2048)
+            gt, thr, grp = _gemv_plan(dtype, N, K)
             o = _pooled_out(b, 1, N)
             gt(b, a, o, N, K, N, threads=thr, group_size=grp)
             return o
@@ -712,14 +987,28 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         sb = b.shape
         N = sb[1]
         dtype = a.dtype
-        if (M >= 64 and N >= 64 and K >= 64 and sb[0] == K and dtype in _PROFILE
+        # N>=32 (not 64): a thin N=32/48 GEMM still belongs on the tensor-unit
+        # m5_tensor path, not the manual m5 kernel.  m5_tensor with a BN=32 tile
+        # (+ the autotuner's conv candidate at N=32) runs N=32 at 0.75-2.5x where
+        # manual m5 was 0.38-0.89x; the autotuner picks the winning tile.
+        # M>=2 (not 64): small batched decode (2<=M<=63, e.g. serving a few
+        # sequences) also belongs on m5_tensor -- the manual m5 kernel ran it at
+        # 0.45-0.79x, while m5_tensor with the short-BM tiles above is 1.00-1.23x.
+        # M==1 already returned via the GEMV fast path / wide-N branch above.
+        if (M >= 2 and N >= 32 and K >= 64 and sb[0] == K and dtype in _PROFILE
                 and a.is_contiguous() and b.is_contiguous()):
             # Pass a, b so a first-sight ambiguous shape autotunes on the real
             # operands; cached thereafter, so the steady-state hot path is still
-            # just a dict hit + the pooled-output alloc + the enqueue.
-            fn, thr, grp = _gemm_plan(dtype, M, N, K, a, b)
+            # just a dict hit + the pooled-output alloc + the enqueue.  The plan
+            # is the lean (fn, thr, grp) tuple for the common single-pass tile, or
+            # a _SplitKPlan for the deep-K regime (two dispatches + a partial buf).
+            plan = _gemm_plan(dtype, M, N, K, a, b)
             o = _pooled_out(a, M, N)
-            fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp)
+            if type(plan) is tuple:
+                fn, thr, grp = plan
+                fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp)
+            else:
+                plan.run(a, b, o)
             return o
 
     assert a.device.type == "mps" and b.device.type == "mps"
@@ -754,13 +1043,13 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         # routing it to m5_tensor reads the wrong elements (max_err ~120).  Such
         # inputs fall back to the manual m5 kernel, which honors lda/ldb.
         packed_ab = (lda_ == K_ and ldb_ == N_)
-        # Wide-N GEMV (M==1, N≥4096 ⇒ ≥128 column-blocks already fill the GPU).
-        # Here we're bandwidth bound and a "padded" m5_tensor wins for bf16/fp16:
-        # it reads the 15 OOB rows as zero (Metal bounds-check) and writes only
-        # the single valid row via cT.store(mC).  With the BM=16 tile this is
-        # 1.03–1.09× across N (vs the dedicated gemv kernel's 0.93×).  fp32 stays
-        # on the dedicated gemv kernel — m5_tensor loses for fp32 above N=4096
-        # (4-byte loads already saturate; m5t 8192 → 0.89×, gemv → 1.01×).
+        # Wide-N M==1 fallback (only reached when the contiguous fast path above
+        # was bypassed by an explicit backend/out/swizzle arg — the common
+        # contiguous call goes to the vectorized gemv_t there, which is the real
+        # winner at 1.06-1.16x).  The padded m5_tensor reads the 15 OOB rows as
+        # zero and writes only the valid row; it lands ~0.74-1.09x, still ahead of
+        # the VEC=1 gemv this preamble path would otherwise force on view inputs.
+        # bf16/fp16 only; fp32 stays on the dedicated gemv kernel below.
         if (M == 1 and N >= 4096 and K >= 256 and is_lp
                 and not trans_a and not trans_b and packed_ab):
             backend = "m5_tensor"
@@ -778,10 +1067,12 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             # (same precision as the manual m5 path) and beats it everywhere —
             # small fp32 especially (256³: 0.50× → 1.55×).  Its cT.store(mC)
             # plus Metal's bounds-checked reads handle non-divisible AND tiny
-            # shapes natively, so we route everything down to 64³ here (64³ runs
-            # ~2× vs torch).  Only sub-64 dims and transposed inputs (whose MPP
-            # descriptor TRANS_* path isn't wired up) fall back to manual m5.
-            if (M >= 64 and N >= 64 and K >= 64
+            # shapes natively, so we route everything down to M>=2/N>=32/K>=64
+            # here (64³ runs ~2× vs torch; small batched decode 2<=M<=63 runs
+            # 1.0-1.23× on the short-BM tiles, vs manual m5's 0.45-0.79×).  Only
+            # transposed / non-packed inputs (whose MPP descriptor TRANS_* path
+            # isn't wired up) and sub-threshold dims fall back to manual m5.
+            if (M >= 2 and N >= 32 and K >= 64
                     and not trans_a and not trans_b and packed_ab):
                 backend = "m5_tensor"
             else:
