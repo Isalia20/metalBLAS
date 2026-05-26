@@ -32,6 +32,40 @@ _PROFILE = {
 # Scalars are passed directly to the kernel — no tensor allocation needed.
 
 
+# --- Apple GPU family detection -------------------------------------------
+# The M5 generation adds a dedicated tensor unit; pre-M5 chips (M1-M4) lower
+# `mpp::tensor_ops::matmul2d` and similar matrix ops onto the simdgroup matrix
+# machinery. For the GEMM path that's transparent — `m5_tensor` works on both.
+# But the GEMV heuristic was tuned on M5 Pro (15 cores) by maximizing VEC
+# (cache-line coverage per simdgroup) with a low NWARPS, which on the larger
+# pre-M5 chips like M3 Ultra (80 cores) leaves the GPU mostly idle: the
+# bf16/fp16 K>=4096 mid-N band collapses to 0.46-0.55x because we spawn 16-32
+# threadgroups for a chip that wants 1000+ simdgroups in flight. So pre-M5
+# takes a parallel branch in `_gemv_pick` that targets ng*nw (total simdgroup
+# count) in the [1024, 4096] band instead of cache-line coverage.
+# Override with METALBLAS_HAS_TENSOR_UNIT=1/0 for testing.
+def _detect_has_tensor_unit() -> bool:
+    env = os.environ.get("METALBLAS_HAS_TENSOR_UNIT")
+    if env is not None:
+        return env != "0"
+    if sys.platform != "darwin":
+        return False
+    try:
+        import re
+        import subprocess
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, check=True, timeout=2,
+        ).stdout.strip()
+    except Exception:
+        return False
+    m = re.match(r"Apple M(\d+)", out)
+    return bool(m and int(m.group(1)) >= 5)
+
+
+_HAS_TENSOR_UNIT = _detect_has_tensor_unit()
+
+
 # --- GEMV hot-path caches -------------------------------------------------
 # Small GEMV is CPU-bound: the kernel runs in a few µs, so per-call Python
 # (compile-cache lookups, closures, allocations) is what caps the speedup.
@@ -66,10 +100,37 @@ def _gemv_handles(dtype):
         for (vec, nw) in _GEMV_T_VARIANTS[dtype]:
             fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec)
             gt[(vec, nw)] = fn
-        nt, _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4)
+        # gemv_nt (N==1, matrix @ vector): VEC=1 is the M5 default. Pre-M5
+        # (e.g. M3 Ultra) compiles additional VEC>=2 variants — each lane reads
+        # VEC consecutive K elements so a warp's 32 lanes span a full 128-B
+        # cache line (VEC=2 bf16) or two (VEC=4). On M5 the read coalescer
+        # already merges adjacent half-line fetches, so VEC=1 stays best.
+        nt = {}
+        nt[1], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 1)
+        if not _HAS_TENSOR_UNIT:
+            nt[2], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 2)
+            nt[4], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 4)
         h = {"gt": gt, "nt": nt}
         _GEMV_HANDLES[dtype] = h
     return h
+
+
+def _gemv_nt_pick(nt_dict, rows, k, ld):
+    """Pick a gemv_nt VEC variant. The M5 path has only VEC=1; pre-M5 prefers
+    VEC=4 when K and ld are 4-element aligned (4096×1×4096 bf16: 0.73× → 0.97×;
+    2048×2048 → 1.45×). The fallback to VEC=2 handles 2-aligned K; arbitrary
+    K/ld falls back to VEC=1 (which the kernel handles via a lane-0 scalar
+    tail, so it's always safe)."""
+    if _HAS_TENSOR_UNIT or 4 not in nt_dict:
+        return nt_dict[1]
+    # VEC>=2 needs the row-start byte address aligned to VEC*sizeof(IN_T); ld must
+    # be VEC-divisible so successive rows stay aligned. K does NOT need to be
+    # VEC-aligned (the kernel's scalar tail handles K%VEC remainder).
+    if (ld % 4) == 0 and k >= 64:
+        return nt_dict[4]
+    if (ld % 2) == 0 and k >= 32:
+        return nt_dict[2]
+    return nt_dict[1]
 
 
 def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
@@ -104,10 +165,37 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
         k_big = (k >= 2048)
     if dtype is torch.float32:
         ng = (cols + 31) // 32
+        if not _HAS_TENSOR_UNIT:
+            # Pre-M5: same story as bf16/fp16 — the M5 Pro sweet spot of NW=16
+            # at 16<ng<=32 leaves the 80-core M3 Ultra ~40% idle (1024×4096
+            # collapsed to 0.61×). NW=32 doubles the simdgroup count and lifts
+            # cols<=2048 by 15-30%; cols>=4096 already has plenty of TGs so
+            # NW=16 stays best there (1.02× vs 0.93× at 4096×4096).
+            return (gt[(1, 16)], 512, 1) if ng >= 128 else (gt[(1, 32)], 1024, 1)
         if 16 < ng <= 32:
             return gt[(1, 16)], 512, 1
         return gt[(1, 32)], 1024, 1
-    if vec_ok and k_big and cols >= 4096:
+    if not _HAS_TENSOR_UNIT:
+        # Pre-M5 (M1-M4, including M3 Ultra at 80 GPU cores): the M5 rule's
+        # high-VEC / low-NWARPS choices give too few threadgroups to fill the
+        # many cores — bf16 1×4096×4096 collapsed to 0.46×. Target ng*nw
+        # (total simdgroup count) in the [~1000, ~4000] band instead. Measured
+        # on M3 Ultra: this lifts the whole 1024<=N<=12288 / K>=4096 regression
+        # band from 0.46-0.55× to 1.10-1.36× while keeping the small-N wins.
+        if vec_ok and cols > 12288:
+            # Huge N (e.g. lm_head 32000): VEC=8 amortizes launch — too many
+            # TGs at VEC=2 (16k+) start losing to scheduling overhead.
+            vec, nw = 8, 8
+        elif vec_ok and cols >= 2560:
+            # Mid-to-wide N: VEC=2 keeps ng*nw above ~1000 (e.g. 4096 → 2048
+            # sg) while still spanning a full 128-B cache line per warp.
+            vec, nw = 2, 32
+        else:
+            # Up to N=2048 every variant fits in ng<=64; VEC=1 gives the most
+            # simdgroups (ng*nw = cols) without leaving cores idle, and wins
+            # cleanly across the small/medium range.
+            vec, nw = 1, 32
+    elif vec_ok and k_big and cols >= 4096:
         vec = 8
         nw = 16 if (k is not None and k >= 8192) else 8
     elif vec_ok and k_big and cols >= 2560:
@@ -135,6 +223,22 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
 # thread/group tuples are a pure function of (dtype, N) for contiguous GEMV
 # (ldb == N), so we resolve them once and the hot path becomes one dict hit.
 _GEMV_PLAN: dict = {}
+# Symmetric memo for the N==1 (gemv_nt) path: pure function of (dtype, K).
+_GEMV_NT_PLAN: dict = {}
+
+
+def _gemv_nt_plan(dtype, K):
+    """Resolve the gemv_nt variant + threadgroup size for the contiguous N==1
+    path (lda == K). Returns (fn, group_size). The caller computes the grid
+    from M (rows) — group size is fixed at 32*NWARPS=128 regardless."""
+    key = (dtype, K)
+    plan = _GEMV_NT_PLAN.get(key)
+    if plan is None:
+        gh = _gemv_handles(dtype)
+        fn = _gemv_nt_pick(gh["nt"], 0, K, K)  # rows arg unused by picker
+        plan = (fn, (128, 1, 1))
+        _GEMV_NT_PLAN[key] = plan
+    return plan
 
 
 def _gemv_plan(dtype, N, K):
@@ -972,6 +1076,25 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             gt(b, a, o, N, K, N, threads=thr, group_size=grp)
             return o
 
+    # --- Lean GEMV fast path: N==1 (matrix × column-vector) -------------------
+    # Symmetric to the M==1 path above: the gemv_nt kernel runs in ~7-25 µs on
+    # M3 Ultra for the common shapes, so the same ~2 µs Python preamble is what
+    # decides parity vs win. Memoize the variant pick by (dtype, K) — _gemv_nt_pick
+    # only consumes K and ld, and for contiguous inputs ld == K.
+    if (b.ndim == 2 and b.shape[1] == 1 and backend is None and out is None
+            and swizzle_log is None and a.is_mps and a.ndim == 2 and sa[0] > 1):
+        dtype = a.dtype
+        M = sa[0]
+        K = sa[1]
+        if (dtype in _PROFILE and M >= 16 and b.shape[0] == K
+                and a.is_contiguous() and b.is_contiguous()):
+            fn, grp = _gemv_nt_plan(dtype, K)
+            o = _pooled_out(a, M, 1)
+            n_groups = (M + 3) // 4
+            fn(a, b.view(-1), o.view(-1), M, K, K,
+               threads=(grp[0] * n_groups, 1, 1), group_size=grp)
+            return o
+
     # --- Lean GEMM fast path (contiguous, untransposed, m5_tensor regime) -----
     # The common GEMM call (both inputs row-major contiguous, M,N,K ≥ 64) routes
     # to m5_tensor.  Small/medium GEMM is short enough that the general preamble
@@ -1156,10 +1279,11 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     raise ValueError(f"unknown backend {backend}")
 
 
-def _gemv_nt(nt, matrix, vec, out_v, rows, k, ld):
+def _gemv_nt(nt_dict, matrix, vec, out_v, rows, k, ld):
     # y[r] = sum_k matrix[r, k] * vec[k] (matrix row-major M×K, one warp/row).
     n_groups = (rows + 3) // 4          # NWARPS=4, ROWS_PER_SG=1
-    nt(matrix, vec, out_v, rows, k, ld,
+    fn = _gemv_nt_pick(nt_dict, rows, k, ld)
+    fn(matrix, vec, out_v, rows, k, ld,
        threads=(128 * n_groups, 1, 1), group_size=(128, 1, 1))
 
 

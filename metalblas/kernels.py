@@ -1044,11 +1044,19 @@ using namespace metal;
 #define OUT_T       __OUT_T__
 #define ROWS_PER_SG __ROWS_PER_SG__
 #define NWARPS      __NWARPS__
+#define VEC         __VEC__
 
 // y = A @ x, A is M x K row-major.
 //   - Each threadgroup handles NWARPS * ROWS_PER_SG rows.
 //   - One warp computes ROWS_PER_SG rows: lanes split K, then simd_sum.
-//   - Reads are coalesced (lanes in a warp read consecutive K elements of a row).
+//   - Each lane owns VEC consecutive K elements per read, so a warp's 32 lanes
+//     span 32*VEC consecutive elements per iteration -- with VEC=2 (bf16) that
+//     is a full 128-B cache line, with VEC=4 two cache lines. This closes the
+//     half-cache-line waste the scalar (VEC=1) path leaves on chips where the
+//     read coalescer doesn't merge adjacent warps' half-line fetches (the M3
+//     Ultra mid-K band that used to sit at 0.73-0.82×).
+struct alignas(sizeof(IN_T) * VEC) VecT_NT { IN_T v[VEC]; };
+
 kernel void gemv_nt(
     device const IN_T   *A   [[buffer(0)]],
     device const IN_T   *x   [[buffer(1)]],
@@ -1062,6 +1070,7 @@ kernel void gemv_nt(
 {
     const int rows_per_tg = NWARPS * ROWS_PER_SG;
     int row0_tg = int(tgid.x) * rows_per_tg;
+    const int K_STRIDE = 32 * VEC;
 
     #pragma unroll
     for (int r = 0; r < ROWS_PER_SG; ++r) {
@@ -1069,16 +1078,42 @@ kernel void gemv_nt(
         if (row >= gM) return;
         const device IN_T *Arow = &A[row * gLda];
         ACC_T acc = (ACC_T)0;
-        int k = int(lane);
-        // 4-way unrolled
-        for (; k + 4*32 <= gK; k += 4*32) {
-            acc += (ACC_T)Arow[k +   0] * (ACC_T)x[k +   0];
-            acc += (ACC_T)Arow[k +  32] * (ACC_T)x[k +  32];
-            acc += (ACC_T)Arow[k +  64] * (ACC_T)x[k +  64];
-            acc += (ACC_T)Arow[k +  96] * (ACC_T)x[k +  96];
+        int k = int(lane) * VEC;
+        // 4-way unrolled: each iteration covers 4*K_STRIDE elements across the warp.
+        // The last per-lane read sits at k + 3*K_STRIDE + (VEC-1) and must be in range.
+        for (; k + 3 * K_STRIDE + VEC <= gK; k += 4 * K_STRIDE) {
+            VecT_NT a0 = *((const device VecT_NT*)(&Arow[k + 0 * K_STRIDE]));
+            VecT_NT a1 = *((const device VecT_NT*)(&Arow[k + 1 * K_STRIDE]));
+            VecT_NT a2 = *((const device VecT_NT*)(&Arow[k + 2 * K_STRIDE]));
+            VecT_NT a3 = *((const device VecT_NT*)(&Arow[k + 3 * K_STRIDE]));
+            VecT_NT x0 = *((const device VecT_NT*)(&x[k + 0 * K_STRIDE]));
+            VecT_NT x1 = *((const device VecT_NT*)(&x[k + 1 * K_STRIDE]));
+            VecT_NT x2 = *((const device VecT_NT*)(&x[k + 2 * K_STRIDE]));
+            VecT_NT x3 = *((const device VecT_NT*)(&x[k + 3 * K_STRIDE]));
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) {
+                acc += (ACC_T)a0.v[i] * (ACC_T)x0.v[i];
+                acc += (ACC_T)a1.v[i] * (ACC_T)x1.v[i];
+                acc += (ACC_T)a2.v[i] * (ACC_T)x2.v[i];
+                acc += (ACC_T)a3.v[i] * (ACC_T)x3.v[i];
+            }
         }
-        for (; k < gK; k += 32) {
-            acc += (ACC_T)Arow[k] * (ACC_T)x[k];
+        // single-stride tail: per-lane condition k+VEC<=gK lets the trailing lanes
+        // keep working even when k+K_STRIDE would push past gK (the bug that made
+        // lane 31 silently skip its last block at small K).
+        for (; k + VEC <= gK; k += K_STRIDE) {
+            VecT_NT av = *((const device VecT_NT*)(&Arow[k]));
+            VecT_NT xv = *((const device VecT_NT*)(&x[k]));
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i)
+                acc += (ACC_T)av.v[i] * (ACC_T)xv.v[i];
+        }
+        // scalar tail for K %% VEC != 0 (only lane 0 runs it; other lanes hold acc=0
+        // for these elements and simd_sum picks up lane 0's contribution).
+        if (lane == 0) {
+            int kk = (gK / VEC) * VEC;
+            for (; kk < gK; ++kk)
+                acc += (ACC_T)Arow[kk] * (ACC_T)x[kk];
         }
         acc = simd_sum(acc);
         if (lane == 0) y[row] = (OUT_T)acc;
@@ -1310,9 +1345,10 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 
 @functools.lru_cache(maxsize=None)
-def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4):
+def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
+            VEC: int = 1):
     src = _subst(GEMV_NT_SRC, IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS)
+                 ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC)
     return _compile(src).gemv_nt, src
 
 
