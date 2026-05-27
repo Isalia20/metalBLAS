@@ -854,7 +854,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         # N>=32 and M>=2: thin-N and batched-decode GEMM belong on m5_tensor
         # (BN=32/short-BM tiles beat manual m5); autotuner picks the tile.
         if (M >= 2 and N >= 32 and K >= 64 and sb[0] == K and dtype in _PROFILE
-                and a.is_contiguous() and b.is_contiguous()):
+                and a.is_contiguous() and b.is_contiguous()
+                and kernels.has_metal4()):
             # Pass a, b so a first-sight ambiguous shape autotunes, cached thereafter.
             # Plan is the lean (fn, thr, grp) tuple, or a _SplitKPlan for deep-K.
             plan = _gemm_plan(dtype, M, N, K, a, b)
@@ -893,9 +894,12 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         # m5_tensor assumes PACKED storage (ignores lda/ldb), so a strided sub-view
         # reads wrong elements; those fall back to the manual m5 kernel.
         packed_ab = (lda_ == K_ and ldb_ == N_)
+        # The m5_tensor / m5 kernels need Metal 4 cooperative-tensor headers
+        # (macOS 26+). When absent, route everything non-GEMV to the simd kernel.
+        m4 = kernels.has_metal4()
         # Wide-N M==1 fallback (only when an explicit arg bypassed gemv_t): padded
         # m5_tensor zeros OOB rows, beating VEC=1 gemv on views. bf16/fp16 only.
-        if (M == 1 and N >= 4096 and K >= 256 and is_lp
+        if (m4 and M == 1 and N >= 4096 and K >= 256 and is_lp
                 and not trans_a and not trans_b and packed_ab):
             backend = "m5_tensor"
         # Everything else GEMV-shaped goes to the dedicated kernel, which fills
@@ -904,14 +908,17 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             backend = "gemv"
         elif N == 1 and M >= 16:
             backend = "gemv"
+        elif not m4:
+            # macOS < 26: no cooperative-tensor headers. The SIMD-group GEMM is the
+            # general fallback (handles transposed / unaligned / tiny shapes too).
+            backend = "simd"
+        # m5_tensor (MPP op.run) wins across all sizes/dtypes (fp32 TF32-relaxed);
+        # bounds-checked reads handle tiny shapes. Only transposed/non-packed fall to m5.
+        elif (M >= 2 and N >= 32 and K >= 64
+                and not trans_a and not trans_b and packed_ab):
+            backend = "m5_tensor"
         else:
-            # m5_tensor (MPP op.run) wins across all sizes/dtypes (fp32 TF32-relaxed);
-            # bounds-checked reads handle tiny shapes. Only transposed/non-packed fall to m5.
-            if (M >= 2 and N >= 32 and K >= 64
-                    and not trans_a and not trans_b and packed_ab):
-                backend = "m5_tensor"
-            else:
-                backend = "m5"
+            backend = "m5"
 
     if backend == "gemv":
         return _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, out)

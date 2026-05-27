@@ -51,6 +51,24 @@ def _compile(src: str):
     return torch.mps.compile_shader(src)
 
 
+@functools.lru_cache(maxsize=1)
+def has_metal4() -> bool:
+    """True if the Metal 4 cooperative-tensor headers are available (macOS 26+).
+
+    The m5_tensor / m5_gemm / splitk / conv1x1 kernels #include
+    <metal_cooperative_tensor> and use mpp::tensor_ops, which only ship with
+    Metal 4. On older macOS, compile_shader fails with "file not found". Probe
+    once with a minimal kernel and cache the result so dispatch can route to the
+    simd/gemv fallbacks instead of emitting a cryptic compile error.
+    """
+    probe = "#include <metal_cooperative_tensor>\n[[kernel]] void _mb_metal4_probe() {}\n"
+    try:
+        torch.mps.compile_shader(probe)
+        return True
+    except Exception:
+        return False
+
+
 @functools.lru_cache(maxsize=None)
 def simd_gemm(in_t: str, acc_t: str, out_t: str,
               BM: int, BN: int, BK: int, WM: int, WN: int,
