@@ -9,6 +9,7 @@ import torch
 # Allow running from project root or anywhere
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from metalblas import matmul as mb_matmul
+from metalblas.kernels import has_metal4
 
 
 def check(M, N, K, dtype, backend="auto", tile=None, atol=None):
@@ -68,18 +69,24 @@ def main():
     print("=== fp16, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
         check(*shape, dtype=torch.float16, backend="simd")
-    print("=== fp32, m5 backend ===")
-    for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-        check(*shape, dtype=torch.float32, backend="m5")
-    print("=== fp16, m5 backend ===")
-    for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-        check(*shape, dtype=torch.float16, backend="m5")
+    # m5 / m5_tensor backends need Metal 4 cooperative-tensor headers (macOS 26+).
+    m4 = has_metal4()
+    if m4:
+        print("=== fp32, m5 backend ===")
+        for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
+            check(*shape, dtype=torch.float32, backend="m5")
+        print("=== fp16, m5 backend ===")
+        for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
+            check(*shape, dtype=torch.float16, backend="m5")
+    else:
+        print("=== m5 backend: SKIPPED (Metal 4 / macOS 26+ not available) ===")
     print("=== bf16, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
         check(*shape, dtype=torch.bfloat16, backend="simd")
-    print("=== bf16, m5 backend ===")
-    for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-        check(*shape, dtype=torch.bfloat16, backend="m5")
+    if m4:
+        print("=== bf16, m5 backend ===")
+        for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
+            check(*shape, dtype=torch.bfloat16, backend="m5")
     print("=== Transposed inputs ===")
     for shape in [(128, 128, 128), (513, 257, 129), (1024, 1024, 256)]:
         for dt in [torch.float32, torch.float16, torch.bfloat16]:
