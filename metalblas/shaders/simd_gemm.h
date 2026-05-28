@@ -20,10 +20,12 @@ using namespace metal;
 #define K_ALIGNED   __K_ALIGNED__
 #define SWIZZLE_LOG __SWIZZLE_LOG__
 #define OUT_IS_ACC  __OUT_IS_ACC__
+#define DBUF        __DBUF__
 
 #define SG_SIZE     32
 #define WARPS       (WM * WN)
 #define TGP_SIZE    (WARPS * SG_SIZE)
+#define NBUF        (DBUF ? 2 : 1)
 
 constant constexpr int WT_M = BM / WM;
 constant constexpr int WT_N = BN / WN;
@@ -161,8 +163,9 @@ kernel void simd_gemm(
     uint         sgid                [[simdgroup_index_in_threadgroup]],
     uint         lane                [[thread_index_in_simdgroup]])
 {
-    threadgroup IN_T As[BM * LDA_TGP];
-    threadgroup IN_T Bs[BK * LDB_TGP];
+    // Double-buffered (NBUF=2) when DBUF==1, single buffer otherwise.
+    threadgroup IN_T As[NBUF * BM * LDA_TGP];
+    threadgroup IN_T Bs[NBUF * BK * LDB_TGP];
 
     int tid = int(sgid) * SG_SIZE + int(lane);
 
@@ -191,6 +194,47 @@ kernel void simd_gemm(
     int k_tiles_full = gK / BK;
     int k_tail       = gK - k_tiles_full * BK;
 
+#if DBUF
+    // Double-buffered K-loop: issue the next K-tile's global loads while the
+    // current tile's MMAs run, so memory latency overlaps compute (one barrier
+    // per K-tile instead of two, and no load/compute serialization).
+    if (k_tiles_full > 0) {
+        load_A_tile(As, A, gLda, gM, gK, m_block, 0, tid, BK);
+        load_B_tile(Bs, B, gLdb, gN, gK, 0, n_block, tid, BK);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int kt = 0; kt < k_tiles_full; ++kt) {
+        int cur_a = (kt & 1) * (BM * LDA_TGP);
+        int cur_b = (kt & 1) * (BK * LDB_TGP);
+        if (kt + 1 < k_tiles_full) {
+            int nxt_a = ((kt + 1) & 1) * (BM * LDA_TGP);
+            int nxt_b = ((kt + 1) & 1) * (BK * LDB_TGP);
+            load_A_tile(As + nxt_a, A, gLda, gM, gK, m_block, (kt + 1) * BK, tid, (kt + 2) * BK);
+            load_B_tile(Bs + nxt_b, B, gLdb, gN, gK, (kt + 1) * BK, n_block, tid, (kt + 2) * BK);
+        }
+        threadgroup IN_T *As_use = As + cur_a;
+        threadgroup IN_T *Bs_use = Bs + cur_b;
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk += 8) {
+            simdgroup_matrix<IN_T, 8, 8> Afrag[TM];
+            simdgroup_matrix<IN_T, 8, 8> Bfrag[TN];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                simdgroup_load(Afrag[i], &As_use[(warp_m + i * 8) * LDA_TGP + kk], LDA_TGP);
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                simdgroup_load(Bfrag[j], &Bs_use[kk * LDB_TGP + warp_n + j * 8], LDB_TGP);
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    simdgroup_multiply_accumulate(Cfrag[i][j], Afrag[i], Bfrag[j], Cfrag[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#else
     for (int kt = 0; kt < k_tiles_full; ++kt) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         load_A_tile(As, A, gLda, gM, gK, m_block, kt * BK, tid, (kt + 1) * BK);
@@ -218,6 +262,7 @@ kernel void simd_gemm(
                     simdgroup_multiply_accumulate(Cfrag[i][j], Afrag[i], Bfrag[j], Cfrag[i][j]);
         }
     }
+#endif
 
 #if !K_ALIGNED
     if (k_tail > 0) {

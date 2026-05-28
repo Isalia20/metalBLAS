@@ -74,7 +74,8 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
               BM: int, BN: int, BK: int, WM: int, WN: int,
               trans_a: bool, trans_b: bool,
               mn_aligned: bool, k_aligned: bool,
-              swizzle_log: int = 0):
+              swizzle_log: int = 0,
+              dbuf: bool = False):
     src = _build(
         "MB_BUILD_SIMD_GEMM",
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
@@ -83,6 +84,7 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
         MN_ALIGNED=int(mn_aligned), K_ALIGNED=int(k_aligned),
         OUT_IS_ACC=int(out_t == acc_t),
         SWIZZLE_LOG=swizzle_log,
+        DBUF=int(dbuf),
     )
     lib = _compile(src)
     return lib.simd_gemm, src

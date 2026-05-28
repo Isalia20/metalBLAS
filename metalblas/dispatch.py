@@ -496,6 +496,115 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
     return plan
 
 
+# Simd-path plan cache (the macOS<26 GEMM fallback). Mirrors _GEMM_PLAN.
+# The best (tile, dbuf) for the simdgroup_matrix kernel shifts with GPU core count
+# and occupancy, so the winner is autotuned at runtime (as the m5_tensor path does).
+# Candidate 0 is the static heuristic.
+_SIMD_PLAN: dict = {}
+_SIMD_TILE: dict = {}
+
+
+def _build_simd_plan(dtype, M, N, K, BM, BN, BK, WM, WN, dbuf):
+    """Compile one simd_gemm tile and return its (fn, threads, group) launch plan
+    for the packed, untransposed case (lda=K, ldb=N, ldc=N)."""
+    in_t, acc_t, out_t = _PROFILE[dtype]
+    mn_aligned = (M % BM == 0) and (N % BN == 0)
+    k_aligned = (K % BK == 0)
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
+    swz = _round_swizzle_log(tiles_m, tiles_n)
+    fn, _ = kernels.simd_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
+                              False, False, mn_aligned, k_aligned, swz, dbuf=dbuf)
+    gsz = WM * WN * 32
+    tf = 1 << swz
+    total = (gsz * tiles_n * tf, (tiles_m + tf - 1) // tf, 1)
+    return (fn, total, (gsz, 1, 1))
+
+
+def _simd_configs(M, N, K, dtype):
+    """(BM,BN,BK,WM,WN,dbuf) candidates for the simd fallback; entry 0 is the
+    default (heuristic tile + double-buffer if it fits). Each tile is offered with
+    and without dbuf so the autotuner can resolve the occupancy/latency trade per
+    device."""
+    db = 4 if dtype == torch.float32 else 2
+
+    def fits(BM, BN, BK, factor):
+        return factor * _threadgroup_bytes(BM, BN, BK, db) <= 32 * 1024
+
+    def dbuf_ok(BM, BN, BK):
+        return K > BK and fits(BM, BN, BK, 2)
+
+    BMp, BNp, BKp, WMp, WNp = _pick_simd_tile(M, N, K, dtype)
+    configs = [(BMp, BNp, BKp, WMp, WNp, dbuf_ok(BMp, BNp, BKp))]
+
+    mx = max(M, N)
+    if mx >= 1024:
+        shortlist = [(128, 128, 32, 4, 4), (128, 128, 16, 4, 4), (64, 64, 16, 2, 2),
+                     (64, 128, 32, 2, 4), (128, 64, 32, 4, 2)]
+    elif mx >= 256:
+        shortlist = [(64, 64, 16, 2, 2), (64, 128, 16, 2, 4), (128, 64, 16, 4, 2),
+                     (64, 64, 32, 2, 2), (32, 64, 16, 1, 2)]
+    else:
+        shortlist = [(32, 32, 16, 1, 1), (64, 64, 16, 2, 2), (32, 64, 16, 1, 2),
+                     (32, 32, 32, 1, 1)]
+    for (BM, BN, BK, WM, WN) in shortlist:
+        if not fits(BM, BN, BK, 1):
+            continue                       # single buffer must fit 32 KB
+        for dbuf in ((False, True) if dbuf_ok(BM, BN, BK) else (False,)):
+            cfg = (BM, BN, BK, WM, WN, dbuf)
+            if cfg not in configs:
+                configs.append(cfg)
+    return configs[:8]                     # bound the one-time probe cost
+
+
+def _autotune_simd(dtype, M, N, K, configs, a, b, margin=_AUTOTUNE_MARGIN):
+    """Time each (tile, dbuf) config best-of-reps; return the fastest (plan, label).
+    Config 0 (heuristic) is kept unless beaten by >margin (same rule as m5_tensor)."""
+    warmup, iters, reps = _probe_params(M, N, K)
+    o = a.new_empty(M, N)
+    cand = []
+    for (BM, BN, BK, WM, WN, dbuf) in configs:
+        fn, thr, grp = _build_simd_plan(dtype, M, N, K, BM, BN, BK, WM, WN, dbuf)
+        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp:
+               fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp))
+        cand.append(((fn, thr, grp), run, (BM, BN, BK, WM, WN, dbuf)))
+
+    for (_, run, _) in cand:
+        for _ in range(warmup):
+            run(a, b, o)
+    torch.mps.synchronize()
+
+    times = [float("inf")] * len(cand)
+    for _ in range(reps):
+        for j, (_, run, _) in enumerate(cand):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                run(a, b, o)
+            torch.mps.synchronize()
+            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
+
+    i = min(range(len(times)), key=lambda j: times[j])
+    if i != 0 and times[i] < times[0] * (1.0 - margin):
+        return cand[i][0], cand[i][2]
+    return cand[0][0], cand[0][2]
+
+
+def _simd_plan(dtype, M, N, K, a=None, b=None):
+    """Cached launch plan for the simd_gemm fallback, autotuned on first sight."""
+    key = (dtype, M, N, K)
+    plan = _SIMD_PLAN.get(key)
+    if plan is None:
+        configs = _simd_configs(M, N, K, dtype)
+        if _AUTOTUNE and a is not None and len(configs) > 1:
+            plan, tile = _autotune_simd(dtype, M, N, K, configs, a, b)
+        else:
+            tile = configs[0]
+            plan = _build_simd_plan(dtype, M, N, K, *tile)
+        _SIMD_PLAN[key] = plan
+        _SIMD_TILE[key] = tile
+    return plan
+
+
 # Recycled output buffers: short ops' per-call new_empty tail can flip a win to a
 # loss. Reuse only a released buffer (getrefcount == 2); large outputs skip the pool.
 _OUT_POOL: dict = {}
@@ -854,11 +963,15 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         # N>=32 and M>=2: thin-N and batched-decode GEMM belong on m5_tensor
         # (BN=32/short-BM tiles beat manual m5); autotuner picks the tile.
         if (M >= 2 and N >= 32 and K >= 64 and sb[0] == K and dtype in _PROFILE
-                and a.is_contiguous() and b.is_contiguous()
-                and kernels.has_metal4()):
-            # Pass a, b so a first-sight ambiguous shape autotunes, cached thereafter.
-            # Plan is the lean (fn, thr, grp) tuple, or a _SplitKPlan for deep-K.
-            plan = _gemm_plan(dtype, M, N, K, a, b)
+                and a.is_contiguous() and b.is_contiguous()):
+            # Pass a, b so a first-sight shape autotunes, cached thereafter. With
+            # Metal 4 this is the m5_tensor plan; on macOS<26 (no cooperative-tensor
+            # headers) it's the autotuned simd_gemm fallback. Both yield a lean
+            # (fn, thr, grp) tuple (or, for m5_tensor deep-K, a _SplitKPlan).
+            if kernels.has_metal4():
+                plan = _gemm_plan(dtype, M, N, K, a, b)
+            else:
+                plan = _simd_plan(dtype, M, N, K, a, b)
             o = _pooled_out(a, M, N)
             if type(plan) is tuple:
                 fn, thr, grp = plan
@@ -924,14 +1037,27 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         return _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, out)
 
     if backend == "simd":
-        BM, BN, BK, WM, WN = tile if tile else _pick_simd_tile(M_, N_, K_, dtype)
+        dbuf = None
+        if tile:
+            if len(tile) >= 6:
+                BM, BN, BK, WM, WN, dbuf = tile[:6]
+            else:
+                BM, BN, BK, WM, WN = tile[:5]
+        else:
+            BM, BN, BK, WM, WN = _pick_simd_tile(M_, N_, K_, dtype)
+        if dbuf is None:
+            # Double-buffer only when the ping-pong tiles still fit 32 KB of
+            # threadgroup memory and K spans >1 tile (else the prologue is waste).
+            db = 4 if dtype == torch.float32 else 2
+            dbuf = (K_ > BK) and (2 * _threadgroup_bytes(BM, BN, BK, db) <= 32 * 1024)
         mn_aligned = (M_ % BM == 0) and (N_ % BN == 0)
         k_aligned  = (K_ % BK == 0)
         tiles_m = (M_ + BM - 1) // BM
         tiles_n = (N_ + BN - 1) // BN
         swz = swizzle_log if swizzle_log is not None else _round_swizzle_log(tiles_m, tiles_n)
         fn, _ = kernels.simd_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
-                                  trans_a, trans_b, mn_aligned, k_aligned, swz)
+                                  trans_a, trans_b, mn_aligned, k_aligned, swz,
+                                  dbuf=bool(dbuf))
         group_size = (WM * WN * 32, 1, 1)
         tile_factor = 1 << swz
         tn_swz = tiles_n * tile_factor
