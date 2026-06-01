@@ -91,7 +91,8 @@ static inline void load_A_tile(threadgroup IN_T   *As,
         bool m_ok = (a_row0 + rl) < M;
         int gc_k0 = a_col0 + local_col0;
         bool k_full = (gc_k0 + VEC) <= kbound;
-        if (m_ok && k_full) {
+        // VecF load needs lda VEC-aligned; else unaligned load corrupts results.
+        if (m_ok && k_full && (lda % VEC) == 0) {
             acc = *((const device VecF*)(&A[(a_row0 + rl) * lda + gc_k0]));
         } else {
             #pragma unroll
@@ -132,7 +133,8 @@ static inline void load_B_tile(threadgroup IN_T *Bs,
 #else
         bool k_ok = gk < kbound;
         bool n_full = (n_global + VEC) <= N;
-        if (k_ok && n_full) {
+        // VecF load needs ldb VEC-aligned; else unaligned load corrupts results.
+        if (k_ok && n_full && (ldb % VEC) == 0) {
             acc = *((const device VecF*)(&B[gk * ldb + n_global]));
         } else if (k_ok) {
             #pragma unroll
