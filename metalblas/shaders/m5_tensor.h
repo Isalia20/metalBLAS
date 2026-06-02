@@ -20,11 +20,39 @@ using namespace mpp::tensor_ops;
 #define MN_ALIGNED  __MN_ALIGNED__
 #define STATIC_SLICE __STATIC_SLICE__
 
+// Write the BM x BN tile from cT_f32 into cT_out (addmm epilogue when EPILOGUE); the
+// fragment index gives (col, row) so the broadcast bias lands right. VALIDATE skips
+// out-of-tile elements (partial edge / unaligned tiles).
+#if EPILOGUE
+#define MB_STORE_TILE(VALIDATE) do {                                              \
+    _Pragma("unroll")                                                            \
+    for (uint16_t _e = 0; _e < cT_f32.get_capacity(); ++_e)                      \
+        if (!(VALIDATE) || cT_f32.is_valid_element(_e)) {                         \
+            auto _idx = cT_f32.get_multidimensional_index(_e);                    \
+            int _r = m_off + (int)_idx[1], _c = n_off + (int)_idx[0];             \
+            cT_out[_e] = mb_epi<OUT_T, float, float>(                             \
+                cT_f32[_e], bias, _r * bstride.x + _c * bstride.y, beta, alpha);  \
+        }                                                                         \
+} while (0)
+#else
+#define MB_STORE_TILE(VALIDATE) do {                                              \
+    for (uint16_t _i = 0; _i < cT_f32.get_capacity(); ++_i)                      \
+        if (!(VALIDATE) || cT_f32.is_valid_element(_i))                           \
+            cT_out[_i] = (OUT_T)cT_f32[_i];                                        \
+} while (0)
+#endif
+
 kernel void m5_tensor_gemm(
     device IN_T   *A   [[buffer(0)]],
     device IN_T   *B   [[buffer(1)]],
     device OUT_T  *C   [[buffer(2)]],
     constant int4&  gP [[buffer(3)]],   // packed (gM, gN, gK); lda/ldb/ldc unused (packed storage)
+#if EPILOGUE
+    device const OUT_T *bias [[buffer(4)]],   // addmm input; bstride = (row, col) broadcast strides
+    constant int2&  bstride  [[buffer(5)]],
+    constant float& beta     [[buffer(6)]],
+    constant float& alpha    [[buffer(7)]],
+#endif
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
     int gM = gP.x, gN = gP.y, gK = gP.z;
@@ -64,8 +92,7 @@ kernel void m5_tensor_gemm(
         auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
         op.run(mA, mB, cT_f32);
         auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
-        for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
-            if (cT_f32.is_valid_element(i)) cT_out[i] = (OUT_T)cT_f32[i];
+        MB_STORE_TILE(1);
         cT_out.store(mC);
         return;
     }
@@ -76,8 +103,7 @@ kernel void m5_tensor_gemm(
     auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
     op.run(mA, mB, cT_f32);
     auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
-    for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
-        cT_out[i] = (OUT_T)cT_f32[i];
+    MB_STORE_TILE(0);
     cT_out.store(mC);
 #else
     // Transposed operands keep the dynamic-slice path; it is off the hot path
@@ -89,11 +115,9 @@ kernel void m5_tensor_gemm(
     op.run(mA, mB, cT_f32);
     auto cT_out = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), OUT_T>();
   #if MN_ALIGNED
-    for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
-        cT_out[i] = (OUT_T)cT_f32[i];
+    MB_STORE_TILE(0);
   #else
-    for (uint16_t i = 0; i < cT_f32.get_capacity(); ++i)
-        if (cT_f32.is_valid_element(i)) cT_out[i] = (OUT_T)cT_f32[i];
+    MB_STORE_TILE(1);
   #endif
     cT_out.store(mC);
 #endif

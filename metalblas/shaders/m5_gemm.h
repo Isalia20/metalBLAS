@@ -156,6 +156,12 @@ kernel void m5_gemm(
     device const IN_T   *B           [[buffer(1)]],
     device       OUT_T  *C           [[buffer(2)]],
     constant MBGemmDims& gP          [[buffer(3)]],   // packed (M, N, K, lda, ldb, ldc)
+#if EPILOGUE
+    device const OUT_T *bias         [[buffer(4)]],   // addmm input; bstride = (row, col) broadcast strides
+    constant int2&  bstride          [[buffer(5)]],
+    constant ACC_T& beta             [[buffer(6)]],
+    constant ACC_T& alpha            [[buffer(7)]],
+#endif
     uint3        tgid                [[threadgroup_position_in_grid]],
     uint         sgid                [[simdgroup_index_in_threadgroup]],
     uint         lane                [[thread_index_in_simdgroup]])
@@ -416,11 +422,17 @@ kernel void m5_gemm(
             for (int e = 0; e < C_ELEM_PER_THR; ++e) {
                 int r = base_row + c_om[e];
                 int c = base_col + c_on[e];
+#if EPILOGUE
+                OUT_T outv = mb_epi<OUT_T, ACC_T, ACC_T>(
+                    Cacc[frag_off + e], bias, r * bstride.x + c * bstride.y, beta, alpha);
+#else
+                OUT_T outv = (OUT_T)Cacc[frag_off + e];
+#endif
 #if MN_ALIGNED
-                C[r * gLdc + c] = (OUT_T)Cacc[frag_off + e];
+                C[r * gLdc + c] = outv;
 #else
                 if (r < gM && c < gN)
-                    C[r * gLdc + c] = (OUT_T)Cacc[frag_off + e];
+                    C[r * gLdc + c] = outv;
 #endif
             }
         }

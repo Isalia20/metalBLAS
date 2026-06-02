@@ -21,6 +21,12 @@ kernel void gemv_nt(
     device const IN_T   *x   [[buffer(1)]],
     device       OUT_T  *y   [[buffer(2)]],
     constant int4&  gP       [[buffer(3)]],   // packed (gM, gK, gLda)
+#if EPILOGUE
+    device const OUT_T *bias [[buffer(4)]],   // addmm input; bstep = its stride per output row
+    constant int&   bstep    [[buffer(5)]],
+    constant ACC_T& beta     [[buffer(6)]],
+    constant ACC_T& alpha    [[buffer(7)]],
+#endif
     uint3        tgid        [[threadgroup_position_in_grid]],
     uint         sgid        [[simdgroup_index_in_threadgroup]],
     uint         lane        [[thread_index_in_simdgroup]])
@@ -83,11 +89,20 @@ kernel void gemv_nt(
             ACC_T s = (ACC_T)0;
             #pragma unroll
             for (int i = 0; i < 32; ++i) s += part[sgid][i];
+#if EPILOGUE
+            y[row] = mb_epi<OUT_T, ACC_T, ACC_T>(s, bias, row * bstep, beta, alpha);
+#else
             y[row] = (OUT_T)s;
+#endif
         }
 #else
         acc = simd_sum(acc);
-        if (lane == 0) y[row] = (OUT_T)acc;
+        if (lane == 0)
+#if EPILOGUE
+            y[row] = mb_epi<OUT_T, ACC_T, ACC_T>(acc, bias, row * bstep, beta, alpha);
+#else
+            y[row] = (OUT_T)acc;
+#endif
 #endif
     }
 }

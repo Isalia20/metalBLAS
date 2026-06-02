@@ -16,6 +16,14 @@ kernel void cgemv_t(
     device const C2 *x  [[buffer(1)]],
     device       C2 *y  [[buffer(2)]],
     constant int4&  gP  [[buffer(3)]],   // packed (gN, gK, gLdb, gXs)
+#if EPILOGUE
+    device const C2* bias    [[buffer(4)]],   // addmm input; bstep = its stride per output col
+    constant int&   bstep    [[buffer(5)]],
+    constant float& beta_re  [[buffer(6)]],
+    constant float& beta_im  [[buffer(7)]],
+    constant float& alpha_re [[buffer(8)]],
+    constant float& alpha_im [[buffer(9)]],
+#endif
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  sgid [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
@@ -49,7 +57,24 @@ kernel void cgemv_t(
         ACC2 s = ACC2(0);
         #pragma unroll
         for (int w = 0; w < NWARPS; ++w) s += partials[w][lane];
-        if (n < gN) y[n] = C2((R)s.x, (R)s.y);
+        if (n < gN) {
+#if EPILOGUE
+            // out = alpha*(s) + beta*bias as a complex multiply (mirrors complex_combine).
+            float outr = 0.0f, outi = 0.0f;
+#if ALPHA_NZ
+            outr += alpha_re * s.x - alpha_im * s.y;
+            outi += alpha_re * s.y + alpha_im * s.x;
+#endif
+#if BETA_NZ
+            C2 bv = bias[n * bstep];
+            outr += beta_re * (float)bv.x - beta_im * (float)bv.y;
+            outi += beta_re * (float)bv.y + beta_im * (float)bv.x;
+#endif
+            y[n] = C2((R)outr, (R)outi);
+#else
+            y[n] = C2((R)s.x, (R)s.y);
+#endif
+        }
     }
 }
 #endif  // MB_BUILD_CGEMV_T

@@ -29,6 +29,21 @@ b = torch.randint(-8, 8, (1024, 1024), device="mps", dtype=torch.int32)
 c = matmul(a, b)   # integer GEMM, ~3x torch.matmul
 ```
 
+`addmm` is the fused BLAS GEMM `C = beta*input + alpha*(mat1 @ mat2)` that
+`nn.Linear` lowers to. The bias and scales are fused into the GEMM/GEMV kernels, so it
+runs at ~parity with `matmul` for every dtype above and matches `torch.addmm` (broadcast
+bias, `beta`/`alpha` scaling, the `beta==0` drop-the-bias rule, bit-exact for integers):
+
+```python
+from metalblas import addmm
+
+x = torch.randn(2048, 4096, device="mps", dtype=torch.bfloat16)
+w = torch.randn(4096, 1024, device="mps", dtype=torch.bfloat16)
+bias = torch.randn(1024, device="mps", dtype=torch.bfloat16)
+y = addmm(bias, x, w)                 # == nn.Linear(x, w, bias)
+y = addmm(bias, x, w, beta=0.5, alpha=2.0)
+```
+
 You can override the backend and tile for the real dtypes if needed:
 
 ```python
@@ -57,6 +72,13 @@ Dispatch picks a kernel from shape and dtype:
   types) and truncating to the output width is bit-identical to torch's
   wrap-on-overflow (two's-complement add/mul are mod 2^w), so there's no precision
   tradeoff - integer matmul matches torch exactly.
+- **addmm** - `C = beta*input + alpha*(A@B)`. Each backend builds an `EPILOGUE`
+  variant (a shared `mb_epi` store helper) that applies the broadcast bias and
+  `beta`/`alpha` scaling, so addmm costs ~the same as the bare matmul. (Complex folds
+  the bias into the four-product `complex_combine` pass it already does.)
+  `beta`/`alpha == 0` are compiled out so a skipped operand's NaN/Inf can't leak into
+  `C`, matching torch's drop-the-operand rule. fp32 ~2x and integer ~3x vs
+  `torch.addmm`; bf16/fp16 ~parity.
 
 A runtime autotuner probes a short tile-candidate list on the real operands the
 first time it sees a bf16/fp16 shape and caches the winner (disable with
