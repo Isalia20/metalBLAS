@@ -121,6 +121,46 @@ def check_complex(M, N, K, dtype, layout="rm", rtol=None):
     return ok
 
 
+_INT_BITS = {torch.int8: 8, torch.uint8: 8, torch.int16: 16, torch.int32: 32}
+
+
+def _int_ref(a, b, dtype):
+    """Exact integer reference: accumulate in int64 on CPU, then truncate to the
+    output width (two's-complement wrap) - matches torch's integer matmul exactly."""
+    r = a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)
+    if dtype == torch.int64:
+        return r                       # int64 already wrapped mod 2^64 on CPU
+    mod = 1 << _INT_BITS[dtype]
+    r = r % mod
+    if dtype != torch.uint8:           # signed: fold high half to negative
+        r = torch.where(r >= (mod >> 1), r - mod, r)
+    return r.to(dtype)
+
+
+def _int_rand(*shape, dtype, lim=40):
+    if dtype == torch.uint8:
+        return torch.randint(0, 2 * lim, shape, device='mps', dtype=dtype)
+    info = torch.iinfo(dtype)
+    return torch.randint(max(info.min, -lim), min(info.max, lim), shape, device='mps', dtype=dtype)
+
+
+def check_int(M, N, K, dtype, layout="rm"):
+    """Integer matmul must be BIT-EXACT vs torch (no precision tradeoff: ACC>=output
+    width + truncate is identical to torch's wrap-on-overflow)."""
+    torch.manual_seed(0)
+    a = _int_rand(M, K, dtype=dtype)
+    b = _int_rand(K, N, dtype=dtype)
+    if layout == "tr":            # transposed (col-major) A view
+        a = _int_rand(K, M, dtype=dtype).t()
+    c = mb_matmul(a, b)
+    ref = _int_ref(a, b, dtype)
+    ok = torch.equal(c.cpu(), ref) and c.dtype == dtype
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:6s} {layout:3s} {M:5d}x{N:5d}x{K:5d} "
+          f"{'bit-exact' if ok else 'MISMATCH'}")
+    return ok
+
+
 def main():
     print("=== fp32, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256), (33, 33, 33)]:
@@ -179,6 +219,20 @@ def main():
     print("=== complex32 (chalf) ===")
     for shape in [(256, 256, 256), (512, 512, 512), (1, 2048, 2048), (2048, 1, 2048)]:
         check_complex(*shape, dtype=torch.complex32)
+
+    int_dtypes = [torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64]
+    print("=== integer GEMM (bit-exact) ===")
+    for dt in int_dtypes:
+        for shape in [(64, 64, 64), (256, 256, 256), (513, 257, 129), (333, 444, 555),
+                      (1024, 1024, 1024), (96, 4096, 512), (33, 33, 33)]:
+            check_int(*shape, dtype=dt)
+    print("=== integer GEMV (M==1 / N==1) ===")
+    for dt in int_dtypes:
+        for shape in [(1, 4096, 4096), (4096, 1, 4096), (1, 1024, 257), (300, 1, 1024)]:
+            check_int(*shape, dtype=dt)
+    print("=== integer transposed views ===")
+    for dt in int_dtypes:
+        check_int(256, 256, 256, dtype=dt, layout="tr")
 
 
 if __name__ == "__main__":

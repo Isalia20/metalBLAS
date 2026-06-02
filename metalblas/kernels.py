@@ -168,9 +168,10 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 @functools.lru_cache(maxsize=None)
 def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
-            VEC: int = 1):
+            VEC: int = 1, red_tg: bool = False):
+    # red_tg: reduce via threadgroup mem instead of simd_sum (int64: no simd_sum(long)).
     src = _build("MB_BUILD_GEMV_NT", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC)
+                 ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC, RED_TG=int(red_tg))
     return _compile(src).gemv_nt, src
 
 
@@ -203,3 +204,13 @@ def complex_pack(c2_t: str, r_t: str):
     src = _build("MB_BUILD_COMPLEX_PACK", C2=c2_t, R=r_t)
     lib = _compile(src)
     return lib.complex_split, lib.complex_combine
+
+
+@functools.lru_cache(maxsize=None)
+def int_gemm(in_t: str, acc_t: str, out_t: str, BM: int, BN: int, BK: int,
+             TX: int, TY: int, trans_a: bool, trans_b: bool):
+    """Register-tiled integer GEMM (simdgroup_matrix / the tensor unit are float-only)."""
+    src = _build("MB_BUILD_INT_GEMM", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                 BM=BM, BN=BN, BK=BK, TX=TX, TY=TY,
+                 TRANS_A=int(trans_a), TRANS_B=int(trans_b))
+    return _compile(src).int_gemm, src

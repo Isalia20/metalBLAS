@@ -9,6 +9,8 @@ using namespace metal;
 #define ROWS_PER_SG __ROWS_PER_SG__
 #define NWARPS      __NWARPS__
 #define VEC         __VEC__
+// RED_TG=1 reduces per-warp partials via threadgroup mem (int64: no simd_sum(long)).
+#define RED_TG      __RED_TG__
 
 // y = A @ x (A is M x K row-major). Each warp does ROWS_PER_SG rows; lanes split K
 // then simd_sum, each reading VEC elements so a warp spans a full cache line.
@@ -24,6 +26,9 @@ kernel void gemv_nt(
     uint         lane        [[thread_index_in_simdgroup]])
 {
     int gM = gP.x, gK = gP.y, gLda = gP.z;
+#if RED_TG
+    threadgroup ACC_T part[NWARPS][32];   // per-warp lane partials (no simd_sum for long)
+#endif
     const int rows_per_tg = NWARPS * ROWS_PER_SG;
     int row0_tg = int(tgid.x) * rows_per_tg;
     const int K_STRIDE = 32 * VEC;
@@ -68,8 +73,22 @@ kernel void gemv_nt(
             for (; kk < gK; ++kk)
                 acc += (ACC_T)Arow[kk] * (ACC_T)x[kk];
         }
+#if RED_TG
+        // simdgroup_barrier, not threadgroup_barrier: the out-of-range-row return above
+        // is divergent across warps and would deadlock a full threadgroup barrier.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        part[sgid][lane] = acc;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            ACC_T s = (ACC_T)0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) s += part[sgid][i];
+            y[row] = (OUT_T)s;
+        }
+#else
         acc = simd_sum(acc);
         if (lane == 0) y[row] = (OUT_T)acc;
+#endif
     }
 }
 #endif  // MB_BUILD_GEMV_NT

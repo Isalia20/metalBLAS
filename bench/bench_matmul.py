@@ -15,10 +15,17 @@ sys.path.insert(0, REPO_ROOT)
 import metalblas
 
 
+def _rand(M, K, dtype):
+    if not (dtype.is_floating_point or dtype.is_complex):
+        lo = 0 if dtype == torch.uint8 else -4
+        return torch.randint(lo, 4, (M, K), device='mps', dtype=dtype)
+    return torch.randn(M, K, device='mps', dtype=dtype)
+
+
 def bench(M, N, K, dtype, fn, iters=100, trials=10, warmup=50):
     torch.manual_seed(0)
-    a = torch.randn(M, K, device='mps', dtype=dtype)
-    b = torch.randn(K, N, device='mps', dtype=dtype)
+    a = _rand(M, K, dtype)
+    b = _rand(K, N, dtype)
     for _ in range(warmup):
         c = fn(a, b)
     torch.mps.synchronize()
@@ -145,7 +152,8 @@ def write_perf_report(*, cool: float = 0.0) -> str:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dtype", default="all",
-                   choices=["fp32", "fp16", "bf16", "c64", "c32", "all"])
+                   choices=["fp32", "fp16", "bf16", "c64", "c32",
+                            "i8", "u8", "i16", "i32", "i64", "all"])
     p.add_argument("--group", default="all",
                    choices=list(SHAPES.keys()) + ["all"])
     p.add_argument("--cool", type=float, default=0.0,
@@ -164,6 +172,11 @@ def main():
     if args.dtype in ("bf16", "all"): dtypes.append(torch.bfloat16)
     if args.dtype in ("c64",): dtypes.append(torch.complex64)
     if args.dtype in ("c32",): dtypes.append(torch.complex32)
+    if args.dtype in ("i8",):  dtypes.append(torch.int8)
+    if args.dtype in ("u8",):  dtypes.append(torch.uint8)
+    if args.dtype in ("i16",): dtypes.append(torch.int16)
+    if args.dtype in ("i32",): dtypes.append(torch.int32)
+    if args.dtype in ("i64",): dtypes.append(torch.int64)
 
     groups = list(SHAPES.keys()) if args.group == "all" else [args.group]
 
