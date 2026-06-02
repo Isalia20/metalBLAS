@@ -18,13 +18,12 @@ kernel void gemv_nt(
     device const IN_T   *A   [[buffer(0)]],
     device const IN_T   *x   [[buffer(1)]],
     device       OUT_T  *y   [[buffer(2)]],
-    constant int& gM         [[buffer(3)]],
-    constant int& gK         [[buffer(4)]],
-    constant int& gLda       [[buffer(5)]],
+    constant int4&  gP       [[buffer(3)]],   // packed (gM, gK, gLda)
     uint3        tgid        [[threadgroup_position_in_grid]],
     uint         sgid        [[simdgroup_index_in_threadgroup]],
     uint         lane        [[thread_index_in_simdgroup]])
 {
+    int gM = gP.x, gK = gP.y, gLda = gP.z;
     const int rows_per_tg = NWARPS * ROWS_PER_SG;
     int row0_tg = int(tgid.x) * rows_per_tg;
     const int K_STRIDE = 32 * VEC;

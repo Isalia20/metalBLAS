@@ -19,11 +19,10 @@ kernel void conv1x1_gemm(
     device IN_T   *A   [[buffer(0)]],
     device IN_T   *B   [[buffer(1)]],
     device OUT_T  *C   [[buffer(2)]],
-    constant int& gM   [[buffer(3)]],
-    constant int& gN   [[buffer(4)]],
-    constant int& gK   [[buffer(5)]],
+    constant int4& gP  [[buffer(3)]],   // packed (gM, gN, gK)
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
+    int gM = gP.x, gN = gP.y, gK = gP.z;
     tensor<device IN_T, dextents<int32_t, 4>, tensor_inline> tA(A, dextents<int32_t, 4>(gK, gM, 1, 1));
     tensor<device IN_T, dextents<int32_t, 4>, tensor_inline> tW(B, dextents<int32_t, 4>(gN, gK, 1, 1));
     tensor<device OUT_T, dextents<int32_t, 4>, tensor_inline> tC(C, dextents<int32_t, 4>(gN, gM, 1, 1));

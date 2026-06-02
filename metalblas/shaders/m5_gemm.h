@@ -148,20 +148,20 @@ static inline void load_B_tile(threadgroup IN_T *Bs,
     }
 }
 
+// Dims + leading strides packed into one constant buffer (one setBytes, not six).
+struct MBGemmDims { int M, N, K, lda, ldb, ldc; };
+
 kernel void m5_gemm(
     device const IN_T   *A           [[buffer(0)]],
     device const IN_T   *B           [[buffer(1)]],
     device       OUT_T  *C           [[buffer(2)]],
-    constant int& gM                 [[buffer(3)]],
-    constant int& gN                 [[buffer(4)]],
-    constant int& gK                 [[buffer(5)]],
-    constant int& gLda               [[buffer(6)]],
-    constant int& gLdb               [[buffer(7)]],
-    constant int& gLdc               [[buffer(8)]],
+    constant MBGemmDims& gP          [[buffer(3)]],   // packed (M, N, K, lda, ldb, ldc)
     uint3        tgid                [[threadgroup_position_in_grid]],
     uint         sgid                [[simdgroup_index_in_threadgroup]],
     uint         lane                [[thread_index_in_simdgroup]])
 {
+    int gM = gP.M, gN = gP.N, gK = gP.K;
+    int gLda = gP.lda, gLdb = gP.ldb, gLdc = gP.ldc;
     // Double-buffered (NBUF=2) when DBUF==1, single buffer otherwise.
     threadgroup IN_T As[NBUF * BM * LDA_TGP];
     threadgroup IN_T Bs[NBUF * BK * LDB_TGP];

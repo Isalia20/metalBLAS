@@ -23,11 +23,10 @@ kernel void splitk_gemm(
     device IN_T   *B   [[buffer(1)]],
     device OUT_T  *C   [[buffer(2)]],
     device float  *Cp  [[buffer(3)]],
-    constant int& gM   [[buffer(4)]],
-    constant int& gN   [[buffer(5)]],
-    constant int& gK   [[buffer(6)]],
+    constant int4&  gP [[buffer(4)]],   // packed (gM, gN, gK)
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
+    int gM = gP.x, gN = gP.y, gK = gP.z;
     int g  = int(tgid.z);
     int k0 = g * KCHUNK;
     if (k0 >= gK) return;
@@ -70,10 +69,10 @@ kernel void splitk_gemm(
 kernel void splitk_reduce(
     device const float *Cp [[buffer(0)]],
     device OUT_T *C        [[buffer(1)]],
-    constant int& n        [[buffer(2)]],
-    constant int& Gm1      [[buffer(3)]],
+    constant int2&  gP     [[buffer(2)]],   // packed (n, Gm1)
     uint gid [[thread_position_in_grid]])
 {
+    int n = gP.x, Gm1 = gP.y;
     int i = int(gid);
     if (i >= n) return;
     float s = (float)C[i];

@@ -24,14 +24,10 @@ kernel void m5_tensor_gemm(
     device IN_T   *A   [[buffer(0)]],
     device IN_T   *B   [[buffer(1)]],
     device OUT_T  *C   [[buffer(2)]],
-    constant int& gM   [[buffer(3)]],
-    constant int& gN   [[buffer(4)]],
-    constant int& gK   [[buffer(5)]],
-    constant int& gLda [[buffer(6)]],
-    constant int& gLdb [[buffer(7)]],
-    constant int& gLdc [[buffer(8)]],
+    constant int4&  gP [[buffer(3)]],   // packed (gM, gN, gK); lda/ldb/ldc unused (packed storage)
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
+    int gM = gP.x, gN = gP.y, gK = gP.z;
     // Tensor views from raw pointers; extent order is (cols, rows) for row-major.
     // Transposed A keeps extents (gK, gM) but flags transposed in the descriptor.
     tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(gK, gM));
