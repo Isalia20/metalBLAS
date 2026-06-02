@@ -32,7 +32,8 @@ def bench(M, N, K, dtype, fn, iters=100, trials=10, warmup=50):
         sec = (t1 - t0) / iters
         if sec < best:
             best = sec
-    flops = 2.0 * M * N * K
+    # Complex MAC is ~4 real MACs (the four ar/ai x br/bi products), so count 4x.
+    flops = 2.0 * M * N * K * (4.0 if dtype.is_complex else 1.0)
     tflops = flops / best / 1e12
     return best, tflops
 
@@ -143,7 +144,8 @@ def write_perf_report(*, cool: float = 0.0) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dtype", default="all", choices=["fp32", "fp16", "bf16", "all"])
+    p.add_argument("--dtype", default="all",
+                   choices=["fp32", "fp16", "bf16", "c64", "c32", "all"])
     p.add_argument("--group", default="all",
                    choices=list(SHAPES.keys()) + ["all"])
     p.add_argument("--cool", type=float, default=0.0,
@@ -160,6 +162,8 @@ def main():
     if args.dtype in ("fp32", "all"): dtypes.append(torch.float32)
     if args.dtype in ("fp16", "all"): dtypes.append(torch.float16)
     if args.dtype in ("bf16", "all"): dtypes.append(torch.bfloat16)
+    if args.dtype in ("c64",): dtypes.append(torch.complex64)
+    if args.dtype in ("c32",): dtypes.append(torch.complex32)
 
     groups = list(SHAPES.keys()) if args.group == "all" else [args.group]
 

@@ -93,6 +93,34 @@ def check_gemv_strided_vec(M, N, K, dtype):
     return ok
 
 
+def check_complex(M, N, K, dtype, layout="rm", rtol=None):
+    """
+    Complex matmul vs a full-precision CPU reference (relative max-error).
+
+    complex64 GEMM rides the TF32-relaxed fp32 backend (rel ~1e-3); the native
+    complex GEMV path accumulates in fp32 (rel ~1e-5)
+    """
+    torch.manual_seed(0)
+    if rtol is None:
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+    a = torch.randn(M, K, dtype=dtype, device='mps')
+    b = torch.randn(K, N, dtype=dtype, device='mps')
+    if layout == "tr":            # transposed (col-major) A view
+        a = torch.randn(K, M, dtype=dtype, device='mps').t()
+    elif layout == "conj":        # lazy conjugate view (must be resolved)
+        a = a.conj()
+    c = mb_matmul(a, b)
+    hp = torch.complex64
+    ref = (a.cpu().to(hp) @ b.cpu().to(hp))
+    err = (c.cpu().to(hp) - ref).abs().max().item()
+    rel = err / (ref.abs().max().item() + 1e-9)
+    ok = rel <= rtol and c.dtype == dtype
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:9s} {layout:4s} {M:5d}x{N:5d}x{K:5d} "
+          f"max_err={err:.3e} rel={rel:.3e} rtol={rtol:.1e}")
+    return ok
+
+
 def main():
     print("=== fp32, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256), (33, 33, 33)]:
@@ -135,6 +163,22 @@ def main():
     for shape in [(1, 1024, 256), (1, 4096, 1024), (64, 1, 256), (1024, 1, 1024)]:
         for dt in [torch.float32, torch.float16, torch.bfloat16]:
             check_gemv_strided_vec(*shape, dtype=dt)
+
+    print("=== complex64 GEMM ===")
+    for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (512, 512, 512),
+                  (1024, 1024, 1024), (513, 257, 129), (333, 444, 555), (2, 64, 128)]:
+        check_complex(*shape, dtype=torch.complex64)
+    print("=== complex64 GEMV (M==1 / N==1) ===")
+    for shape in [(1, 4096, 4096), (4096, 1, 4096), (1, 1024, 1024),
+                  (1024, 1, 1024), (1, 1, 512), (1, 17, 33)]:
+        check_complex(*shape, dtype=torch.complex64)
+    print("=== complex64 transposed / conj views ===")
+    for shape in [(256, 256, 256), (513, 257, 129)]:
+        check_complex(*shape, dtype=torch.complex64, layout="tr")
+        check_complex(*shape, dtype=torch.complex64, layout="conj")
+    print("=== complex32 (chalf) ===")
+    for shape in [(256, 256, 256), (512, 512, 512), (1, 2048, 2048), (2048, 1, 2048)]:
+        check_complex(*shape, dtype=torch.complex32)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,14 @@ _PROFILE = {
     torch.float16: ("half",  "float", "half"),
     torch.bfloat16: ("bfloat", "float", "bfloat"),
 }
+_COMPLEX = {
+    torch.complex64: ("float2", "float"),
+    torch.complex32: ("half2",  "half"),
+}
+_COMPLEX_REAL = {
+    torch.complex64: torch.float32,
+    torch.complex32: torch.float16,
+}
 
 # Apple GPU family detection
 # M5 adds a tensor unit; the M5-tuned GEMV heuristic underfills pre-M5 chips, so
@@ -817,6 +825,89 @@ def _resolve_inputs(a: torch.Tensor, b: torch.Tensor):
     return A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b
 
 
+# Complex GEMV + pack kernel handles, resolved once per complex dtype.
+_CGEMV_HANDLES: dict = {}
+_CGEMV_T_NWARPS = 8     # K-split simdgroups for y = x @ B
+_CGEMV_NT_NWARPS = 4    # rows per threadgroup for y = A @ x
+
+
+def _cgemv_handles(cdt):
+    h = _CGEMV_HANDLES.get(cdt)
+    if h is None:
+        c2, r = _COMPLEX[cdt]
+        t, _ = kernels.cgemv_t(c2, "float2", r, 32, _CGEMV_T_NWARPS)
+        nt, _ = kernels.cgemv_nt(c2, "float2", r, _CGEMV_NT_NWARPS)
+        split, combine = kernels.complex_pack(c2, r)
+        h = {"t": t, "nt": nt, "split": split, "combine": combine}
+        _CGEMV_HANDLES[cdt] = h
+    return h
+
+
+def _complex_matmul(a: torch.Tensor, b: torch.Tensor,
+                    out: torch.Tensor | None = None) -> torch.Tensor:
+    """Complex C = A @ B: native interleaved-complex GEMV for M==1 / N==1, else
+    four real products (ar@br - ai@bi) + i(ar@bi + ai@br) on the tuned backend."""
+    cdt = a.dtype if a.dtype in _COMPLEX else b.dtype
+    # promote a real operand (torch allows complex @ real); resolve lazy conj() views
+    if a.dtype != cdt:
+        a = a.to(cdt)
+    if b.dtype != cdt:
+        b = b.to(cdt)
+    if a.is_conj():
+        a = a.resolve_conj()
+    if b.is_conj():
+        b = b.resolve_conj()
+    assert a.device.type == "mps" and b.device.type == "mps"
+    assert a.dim() == 2 and b.dim() == 2, "complex matmul currently expects 2-D inputs"
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2, f"shape mismatch: A is {a.shape}, B is {b.shape}"
+    if out is not None:
+        assert out.shape == (M, N) and out.dtype == cdt and out.device.type == "mps", \
+            f"out must be ({M}, {N}) {cdt} on mps"
+    h = _cgemv_handles(cdt)
+
+    # y = x @ B (M==1), B contiguous (ldb == N)
+    if M == 1 and a.is_contiguous() and b.is_contiguous() and b.stride(0) == N and N >= 1:
+        if out is None:
+            out = torch.empty(1, N, dtype=cdt, device=a.device)
+        ng = (N + 31) // 32
+        h["t"](b, a.view(-1), out.view(-1), _pk(N, K, N, 1),
+               threads=(_CGEMV_T_NWARPS * 32 * ng, 1, 1),
+               group_size=(_CGEMV_T_NWARPS * 32, 1, 1))
+        return out
+    # y = A @ x (N==1), A contiguous (lda == K)
+    if N == 1 and a.is_contiguous() and b.is_contiguous() and a.stride(0) == K and M >= 1:
+        if out is None:
+            out = torch.empty(M, 1, dtype=cdt, device=a.device)
+        ng = (M + _CGEMV_NT_NWARPS - 1) // _CGEMV_NT_NWARPS
+        h["nt"](a, b.view(-1), out.view(-1), _pk(M, K, K, 1),
+                threads=(_CGEMV_NT_NWARPS * 32 * ng, 1, 1),
+                group_size=(_CGEMV_NT_NWARPS * 32, 1, 1))
+        return out
+
+    # GEMM: deinterleave to real planes, four real GEMMs, fold back to complex.
+    a = a.contiguous()
+    b = b.contiguous()
+    rdt = _COMPLEX_REAL[cdt]
+    ar = torch.empty(M, K, dtype=rdt, device=a.device)
+    ai = torch.empty(M, K, dtype=rdt, device=a.device)
+    br = torch.empty(K, N, dtype=rdt, device=b.device)
+    bi = torch.empty(K, N, dtype=rdt, device=b.device)
+    nA, nB = M * K, K * N
+    h["split"](a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
+    h["split"](b, br, bi, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
+    P = matmul(ar, br)
+    Q = matmul(ai, bi)
+    S = matmul(ar, bi)
+    T = matmul(ai, br)
+    if out is None:
+        out = torch.empty(M, N, dtype=cdt, device=a.device)
+    nC = M * N
+    h["combine"](P, Q, S, T, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
+    return out
+
+
 def matmul(a: torch.Tensor, b: torch.Tensor, *,
            backend: str | None = None,
            tile: tuple | None = None,
@@ -832,6 +923,11 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     swizzle_log : override the swizzle (0, 1, 2 …)
     out   : optional preallocated output of shape (M, N)
     """
+    # Complex dtypes route to the dedicated complex path (native GEMV for rank-1
+    # problems, decomposed real GEMMs otherwise). backend/tile/swizzle don't apply.
+    if a.is_mps and (a.dtype in _COMPLEX or b.dtype in _COMPLEX):
+        return _complex_matmul(a, b, out=out)
+
     # Lean GEMV fast path (checked BEFORE the asserts)
     # Row-vector x matrix runs in ~7-12 us, so the Python preamble IS the
     # bottleneck. Gate on cheap reads and route contiguous M==1 GEMV to gemv_t.
