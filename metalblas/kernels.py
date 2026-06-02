@@ -182,3 +182,24 @@ def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4
     src = _build("MB_BUILD_GEMV_T", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC)
     return _compile(src).gemv_t, src
+
+
+@functools.lru_cache(maxsize=None)
+def cgemv_t(c2_t: str, acc2_t: str, r_t: str, BLOCK_N: int = 32, NWARPS: int = 8):
+    src = _build("MB_BUILD_CGEMV_T", C2=c2_t, ACC2=acc2_t, R=r_t,
+                 BLOCK_N=BLOCK_N, NWARPS=NWARPS)
+    return _compile(src).cgemv_t, src
+
+
+@functools.lru_cache(maxsize=None)
+def cgemv_nt(c2_t: str, acc2_t: str, r_t: str, NWARPS: int = 4):
+    src = _build("MB_BUILD_CGEMV_NT", C2=c2_t, ACC2=acc2_t, R=r_t, NWARPS=NWARPS)
+    return _compile(src).cgemv_nt, src
+
+
+@functools.lru_cache(maxsize=None)
+def complex_pack(c2_t: str, r_t: str):
+    """-> (split_fn, combine_fn) for the given complex element type (float2/half2)."""
+    src = _build("MB_BUILD_COMPLEX_PACK", C2=c2_t, R=r_t)
+    lib = _compile(src)
+    return lib.complex_split, lib.complex_combine
