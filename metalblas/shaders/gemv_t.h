@@ -21,6 +21,7 @@ kernel void gemv_t(
     constant int& gN         [[buffer(3)]],
     constant int& gK         [[buffer(4)]],
     constant int& gLdb       [[buffer(5)]],
+    constant int& gXs        [[buffer(6)]],
     uint3        tgid        [[threadgroup_position_in_grid]],
     uint         sgid        [[simdgroup_index_in_threadgroup]],
     uint         lane        [[thread_index_in_simdgroup]])
@@ -49,8 +50,8 @@ kernel void gemv_t(
             VecT b1 = *((const device VecT*)(&B[(k+1) * gLdb + n0]));
             VecT b2 = *((const device VecT*)(&B[(k+2) * gLdb + n0]));
             VecT b3 = *((const device VecT*)(&B[(k+3) * gLdb + n0]));
-            ACC_T x0 = (ACC_T)x[k+0], x1 = (ACC_T)x[k+1];
-            ACC_T x2 = (ACC_T)x[k+2], x3 = (ACC_T)x[k+3];
+            ACC_T x0 = (ACC_T)x[(k+0)*gXs], x1 = (ACC_T)x[(k+1)*gXs];
+            ACC_T x2 = (ACC_T)x[(k+2)*gXs], x3 = (ACC_T)x[(k+3)*gXs];
             #pragma unroll
             for (int i = 0; i < VEC; ++i) {
                 acc[i] += (ACC_T)b0.v[i] * x0;
@@ -61,14 +62,14 @@ kernel void gemv_t(
         }
         for (; k < k_end; ++k) {
             VecT bv = *((const device VecT*)(&B[k * gLdb + n0]));
-            ACC_T xk = (ACC_T)x[k];
+            ACC_T xk = (ACC_T)x[k*gXs];
             #pragma unroll
             for (int i = 0; i < VEC; ++i) acc[i] += (ACC_T)bv.v[i] * xk;
         }
     } else {
         // Edge block: scalar with per-column bounds for non-VEC-aligned N.
         for (int k = k_start; k < k_end; ++k) {
-            ACC_T xk = (ACC_T)x[k];
+            ACC_T xk = (ACC_T)x[k*gXs];
             #pragma unroll
             for (int i = 0; i < VEC; ++i) {
                 int n = n0 + i;

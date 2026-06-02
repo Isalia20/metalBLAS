@@ -62,6 +62,37 @@ def check_transposed(M, N, K, dtype, backend="auto"):
     return ok
 
 
+def check_gemv_strided_vec(M, N, K, dtype):
+    """Regression for the strided-GEMV-vector bug: the vector operand is a
+    non-contiguous sub-view (a sliced column/row off a wider buffer). The kernel
+    reads the vector as unit-stride, so _dispatch_gemv must contiguify it while
+    leaving the matrix strided. Compares against a reference on the SAME views."""
+    torch.manual_seed(0)
+    if dtype == torch.float32:
+        atol = max(0.1, 5e-3 * K**0.5)
+    elif dtype == torch.bfloat16:
+        atol = max(5e-1, 3e-2 * K**0.5)
+    else:
+        atol = max(5e-2, 1e-2 * K**0.5)
+    if N == 1:                       # matrix @ strided column vector
+        a = torch.randn(M, K, dtype=dtype, device='mps')
+        b = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1]   # (K,1) stride (2,1)
+        tag = "vecB"
+    else:                            # strided row vector @ matrix  (M == 1)
+        a = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1].t()  # (1,K) stride (1,2)
+        b = torch.randn(K, N, dtype=dtype, device='mps')
+        tag = "vecA"
+    assert not (a.is_contiguous() and b.is_contiguous()), "vector should be strided"
+    c = mb_matmul(a, b, backend="gemv")
+    ref = (a.to(torch.float32) @ b.to(torch.float32)).to(dtype)
+    err = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    ok = err.max().item() <= atol
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {dtype} gemv-{tag} {M:5d}x{N:5d}x{K:5d} "
+          f"max_err={err.max().item():.3e} atol={atol:.3e}")
+    return ok
+
+
 def main():
     print("=== fp32, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256), (33, 33, 33)]:
@@ -100,6 +131,10 @@ def main():
     for shape in [(1, 4096, 4096), (4096, 1, 4096)]:
         for dt in [torch.float32, torch.float16, torch.bfloat16]:
             check_transposed(*shape, dtype=dt)
+    print("=== GEMV strided vector ===")
+    for shape in [(1, 1024, 256), (1, 4096, 1024), (64, 1, 256), (1024, 1, 1024)]:
+        for dt in [torch.float32, torch.float16, torch.bfloat16]:
+            check_gemv_strided_vec(*shape, dtype=dt)
 
 
 if __name__ == "__main__":
