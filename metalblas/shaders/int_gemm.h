@@ -32,6 +32,12 @@ kernel void int_gemm(
     device const IN_T   *B    [[buffer(1)]],
     device       OUT_T  *C    [[buffer(2)]],
     constant MBIntGemmDims& gP [[buffer(3)]],   // packed (M, N, K, lda, ldb, ldc)
+#if EPILOGUE
+    device const OUT_T *bias  [[buffer(4)]],    // addmm input; bstride = (row, col) broadcast strides
+    constant int2&  bstride   [[buffer(5)]],
+    constant ACC_T& beta      [[buffer(6)]],
+    constant ACC_T& alpha     [[buffer(7)]],
+#endif
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]])
 {
@@ -117,7 +123,13 @@ kernel void int_gemm(
         #pragma unroll
         for (int j = 0; j < TN; ++j) {
             int gn = n_block + col0 + j;
-            if (gn < gN) C[gm * gLdc + gn] = (OUT_T)acc[i][j];
+            if (gn < gN)
+#if EPILOGUE
+                C[gm * gLdc + gn] = mb_epi<OUT_T, ACC_T, ACC_T>(
+                    acc[i][j], bias, gm * bstride.x + gn * bstride.y, beta, alpha);
+#else
+                C[gm * gLdc + gn] = (OUT_T)acc[i][j];
+#endif
         }
     }
 }

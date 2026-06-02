@@ -157,6 +157,12 @@ kernel void simd_gemm(
     device const IN_T   *B           [[buffer(1)]],
     device       OUT_T  *C           [[buffer(2)]],
     constant MBGemmDims& gP          [[buffer(3)]],   // packed (M, N, K, lda, ldb, ldc)
+#if EPILOGUE
+    device const OUT_T *bias         [[buffer(4)]],   // addmm input; bstride = (row, col) broadcast strides
+    constant int2&  bstride          [[buffer(5)]],
+    constant ACC_T& beta             [[buffer(6)]],
+    constant ACC_T& alpha            [[buffer(7)]],
+#endif
     uint3        tgid                [[threadgroup_position_in_grid]],
     uint         sgid                [[simdgroup_index_in_threadgroup]],
     uint         lane                [[thread_index_in_simdgroup]])
@@ -261,7 +267,19 @@ kernel void simd_gemm(
         for (int j = 0; j < TN; ++j) {
             int row = m_block + warp_m + i * 8 + fm;
             int col = n_block + warp_n + j * 8 + fn;
-#if MN_ALIGNED
+#if EPILOGUE
+            // addmm always takes the per-element path: the bulk simdgroup_store can't
+            // fold a per-(row,col) bias. The lane owns (row,col) and (row,col+1).
+            ACC_T te0 = Cfrag[i][j].thread_elements()[0];
+            ACC_T te1 = Cfrag[i][j].thread_elements()[1];
+            int cc0 = col, cc1 = col + 1;
+            if (row < gM && cc0 < gN)
+                C[row * gLdc + cc0] = mb_epi<OUT_T, ACC_T, ACC_T>(
+                    te0, bias, row * bstride.x + cc0 * bstride.y, beta, alpha);
+            if (row < gM && cc1 < gN)
+                C[row * gLdc + cc1] = mb_epi<OUT_T, ACC_T, ACC_T>(
+                    te1, bias, row * bstride.x + cc1 * bstride.y, beta, alpha);
+#elif MN_ALIGNED
             int row0 = m_block + warp_m + i * 8;
             int col0 = n_block + warp_n + j * 8;
 #if OUT_IS_ACC

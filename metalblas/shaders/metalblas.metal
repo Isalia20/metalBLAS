@@ -1,6 +1,7 @@
 // metalblas.metal - binder. The loader (../kernels.py) enables one #ifdef-guarded family
 // via -DMB_BUILD_<NAME>, so gemv/simd builds skip the MetalPerformancePrimitives headers.
 
+#include "mb_epi.h"
 #include "simd_gemm.h"
 #include "m5_gemm.h"
 #include "m5_tensor.h"

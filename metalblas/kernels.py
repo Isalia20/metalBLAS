@@ -41,9 +41,23 @@ def _subst(src: str, **kw) -> str:
     return src
 
 
-def _build(build_flag: str, **params) -> str:
-    """Assemble one kernel's source: enable its build flag, inline the shaders, substitute params."""
-    return _subst(f"#define {build_flag} 1\n" + _binder_source(), **params)
+def _build(build_flag: str, *, defines=None, **params) -> str:
+    """Assemble one kernel's source: enable its build flag, inline the shaders, substitute params.
+
+    `defines` prepends extra `#define`s (e.g. the addmm EPILOGUE flags); omitting it
+    leaves the source byte-identical to a plain build.
+    """
+    prelude = f"#define {build_flag} 1\n"
+    if defines:
+        prelude += "".join(f"#define {k} {int(v)}\n" for k, v in defines.items())
+    return _subst(prelude + _binder_source(), **params)
+
+
+def _epi_defines(epilogue: bool, beta_nz: bool, alpha_nz: bool):
+    """addmm epilogue flags for _build, or None for a plain (non-fused) matmul build."""
+    if not epilogue:
+        return None
+    return {"EPILOGUE": 1, "BETA_NZ": int(beta_nz), "ALPHA_NZ": int(alpha_nz)}
 
 
 @functools.lru_cache(maxsize=None)
@@ -74,9 +88,11 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
               BM: int, BN: int, BK: int, WM: int, WN: int,
               trans_a: bool, trans_b: bool,
               mn_aligned: bool, k_aligned: bool,
-              swizzle_log: int = 0):
+              swizzle_log: int = 0,
+              epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     src = _build(
         "MB_BUILD_SIMD_GEMM",
+        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
         BM=BM, BN=BN, BK=BK, WM=WM, WN=WN,
         TRANS_A=int(trans_a), TRANS_B=int(trans_b),
@@ -96,13 +112,15 @@ def m5_gemm(in_t: str, acc_t: str, out_t: str,
             relaxed: bool = True,
             swizzle_log: int = 0,
             dbuf: bool = False,
-            pad: int | None = None):
+            pad: int | None = None,
+            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     # pad defaults to 16/sizeof(IN_T) for VecF alignment (0 is OK when BK/BN are VEC-aligned).
     if pad is None:
         in_bytes = 4 if in_t == "float" else 2
         pad = 16 // in_bytes
     src = _build(
         "MB_BUILD_M5_GEMM",
+        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
         BM=BM, BN=BN, BK=BK, WM=WM, WN=WN,
         TRANS_A=int(trans_a), TRANS_B=int(trans_b),
@@ -122,11 +140,13 @@ def m5_tensor_gemm(in_t: str, out_t: str,
                    trans_a: bool, trans_b: bool,
                    relaxed: bool = True,
                    swizzle_log: int = 0,
-                   mn_aligned: bool = False):
+                   mn_aligned: bool = False,
+                   epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     # Static-extent slices only for non-transposed (the orientation auto-dispatch routes here).
     static_slice = (not trans_a) and (not trans_b)
     src = _build(
         "MB_BUILD_M5_TENSOR",
+        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, OUT_T=out_t,
         BM=BM, BN=BN, NSG=NSG,
         TRANS_A=("true" if trans_a else "false"),
@@ -168,49 +188,61 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 @functools.lru_cache(maxsize=None)
 def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
-            VEC: int = 1, red_tg: bool = False):
+            VEC: int = 1, red_tg: bool = False,
+            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     # red_tg: reduce via threadgroup mem instead of simd_sum (int64: no simd_sum(long)).
-    src = _build("MB_BUILD_GEMV_NT", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+    src = _build("MB_BUILD_GEMV_NT", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC, RED_TG=int(red_tg))
     return _compile(src).gemv_nt, src
 
 
 @functools.lru_cache(maxsize=None)
 def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4,
-           VEC: int = 1):
+           VEC: int = 1,
+           epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     # Each lane owns VEC columns, so a threadgroup spans BLOCK_N == 32*VEC cols.
     assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
-    src = _build("MB_BUILD_GEMV_T", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+    src = _build("MB_BUILD_GEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC)
     return _compile(src).gemv_t, src
 
 
 @functools.lru_cache(maxsize=None)
-def cgemv_t(c2_t: str, acc2_t: str, r_t: str, BLOCK_N: int = 32, NWARPS: int = 8):
-    src = _build("MB_BUILD_CGEMV_T", C2=c2_t, ACC2=acc2_t, R=r_t,
-                 BLOCK_N=BLOCK_N, NWARPS=NWARPS)
+def cgemv_t(c2_t: str, acc2_t: str, r_t: str, BLOCK_N: int = 32, NWARPS: int = 8,
+            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
+    src = _build("MB_BUILD_CGEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 C2=c2_t, ACC2=acc2_t, R=r_t, BLOCK_N=BLOCK_N, NWARPS=NWARPS)
     return _compile(src).cgemv_t, src
 
 
 @functools.lru_cache(maxsize=None)
-def cgemv_nt(c2_t: str, acc2_t: str, r_t: str, NWARPS: int = 4):
-    src = _build("MB_BUILD_CGEMV_NT", C2=c2_t, ACC2=acc2_t, R=r_t, NWARPS=NWARPS)
+def cgemv_nt(c2_t: str, acc2_t: str, r_t: str, NWARPS: int = 4,
+             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
+    src = _build("MB_BUILD_CGEMV_NT", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 C2=c2_t, ACC2=acc2_t, R=r_t, NWARPS=NWARPS)
     return _compile(src).cgemv_nt, src
 
 
 @functools.lru_cache(maxsize=None)
-def complex_pack(c2_t: str, r_t: str):
-    """-> (split_fn, combine_fn) for the given complex element type (float2/half2)."""
-    src = _build("MB_BUILD_COMPLEX_PACK", C2=c2_t, R=r_t)
+def complex_pack(c2_t: str, r_t: str,
+                 epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
+    """-> (split_fn, combine_fn) for the given complex element type (float2/half2).
+    epilogue folds the complex addmm bias+scales into complex_combine."""
+    src = _build("MB_BUILD_COMPLEX_PACK", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 C2=c2_t, R=r_t)
     lib = _compile(src)
     return lib.complex_split, lib.complex_combine
 
 
 @functools.lru_cache(maxsize=None)
 def int_gemm(in_t: str, acc_t: str, out_t: str, BM: int, BN: int, BK: int,
-             TX: int, TY: int, trans_a: bool, trans_b: bool):
+             TX: int, TY: int, trans_a: bool, trans_b: bool,
+             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     """Register-tiled integer GEMM (simdgroup_matrix / the tensor unit are float-only)."""
-    src = _build("MB_BUILD_INT_GEMM", IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+    src = _build("MB_BUILD_INT_GEMM", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  BM=BM, BN=BN, BK=BK, TX=TX, TY=TY,
                  TRANS_A=int(trans_a), TRANS_B=int(trans_b))
     return _compile(src).int_gemm, src

@@ -393,7 +393,8 @@ def _m5_tensor_tile_candidates(M, N, K, dtype):
     # Thin min-dim: square default makes too few tiles on the short axis. Offer
     # both tall-narrow orientations plus the NSG/BM ambiguity for the autotuner.
     if mn <= 256 and mx >= 1024:
-        extra = [(128, 32, 2), (256, 32, 4), (32, 128, 2), (32, 256, 4), (64, 64, 2)]
+        extra = [(128, 32, 2), (256, 32, 4), (32, 128, 2), (32, 256, 4), (64, 64, 2),
+                 (64, 32, 2), (32, 64, 2)]
         # Thin M (M<<N) wants a SHORT BM so the few rows nearly fill the tile;
         # add the BM=16/32 family when the min dim is tiny.
         if mn <= 48:
@@ -945,6 +946,8 @@ def _pick_int_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int
     mx = max(M, N)
     if mx <= 256:                              # small: keep enough threadgroups
         return (64, 64, 16, 16, 16)
+    if M <= 16 and N >= 1024:                  # M<=16 fills exactly one BM=16 row-tile
+        return (16, 64, 16, 16, 16)
     if M <= 128 and N >= 1024:                 # thin-M wide-N: short BM
         return (32, 64, 16, 8, 16)
     if nbytes == 8:                            # int64: shallow BK caps threadgroup mem
@@ -1279,5 +1282,230 @@ def _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, o
         raise ValueError("gemv backend requires M==1 or N==1")
 
 
-# Convenience alias
+# addmm  (C = beta*input + alpha*(A@B))
+# The bias+scales are fused into each GEMM/GEMV kernel via EPILOGUE builds, so addmm
+# costs ~the same as the bare matmul.
+# Backend selection mirrors matmul()'s; only the chosen kernel is rebuilt with the
+# epilogue and handed bias + broadcast strides + scalars.
+def _addmm_gemv_t(dtype, matrix, xv, xs, out, cols, k, ld, bstep, bias, beta, alpha, bnz, anz):
+    # y[c] = sum_k matrix[k,c]*x[k]; bias indexed by the output col -> bstep.
+    if dtype in _INT_PROFILE:
+        in_t, acc_t, out_t = _INT_PROFILE[dtype]
+        vec, nw = _IGEMV_T_CFG[dtype]
+        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+    else:
+        in_t, acc_t, out_t = _PROFILE[dtype]
+        _, tg, vec = _gemv_pick(_gemv_handles(dtype), cols,
+                                int(ld) | matrix.storage_offset(), dtype, k=int(k))
+        nw = tg // 32
+    fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec,
+                           epilogue=True, beta_nz=bnz, alpha_nz=anz)
+    ng = (cols + 32 * vec - 1) // (32 * vec)
+    fn(matrix, xv, out.view(-1), _pk(cols, k, ld, int(xs)), bias, int(bstep), beta, alpha,
+       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
+
+
+def _addmm_gemv_nt(dtype, matrix, xv, out, rows, k, ld, bstep, bias, beta, alpha, bnz, anz):
+    # y[r] = sum_k matrix[r,k]*x[k]; bias indexed by the output row -> bstep.
+    if dtype in _INT_PROFILE:
+        in_t, acc_t, out_t = _INT_PROFILE[dtype]
+        vec, nw = _IGEMV_NT_CFG[dtype]
+        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+        red_tg = dtype is torch.int64
+    else:
+        in_t, acc_t, out_t = _PROFILE[dtype]
+        nw, red_tg = 4, False
+        vec = _gemv_nt_vec(dtype, int(k), int(ld), matrix.storage_offset())
+    fn, _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, nw, vec, red_tg=red_tg,
+                            epilogue=True, beta_nz=bnz, alpha_nz=anz)
+    ng = (rows + nw - 1) // nw
+    fn(matrix, xv, out.view(-1), _pk(rows, k, ld), bias, int(bstep), beta, alpha,
+       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
+
+
+def _gemv_nt_vec(dtype, k, ld, off):
+    """The VEC gemv_nt would pick for (dtype, K, alignment) - mirrors _gemv_nt_pick."""
+    if dtype is torch.float32:
+        return 1
+    align = int(ld) | int(off)
+    if _HAS_TENSOR_UNIT:
+        if not (align & 3) and k >= 512: return 4
+        if not (align & 1) and k >= 512: return 2
+        return 1
+    if not (align & 3) and k >= 64: return 4
+    if not (align & 1) and k >= 32: return 2
+    return 1
+
+
+def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
+    """Fused real-dtype addmm: rank-1 -> gemv, else the tiled GEMM for this backend."""
+    dtype = mat1.dtype
+    is_int = dtype in _INT_PROFILE
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b = _resolve_inputs(mat1, mat2)
+    if out is None:
+        out = _pooled_out(mat1, M, N)
+    ldc = out.stride(0)
+    bstride = _pk(int(br), int(bc))               # int2 (row, col) broadcast strides
+
+    # Rank-1 fast paths (bias is 1-D over the output index: col for M==1, row for N==1).
+    if M == 1 and N >= 16:
+        if not trans_b:
+            xv = A_view.reshape(-1)
+            return _addmm_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, ldb, bc, x, beta, alpha, bnz, anz)
+        xv = A_view.reshape(-1).contiguous()
+        return _addmm_gemv_nt(dtype, B_view, xv, out, N, K, ldb, bc, x, beta, alpha, bnz, anz)
+    if N == 1 and M >= 16:
+        if trans_a:
+            xv = B_view.reshape(-1)
+            return _addmm_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, lda, br, x, beta, alpha, bnz, anz)
+        xv = B_view.reshape(-1).contiguous()
+        return _addmm_gemv_nt(dtype, A_view, xv, out, M, K, lda, br, x, beta, alpha, bnz, anz)
+
+    M_, N_, K_, lda_, ldb_, ldc_ = int(M), int(N), int(K), int(lda), int(ldb), int(ldc)
+    dims6 = _pk(M_, N_, K_, lda_, ldb_, ldc_)
+
+    if is_int:
+        in_t, acc_t, out_t = _INT_PROFILE[dtype]
+        BM, BN, BK, TX, TY = _pick_int_tile(M_, N_, K_, dtype)
+        fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b,
+                                 epilogue=True, beta_nz=bnz, alpha_nz=anz)
+        grp = TX * TY
+        fn(A_view, B_view, out, dims6, x, bstride, beta, alpha,
+           threads=(grp * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=(grp, 1, 1))
+        return out
+
+    in_t, acc_t, out_t = _PROFILE[dtype]
+    packed_ab = (lda_ == K_ and ldb_ == N_)
+    m4 = kernels.has_metal4()
+    if m4 and M_ >= 2 and N_ >= 32 and K_ >= 64 and not trans_a and not trans_b and packed_ab:
+        # Reuse matmul's autotuner: the winning tile transfers (the epilogue is a
+        # cheap store-time change), so awkward shapes get the same fast tile here.
+        _gemm_plan(dtype, M_, N_, K_, A_view, B_view)
+        tile = _GEMM_TILE[(dtype, M_, N_, K_)]
+        # An m5_tensor tile is a 3-tuple; a 4/5-tuple means the autotuner chose a
+        # split-K or conv plan (no epilogue) - fall back to the heuristic tile.
+        if len(tile) == 3:
+            BM, BN, NSG = tile
+        else:
+            BM, BN, NSG = _pick_m5_tensor_tile(M_, N_, K_, dtype)
+        mn_aligned = (M_ % BM == 0) and (N_ % BN == 0)
+        fn, _ = kernels.m5_tensor_gemm(in_t, out_t, BM, BN, NSG, False, False,
+                                       relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
+                                       epilogue=True, beta_nz=bnz, alpha_nz=anz)
+        grp = (NSG * 32, 1, 1)
+        fn(A_view, B_view, out, _pk(M_, N_, K_), x, bstride, float(beta), float(alpha),
+           threads=(grp[0] * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=grp)
+        return out
+
+    # Transposed / non-packed (m4) or no Metal 4: the manual tiled fallbacks.
+    if m4:
+        BM, BN, BK, WM, WN, dbuf = _pick_m5_tile(M_, N_, K_, dtype)
+        builder = lambda: kernels.m5_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN, trans_a, trans_b,
+                                          (M_ % BM == 0) and (N_ % BN == 0), K_ % BK == 0,
+                                          relaxed=True, swizzle_log=0, dbuf=dbuf,
+                                          epilogue=True, beta_nz=bnz, alpha_nz=anz)
+    else:
+        BM, BN, BK, WM, WN = _pick_simd_tile(M_, N_, K_, dtype)
+        builder = lambda: kernels.simd_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN, trans_a, trans_b,
+                                            (M_ % BM == 0) and (N_ % BN == 0), K_ % BK == 0,
+                                            swizzle_log=0, epilogue=True, beta_nz=bnz, alpha_nz=anz)
+    fn, _ = builder()
+    grp = (WM * WN * 32, 1, 1)
+    fn(A_view, B_view, out, dims6, x, bstride, float(beta), float(alpha),
+       threads=(grp[0] * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=grp)
+    return out
+
+
+def _addmm_complex(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
+    """Complex addmm: four real products folded into one complex_combine pass that
+    also applies beta*input + alpha*(.) - no extra sweep beyond the GEMM's own combine."""
+    cdt = mat1.dtype
+    a = mat1.resolve_conj().contiguous() if mat1.is_conj() else mat1.contiguous()
+    b = mat2.resolve_conj().contiguous() if mat2.is_conj() else mat2.contiguous()
+    M, K = a.shape
+    _, N = b.shape
+    c2, r = _COMPLEX[cdt]
+    rdt = _COMPLEX_REAL[cdt]
+
+    # Rank-1 fast paths: native interleaved-complex cgemv with bias fused in (~2x the
+    # 4-GEMV decomposition). beta/alpha split into re/im (a Python real has imag 0).
+    bre, bim = float(beta.real), float(beta.imag)
+    are, aim = float(alpha.real), float(alpha.imag)
+    if M == 1 and N >= 1:
+        out = out if out is not None else torch.empty(1, N, dtype=cdt, device=a.device)
+        fn, _ = kernels.cgemv_t(c2, "float2", r, 32, _CGEMV_T_NWARPS,
+                                epilogue=True, beta_nz=bnz, alpha_nz=anz)
+        ng = (N + 31) // 32
+        fn(b, a.view(-1), out.view(-1), _pk(N, K, N, 1),
+           x, int(bc), bre, bim, are, aim,
+           threads=(_CGEMV_T_NWARPS * 32 * ng, 1, 1),
+           group_size=(_CGEMV_T_NWARPS * 32, 1, 1))
+        return out
+    if N == 1 and M >= 1:
+        out = out if out is not None else torch.empty(M, 1, dtype=cdt, device=a.device)
+        fn, _ = kernels.cgemv_nt(c2, "float2", r, _CGEMV_NT_NWARPS,
+                                 epilogue=True, beta_nz=bnz, alpha_nz=anz)
+        ng = (M + _CGEMV_NT_NWARPS - 1) // _CGEMV_NT_NWARPS
+        fn(a, b.view(-1), out.view(-1), _pk(M, K, K, 1),
+           x, int(br), bre, bim, are, aim,
+           threads=(_CGEMV_NT_NWARPS * 32 * ng, 1, 1),
+           group_size=(_CGEMV_NT_NWARPS * 32, 1, 1))
+        return out
+
+    ar = torch.empty(M, K, dtype=rdt, device=a.device); ai = torch.empty(M, K, dtype=rdt, device=a.device)
+    bre = torch.empty(K, N, dtype=rdt, device=b.device); bim = torch.empty(K, N, dtype=rdt, device=b.device)
+    split, _ = kernels.complex_pack(c2, r)
+    nA, nB = M * K, K * N
+    split(a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
+    split(b, bre, bim, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
+    P = matmul(ar, bre); Q = matmul(ai, bim); S = matmul(ar, bim); T = matmul(ai, bre)
+    if out is None:
+        out = torch.empty(M, N, dtype=cdt, device=a.device)
+    _, combine = kernels.complex_pack(c2, r, epilogue=True, beta_nz=bnz, alpha_nz=anz)
+    nC = M * N
+    combine(P, Q, S, T, out, nC, x, _pk(int(N), int(br), int(bc), 0),
+            float(beta.real), float(beta.imag), float(alpha.real), float(alpha.imag),
+            threads=(nC, 1, 1), group_size=(256, 1, 1))
+    return out
+
+
+def addmm(input: torch.Tensor, mat1: torch.Tensor, mat2: torch.Tensor, *,
+          beta=1, alpha=1, out: torch.Tensor | None = None) -> torch.Tensor:
+    """C = beta*input + alpha*(mat1 @ mat2), matching torch.addmm (2-D only).
+
+    The product runs on the same tuned kernels as matmul, with the bias and scales
+    fused into the EPILOGUE build of each kernel.
+    """
+    assert mat1.is_mps and mat2.is_mps
+    assert mat1.dim() == 2 and mat2.dim() == 2, "addmm expects 2-D mat1, mat2"
+    M, K = mat1.shape
+    K2, N = mat2.shape
+    assert K == K2, f"shape mismatch: mat1 is {mat1.shape}, mat2 is {mat2.shape}"
+    dtype = mat1.dtype
+    assert mat2.dtype == dtype, "addmm requires mat1.dtype == mat2.dtype"
+    if out is not None:
+        assert out.shape == (M, N) and out.dtype == dtype and out.is_mps
+
+    # Coerce scalars to the kernel's arg type: ints truncate toward zero (as torch);
+    # fp needs real floats (an int reinterpreted as float binds ~0); complex splits re/im.
+    if dtype in _INT_PROFILE:
+        beta, alpha = int(beta), int(alpha)
+    elif dtype not in _COMPLEX:
+        beta, alpha = float(beta), float(alpha)
+    bnz, anz = beta != 0, alpha != 0
+
+    # input -> result dtype, then expand to (M,N): broadcast dims get stride 0, so
+    # the kernel reads input[i*br + j*bc] uniformly for any broadcastable shape.
+    x = input if input.dtype == dtype else input.to(dtype)
+    xe = x.expand(M, N)
+    br, bc = (int(s) for s in xe.stride())
+
+    if dtype in _COMPLEX:
+        return _addmm_complex(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out)
+    return _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out)
+
+
+# Convenience aliases
 gemm = matmul
