@@ -75,11 +75,13 @@ def _gemv_handles(dtype):
         for (vec, nw) in _GEMV_T_VARIANTS[dtype]:
             fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec)
             gt[(vec, nw)] = fn
-        # gemv_nt (N==1, matrix @ vector): VEC=1 is the M5 default. Pre-M5 adds
-        # VEC>=2 for full-line coverage; M5's coalescer keeps VEC=1 best.
+        # gemv_nt (N==1, matrix @ vector): VEC>1 reads each row a full cache line at
+        # a time. Built pre-M5 (all dtypes, original) and on M5 for low precision
+        # (fp32 VEC=1 is already a full 128-B line). The picker gates VEC on the
+        # row-stride/offset alignment and K.
         nt = {}
         nt[1], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 1)
-        if not _HAS_TENSOR_UNIT:
+        if not _HAS_TENSOR_UNIT or dtype is not torch.float32:
             nt[2], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 2)
             nt[4], _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, 4, 4)
         h = {"gt": gt, "nt": nt}
@@ -87,16 +89,19 @@ def _gemv_handles(dtype):
     return h
 
 
-def _gemv_nt_pick(nt_dict, rows, k, ld):
-    """Pick a gemv_nt VEC variant. M5 has only VEC=1; pre-M5 prefers VEC=4 for
-    4-aligned ld, VEC=2 for 2-aligned, else VEC=1 (kernel's scalar tail)."""
-    if _HAS_TENSOR_UNIT or 4 not in nt_dict:
+def _gemv_nt_pick(nt_dict, rows, k, ld, off=0):
+    if 4 not in nt_dict:                 # fp32 (or VEC>1 not built): VEC=1 only
         return nt_dict[1]
-    # VEC>=2 needs ld VEC-divisible so successive rows stay aligned. K need not
-    # be VEC-aligned (the kernel's scalar tail handles the K%VEC remainder).
-    if (ld % 4) == 0 and k >= 64:
+    align = int(ld) | int(off)
+    if _HAS_TENSOR_UNIT:
+        if (align & 3) == 0 and k >= 512:
+            return nt_dict[4]
+        if (align & 1) == 0 and k >= 512:
+            return nt_dict[2]
+        return nt_dict[1]
+    if (align & 3) == 0 and k >= 64:
         return nt_dict[4]
-    if (ld % 2) == 0 and k >= 32:
+    if (align & 1) == 0 and k >= 32:
         return nt_dict[2]
     return nt_dict[1]
 
@@ -134,12 +139,15 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
             # Up to N=2048: VEC=1 gives the most simdgroups (ng*nw=cols) without
             # idling cores, and wins across the small/medium range.
             vec, nw = 1, 32
-    elif vec_ok and k_big and cols >= 4096:
+    elif vec_ok and cols >= 4096 and (k_big or (k is not None and k >= 1024)):
+        # Wide N: full-line VEC=8 coalescing pays off once K>=1024, even below the
+        # deep-K (k_big) gate - the half-line VEC=2 loses ~8% here (4096x1024 bf16).
         vec = 8
         nw = 16 if (k is not None and k >= 8192) else 8
-    elif vec_ok and k_big and cols >= 2560:
+    elif vec_ok and cols >= 2560 and (k_big or (k is not None and k >= 1024)):
         vec, nw = 4, 8
     elif vec_ok and k_big and cols >= 1280:
+        # The 1280..2560 VEC=4 tier stays deep-K-only: at K=1024 these N prefer VEC=2.
         vec, nw = 4, 16
     elif vec_ok and cols >= 1024:
         vec, nw = 2, 16     # >=16 TGs fill the cores; NW=32 over-subscribes the
@@ -822,7 +830,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             # enqueue. b is (K×N) contiguous so stride(0)==N, passed as ldb.
             gt, thr, grp = _gemv_plan(dtype, N, K)
             o = _pooled_out(b, 1, N)
-            gt(b, a, o, N, K, N, threads=thr, group_size=grp)
+            gt(b, a, o, N, K, N, 1, threads=thr, group_size=grp)  # xs=1: contiguous a
             return o
 
     # Lean GEMV fast path: N==1 (matrix × column-vector)
@@ -1001,17 +1009,23 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
 def _gemv_nt(nt_dict, matrix, vec, out_v, rows, k, ld):
     # y[r] = sum_k matrix[r, k] * vec[k] (matrix row-major M×K, one warp/row).
     n_groups = (rows + 3) // 4          # NWARPS=4, ROWS_PER_SG=1
-    fn = _gemv_nt_pick(nt_dict, rows, k, ld)
+    fn = _gemv_nt_pick(nt_dict, rows, k, ld, matrix.storage_offset())
     fn(matrix, vec, out_v, rows, k, ld,
        threads=(128 * n_groups, 1, 1), group_size=(128, 1, 1))
 
 
-def _gemv_t(gh, matrix, x_vec, out_v, cols, k, ld, dtype):
+def _gemv_t(gh, matrix, x_vec, xs, out_v, cols, k, ld, dtype):
     # y[c] = sum_k matrix[k, c] * x[k]. gt splits K across simdgroups, reducing in
-    # threadgroup memory. Serves views, so forces VEC=1 (vec>1 needs 16-B alignment).
-    gt, tg, vec = _gemv_pick(gh, cols, ld, dtype, vec_ok=False, k_big=(k >= 2048))
+    # threadgroup memory. The matrix is read VEC-wide, the vector scalar (stride xs).
+    # VEC-wide matrix loads need both its row stride AND its base offset VEC-aligned:
+    # a VecT at element (off + k*ld + n0) is aligned for all k iff off and ld are.
+    # OR-ing them gives the combined low-bit alignment the picker clamps on, while
+    # the kernel still gets the real ld. Aligned views (incl. contiguous) now get
+    # the full VEC instead of a half-line VEC=1 read.
+    align = int(ld) | int(matrix.storage_offset())
+    gt, tg, vec = _gemv_pick(gh, cols, align, dtype, vec_ok=True, k=int(k))
     n_groups = (cols + 32 * vec - 1) // (32 * vec)
-    gt(matrix, x_vec, out_v, cols, k, ld,
+    gt(matrix, x_vec, out_v, cols, k, ld, int(xs),
        threads=(tg * n_groups, 1, 1), group_size=(tg, 1, 1))
 
 
@@ -1022,15 +1036,17 @@ def _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, o
     yv = out.view(-1)
     if M == 1:
         if trans_b:
-            _gemv_nt(nt, B_view, A_view.view(-1), yv, N, K, int(ldb))
+            _gemv_nt(nt, B_view, A_view.reshape(-1).contiguous(), yv, N, K, int(ldb))
         else:
-            _gemv_t(gh, B_view, A_view.view(-1), yv, N, K, int(ldb), dtype)
+            xv = A_view.reshape(-1)
+            _gemv_t(gh, B_view, xv, xv.stride(0), yv, N, K, int(ldb), dtype)
         return out
     elif N == 1:
         if trans_a:
-            _gemv_t(gh, A_view, B_view.view(-1), yv, M, K, int(lda), dtype)
+            xv = B_view.reshape(-1)
+            _gemv_t(gh, A_view, xv, xv.stride(0), yv, M, K, int(lda), dtype)
         else:
-            _gemv_nt(nt, A_view, B_view.view(-1), yv, M, K, int(lda))
+            _gemv_nt(nt, A_view, B_view.reshape(-1).contiguous(), yv, M, K, int(lda))
         return out
     else:
         raise ValueError("gemv backend requires M==1 or N==1")
