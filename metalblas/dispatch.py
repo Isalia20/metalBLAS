@@ -908,6 +908,115 @@ def _complex_matmul(a: torch.Tensor, b: torch.Tensor,
     return out
 
 
+# Integer matmul (no tensor/simdgroup-matrix unit): register-tiled int_gemm + the
+# gemv_t/gemv_nt templates. ACC_T >= output width, then truncate -> bit-exact vs
+# torch's wrap-on-overflow.
+_INT_PROFILE = {
+    torch.int8:  ("char",  "int",  "char"),
+    torch.uint8: ("uchar", "uint", "uchar"),
+    torch.int16: ("short", "int",  "short"),
+    torch.int32: ("int",   "int",  "int"),
+    torch.int64: ("long",  "long", "long"),
+}
+_INT_BYTES = {torch.int8: 1, torch.uint8: 1, torch.int16: 2, torch.int32: 4, torch.int64: 8}
+
+# GEMV (VEC cols/lane, NWARPS K-split); VEC clamped to alignment at call time.
+_IGEMV_T_CFG = {     # M==1: y = x @ B (gemv_t)
+    torch.int8: (8, 8), torch.uint8: (8, 8), torch.int16: (4, 8),
+    torch.int32: (2, 8), torch.int64: (1, 8),
+}
+_IGEMV_NT_CFG = {    # N==1: y = A @ x (gemv_nt); int64 reduces via threadgroup mem
+    torch.int8: (8, 4), torch.uint8: (8, 4), torch.int16: (4, 4),
+    torch.int32: (4, 8), torch.int64: (2, 4),
+}
+
+
+def _int_clamp_vec(vec: int, ld: int, off: int) -> int:
+    """Largest power-of-2 <= vec dividing both the row stride and base offset."""
+    a = int(ld) | int(off)
+    while vec > 1 and (a % vec):
+        vec >>= 1
+    return vec
+
+
+def _pick_int_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int, int, int]:
+    """(BM, BN, BK, TX, TY) for int_gemm, from M5 Pro sweeps."""
+    nbytes = _INT_BYTES[dtype]
+    mx = max(M, N)
+    if mx <= 256:                              # small: keep enough threadgroups
+        return (64, 64, 16, 16, 16)
+    if M <= 128 and N >= 1024:                 # thin-M wide-N: short BM
+        return (32, 64, 16, 8, 16)
+    if nbytes == 8:                            # int64: shallow BK caps threadgroup mem
+        return (64, 64, 8, 16, 16)
+    if nbytes == 1 and M >= 512:               # int8/uint8 large: tall BM amortizes
+        return (128, 64, 16, 16, 16)
+    return (64, 64, 16, 16, 16)
+
+
+def _int_gemv_t(dtype, matrix, x_vec, xs, out, cols, k, ld):
+    # y[c] = sum_k matrix[k,c] * x[k]; matrix read VEC-wide along c, K split over NWARPS.
+    in_t, acc_t, out_t = _INT_PROFILE[dtype]
+    vec, nw = _IGEMV_T_CFG[dtype]
+    vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+    fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec)
+    ng = (cols + 32 * vec - 1) // (32 * vec)
+    fn(matrix, x_vec, out.view(-1), _pk(cols, k, ld, int(xs)),
+       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
+
+
+def _int_gemv_nt(dtype, matrix, x_vec, out, rows, k, ld):
+    # y[r] = sum_k matrix[r,k] * x[k]; one warp per row (int64 reduces via tgroup mem).
+    in_t, acc_t, out_t = _INT_PROFILE[dtype]
+    vec, nw = _IGEMV_NT_CFG[dtype]
+    vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+    fn, _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, nw, vec, red_tg=(dtype is torch.int64))
+    ng = (rows + nw - 1) // nw
+    fn(matrix, x_vec, out.view(-1), _pk(rows, k, ld),
+       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
+
+
+def _int_matmul(a: torch.Tensor, b: torch.Tensor,
+                out: torch.Tensor | None = None) -> torch.Tensor:
+    """Integer C = A @ B: native GEMV for rank-1 (M==1 / N==1), else a register-tiled
+    integer GEMM. Bit-exact vs torch (same two's-complement wrapping)."""
+    assert a.device.type == "mps" and b.device.type == "mps"
+    assert a.dtype == b.dtype, "integer matmul requires both operands the same dtype"
+    dtype = a.dtype
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b = _resolve_inputs(a, b)
+    if out is None:
+        out = a.new_empty(M, N)
+    else:
+        assert out.shape == (M, N) and out.dtype == dtype and out.device.type == "mps"
+    ldc = out.stride(0)
+
+    # Rank-1 fast paths: gemv_t (y = x @ B), gemv_nt (y = A @ x).
+    if M == 1 and N >= 16:
+        if not trans_b:
+            xv = A_view.reshape(-1)
+            return _int_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, ldb)
+        xv = A_view.reshape(-1).contiguous()
+        return _int_gemv_nt(dtype, B_view, xv, out, N, K, ldb)
+    elif N == 1 and M >= 16:
+        if trans_a:
+            xv = B_view.reshape(-1)
+            return _int_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, lda)
+        xv = B_view.reshape(-1).contiguous()
+        return _int_gemv_nt(dtype, A_view, xv, out, M, K, lda)
+
+    in_t, acc_t, out_t = _INT_PROFILE[dtype]
+    BM, BN, BK, TX, TY = _pick_int_tile(int(M), int(N), int(K), dtype)
+    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b)
+    tiles_m = (M + BM - 1) // BM
+    tiles_n = (N + BN - 1) // BN
+    grp = TX * TY
+    fn(A_view, B_view, out, _pk(M, N, K, lda, ldb, ldc),
+       threads=(grp * tiles_n, tiles_m, 1), group_size=(grp, 1, 1))
+    return out
+
+
 def matmul(a: torch.Tensor, b: torch.Tensor, *,
            backend: str | None = None,
            tile: tuple | None = None,
@@ -927,6 +1036,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     # problems, decomposed real GEMMs otherwise). backend/tile/swizzle don't apply.
     if a.is_mps and (a.dtype in _COMPLEX or b.dtype in _COMPLEX):
         return _complex_matmul(a, b, out=out)
+
+    # Integer dtypes: dedicated path (backend/tile/swizzle don't apply).
+    if a.is_mps and a.dtype in _INT_PROFILE:
+        return _int_matmul(a, b, out=out)
 
     # Lean GEMV fast path (checked BEFORE the asserts)
     # Row-vector x matrix runs in ~7-12 us, so the Python preamble IS the

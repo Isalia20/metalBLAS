@@ -11,3 +11,4 @@
 #include "cgemv_nt.h"
 #include "cgemv_t.h"
 #include "complex_pack.h"
+#include "int_gemm.h"
