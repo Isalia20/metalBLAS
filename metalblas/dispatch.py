@@ -14,6 +14,15 @@ import torch
 from . import kernels
 
 
+def _pk(*vals):
+    words = []
+    for i in range(0, len(vals), 2):
+        lo = int(vals[i]) & 0xFFFFFFFF
+        hi = (int(vals[i + 1]) & 0xFFFFFFFF) if i + 1 < len(vals) else 0
+        words.append(lo | (hi << 32))
+    return words
+
+
 _DTYPE_NAME = {
     torch.float32: "float",
     torch.float16: "half",
@@ -166,8 +175,9 @@ def _gemv_pick(gh, cols, ldb, dtype, vec_ok=True, k=None, k_big=True):
     return gt[(vec, nw)], nw * 32, vec
 
 
-# Fast-path launch plan, memoized by (dtype, N): for contiguous GEMV (ldb == N)
-# the handle and thread/group tuples are pure functions of (dtype, N).
+# Fast-path launch plan, memoized by (dtype, N, K): for contiguous GEMV (ldb == N)
+# the handle/thread/group are functions of (dtype, N) and the K tiers, plus the
+# precomputed packed (N, K, N, 1) dims buffer (which embeds the exact K).
 _GEMV_PLAN: dict = {}
 # Symmetric memo for the N==1 (gemv_nt) path: pure function of (dtype, K).
 _GEMV_NT_PLAN: dict = {}
@@ -175,26 +185,30 @@ _GEMV_NT_PLAN: dict = {}
 
 def _gemv_nt_plan(dtype, K):
     """Resolve the gemv_nt variant + threadgroup size for the contiguous N==1
-    path (lda == K). Returns (fn, group_size); group size is fixed at 128."""
+    path (lda == K). Returns (fn, group_size, k_hi, k_lda); group size is fixed
+    at 128. gemv_nt packs (M, K, lda=K) into a uint4 (x=M, y=K, z=lda); M is the
+    runtime arg, so we precompute the K halves (k_hi = K<<32, k_lda = K) and the
+    hot path only ORs in M: dims = [M | k_hi, k_lda]."""
     key = (dtype, K)
     plan = _GEMV_NT_PLAN.get(key)
     if plan is None:
         gh = _gemv_handles(dtype)
         fn = _gemv_nt_pick(gh["nt"], 0, K, K)  # rows arg unused by picker
-        plan = (fn, (128, 1, 1))
+        plan = (fn, (128, 1, 1), K << 32, K)
         _GEMV_NT_PLAN[key] = plan
     return plan
 
 
 def _gemv_plan(dtype, N, K):
-    # Key on the two K thresholds _gemv_pick uses (K>=2048 picks vectorized tiers,
-    # K>=8192 picks NWARPS for VEC=8) rather than the raw K.
-    key = (dtype, N, K >= 2048, K >= 8192)
+    # Key on the exact K so the packed dims (which embed K) can be memoized; the
+    # (fn, thr, grp) pick itself only varies with N and the K>=2048/>=8192 tiers.
+    key = (dtype, N, K)
     plan = _GEMV_PLAN.get(key)
     if plan is None:
         gt, tg, vec = _gemv_pick(_gemv_handles(dtype), N, N, dtype, k=K)
         ng = (N + 32 * vec - 1) // (32 * vec)
-        plan = (gt, (tg * ng, 1, 1), (tg, 1, 1))
+        # Contiguous M==1: ldb==N, xs==1, so the full (N, K, ldb, xs) packs once.
+        plan = (gt, (tg * ng, 1, 1), (tg, 1, 1), _pk(N, K, N, 1))
         _GEMV_PLAN[key] = plan
     return plan
 
@@ -264,12 +278,14 @@ class _SplitKPlan:
         self.n_elems = M * N
         self.red_threads = (self.n_elems, 1, 1)
         self.red_group = (256, 1, 1)
+        self.sk_dims = _pk(M, N, K)
+        self.red_dims = _pk(self.n_elems, self.planes)
 
     def run(self, a, b, o):
         cp = _splitk_partial(o, self.planes, self.M, self.N)
-        self.splitk_fn(a, b, o, cp, self.M, self.N, self.K,
+        self.splitk_fn(a, b, o, cp, self.sk_dims,
                        threads=self.sk_threads, group_size=self.sk_group)
-        self.reduce_fn(cp, o, self.n_elems, self.planes,
+        self.reduce_fn(cp, o, self.red_dims,
                        threads=self.red_threads, group_size=self.red_group)
 
 
@@ -313,9 +329,10 @@ class _Conv1x1Plan:
         tiles_w = (M + BMW - 1) // BMW
         self.threads = (NSG * 32 * tiles_o, tiles_w, 1)
         self.group = (NSG * 32, 1, 1)
+        self.dims = _pk(M, N, K)
 
     def run(self, a, b, o):
-        self.fn(a, b, o, self.M, self.N, self.K,
+        self.fn(a, b, o, self.dims,
                 threads=self.threads, group_size=self.group)
 
 
@@ -431,11 +448,12 @@ def _autotune_m5t(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs
 
     # Each candidate is (cached_plan, run(a,b,o), label): m5_tensor tiles keep the
     # lean (fn, thr, grp) tuple, split-K uses its plan object.
+    m5t_dims = _pk(M, N, K)               # shared by all candidate tiles
     cand = []
     for (BM, BN, NSG) in cands:
         fn, thr, grp = _build_m5t_plan(dtype, M, N, K, BM, BN, NSG)
-        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp:
-               fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp))
+        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp, d=m5t_dims:
+               fn(a, b, o, d, threads=thr, group_size=grp))
         cand.append(((fn, thr, grp), run, (BM, BN, NSG)))
 
     # Add split-K / 1x1-conv candidates, but only those whose result matches the
@@ -828,9 +846,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
                 and a.is_contiguous() and b.is_contiguous()):
             # Memoized launch (pure in (dtype, N)): one dict hit + alloc +
             # enqueue. b is (K×N) contiguous so stride(0)==N, passed as ldb.
-            gt, thr, grp = _gemv_plan(dtype, N, K)
+            gt, thr, grp, dims = _gemv_plan(dtype, N, K)
             o = _pooled_out(b, 1, N)
-            gt(b, a, o, N, K, N, 1, threads=thr, group_size=grp)  # xs=1: contiguous a
+            gt(b, a, o, dims, threads=thr, group_size=grp)  # xs=1: contiguous a
             return o
 
     # Lean GEMV fast path: N==1 (matrix × column-vector)
@@ -843,10 +861,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         K = sa[1]
         if (dtype in _PROFILE and M >= 16 and b.shape[0] == K
                 and a.is_contiguous() and b.is_contiguous()):
-            fn, grp = _gemv_nt_plan(dtype, K)
+            fn, grp, k_hi, k_lda = _gemv_nt_plan(dtype, K)
             o = _pooled_out(a, M, 1)
             n_groups = (M + 3) // 4
-            fn(a, b.view(-1), o.view(-1), M, K, K,
+            fn(a, b.view(-1), o.view(-1), [M | k_hi, k_lda],
                threads=(grp[0] * n_groups, 1, 1), group_size=grp)
             return o
 
@@ -870,7 +888,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             o = _pooled_out(a, M, N)
             if type(plan) is tuple:
                 fn, thr, grp = plan
-                fn(a, b, o, M, N, K, K, N, N, threads=thr, group_size=grp)
+                fn(a, b, o, _pk(M, N, K), threads=thr, group_size=grp)
             else:
                 plan.run(a, b, o)
             return o
@@ -945,7 +963,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         tn_swz = tiles_n * tile_factor
         tm_swz = (tiles_m + tile_factor - 1) // tile_factor
         total = (group_size[0] * tn_swz, tm_swz, 1)
-        fn(A_view, B_view, out, M_, N_, K_, lda_, ldb_, ldc_,
+        fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
            threads=total, group_size=group_size)
         return out
 
@@ -971,7 +989,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         tn_swz = tiles_n * tile_factor
         tm_swz = (tiles_m + tile_factor - 1) // tile_factor
         total = (group_size[0] * tn_swz, tm_swz, 1)
-        fn(A_view, B_view, out, M_, N_, K_, lda_, ldb_, ldc_,
+        fn(A_view, B_view, out, _pk(M_, N_, K_),   # lda/ldb/ldc unused (packed storage)
            threads=total, group_size=group_size)
         return out
 
@@ -999,7 +1017,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         tn_swz = tiles_n * tile_factor
         tm_swz = (tiles_m + tile_factor - 1) // tile_factor
         total = (group_size[0] * tn_swz, tm_swz, 1)
-        fn(A_view, B_view, out, M_, N_, K_, lda_, ldb_, ldc_,
+        fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
            threads=total, group_size=group_size)
         return out
 
@@ -1010,7 +1028,7 @@ def _gemv_nt(nt_dict, matrix, vec, out_v, rows, k, ld):
     # y[r] = sum_k matrix[r, k] * vec[k] (matrix row-major M×K, one warp/row).
     n_groups = (rows + 3) // 4          # NWARPS=4, ROWS_PER_SG=1
     fn = _gemv_nt_pick(nt_dict, rows, k, ld, matrix.storage_offset())
-    fn(matrix, vec, out_v, rows, k, ld,
+    fn(matrix, vec, out_v, _pk(rows, k, ld),
        threads=(128 * n_groups, 1, 1), group_size=(128, 1, 1))
 
 
@@ -1025,7 +1043,7 @@ def _gemv_t(gh, matrix, x_vec, xs, out_v, cols, k, ld, dtype):
     align = int(ld) | int(matrix.storage_offset())
     gt, tg, vec = _gemv_pick(gh, cols, align, dtype, vec_ok=True, k=int(k))
     n_groups = (cols + 32 * vec - 1) // (32 * vec)
-    gt(matrix, x_vec, out_v, cols, k, ld, int(xs),
+    gt(matrix, x_vec, out_v, _pk(cols, k, ld, int(xs)),
        threads=(tg * n_groups, 1, 1), group_size=(tg, 1, 1))
 
 

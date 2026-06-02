@@ -18,15 +18,13 @@ kernel void gemv_t(
     device const IN_T   *B   [[buffer(0)]],
     device const IN_T   *x   [[buffer(1)]],
     device       OUT_T  *y   [[buffer(2)]],
-    constant int& gN         [[buffer(3)]],
-    constant int& gK         [[buffer(4)]],
-    constant int& gLdb       [[buffer(5)]],
-    constant int& gXs        [[buffer(6)]],
+    constant int4&  gP       [[buffer(3)]],   // packed (gN, gK, gLdb, gXs)
     uint3        tgid        [[threadgroup_position_in_grid]],
     uint         sgid        [[simdgroup_index_in_threadgroup]],
     uint         lane        [[thread_index_in_simdgroup]])
 {
     static_assert(BLOCK_N == 32 * VEC, "BLOCK_N must equal 32*VEC");
+    int gN = gP.x, gK = gP.y, gLdb = gP.z, gXs = gP.w;
     threadgroup ACC_T partials[NWARPS][BLOCK_N];
 
     int col0 = int(tgid.x) * BLOCK_N;
