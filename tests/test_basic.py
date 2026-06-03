@@ -162,6 +162,101 @@ def check_int(M, N, K, dtype, layout="rm"):
     return ok
 
 
+def check_bmm(B, M, N, K, dtype, layout="rm"):
+    """metalblas.bmm vs torch.bmm (3-D batched). Bit-exact for ints; atol for fp;
+    relative for complex. layout 'tr' makes both operands col-major (transposed view)."""
+    torch.manual_seed(0)
+    is_int = dtype in _INT_BITS or dtype == torch.int64
+    rand = (lambda *s: _int_rand(*s, dtype=dtype)) if is_int else \
+           (lambda *s: torch.randn(*s, dtype=dtype, device='mps'))
+    if layout == "tr":            # col-major matrices (e.g. attention Q@Kᵀ)
+        a = rand(B, K, M).transpose(-2, -1)
+        b = rand(B, N, K).transpose(-2, -1)
+    else:
+        a = rand(B, M, K)
+        b = rand(B, K, N)
+    got = metalblas.bmm(a, b)
+    if is_int:
+        ref = _int_ref(a, b, dtype)        # int64 @ then wrap (== torch's overflow)
+        ok = torch.equal(got.cpu(), ref) and got.dtype == dtype
+        metric = "bit-exact" if ok else "MISMATCH"
+    elif dtype.is_complex:
+        hp = torch.complex64
+        ref = a.cpu().to(hp) @ b.cpu().to(hp)
+        err = (got.cpu().to(hp) - ref).abs().max().item()
+        rel = err / (ref.abs().max().item() + 1e-9)
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+        ok = rel <= rtol and got.dtype == dtype
+        metric = f"rel={rel:.2e}"
+    else:
+        ref = torch.bmm(a.float(), b.float()).to(dtype)
+        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
+                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
+                else max(5e-2, 1e-2 * K**0.5))
+        err = (got.float() - ref.float()).abs().max().item()
+        ok = err <= atol and got.dtype == dtype
+        metric = f"err={err:.2e} atol={atol:.2e}"
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:9s} {layout:3s} B={B:4d} {M:4d}x{N:4d}x{K:4d} {metric}")
+    return ok
+
+
+def _baddbmm_int_ref(inp, a, b, beta, alpha, dtype):
+    """Exact int baddbmm: beta*input + alpha*(a@b) in int64, then wrap to output width."""
+    prod = a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)
+    Bb, M, N = prod.shape
+    r = alpha * prod + beta * inp.cpu().to(torch.int64).expand(Bb, M, N)
+    if dtype == torch.int64:
+        return r
+    mod = 1 << _INT_BITS[dtype]
+    r = r % mod
+    if dtype != torch.uint8:
+        r = torch.where(r >= (mod >> 1), r - mod, r)
+    return r.to(dtype)
+
+
+def check_baddbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
+    """metalblas.baddbmm vs torch.baddbmm: C = beta*input + alpha*(b1 @ b2)."""
+    torch.manual_seed(0)
+    is_int = dtype in _INT_BITS or dtype == torch.int64
+    if dtype.is_floating_point or dtype.is_complex:
+        a = torch.randn(B, M, K, dtype=dtype, device='mps')
+        b = torch.randn(B, K, N, dtype=dtype, device='mps')
+    else:
+        a = _int_rand(B, M, K, dtype=dtype)
+        b = _int_rand(B, K, N, dtype=dtype)
+    inp = _bias(bshape, dtype)
+    got = metalblas.baddbmm(inp, a, b, beta=beta, alpha=alpha)
+    if is_int:
+        ref = _baddbmm_int_ref(inp, a, b, beta, alpha, dtype)
+        ok = torch.equal(got.cpu(), ref) and got.dtype == dtype
+        metric = "bit-exact" if ok else "MISMATCH"
+    elif dtype.is_complex:
+        hp = torch.complex64
+        prod = a.cpu().to(hp) @ b.cpu().to(hp)
+        ref = (alpha * prod if alpha != 0 else torch.zeros_like(prod))
+        if beta != 0:
+            ref = ref + beta * inp.cpu().to(hp).expand(B, M, N)
+        err = (got.cpu().to(hp) - ref).abs().max().item()
+        rel = err / (ref.abs().max().item() + 1e-9)
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+        ok = rel <= rtol and got.dtype == dtype
+        metric = f"rel={rel:.2e}"
+    else:
+        ref = torch.baddbmm(inp.float(), a.float(), b.float(), beta=beta, alpha=alpha).to(dtype)
+        sc = abs(alpha) + abs(beta)
+        base = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
+                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
+                else max(5e-2, 1e-2 * K**0.5))
+        err = (got.float() - ref.float()).abs().max().item()
+        ok = err <= sc * base and got.dtype == dtype
+        metric = f"err={err:.2e} atol={sc*base:.2e}"
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:9s} {str(bshape):9s} b={beta} a={alpha} "
+          f"B={B} {M}x{N}x{K} {metric}")
+    return ok
+
+
 def _bias(bshape, dtype):
     if dtype in (torch.complex64, torch.complex32) or dtype.is_floating_point:
         return torch.randn(bshape, dtype=dtype, device='mps')
@@ -328,6 +423,37 @@ def main():
     print("=== addmm: beta=0 drops NaN bias ===")
     for dt in [torch.float32, torch.float16, torch.bfloat16]:
         check_addmm_beta0_nan(128, 96, 256, dt)
+
+    # bmm / baddbmm: batched 3-D GEMM, matching torch.bmm / torch.baddbmm.
+    bmm_dtypes = addmm_dtypes
+    print("=== bmm (batched) ===")
+    for dt in bmm_dtypes:
+        # square, thin-M/N, attention-shaped, many-small (launch regime), partial-edge.
+        for (B, M, N, K) in [(8, 128, 128, 128), (32, 256, 256, 256), (4, 512, 512, 512),
+                             (96, 512, 512, 64), (16, 64, 4096, 512), (128, 4096, 64, 256),
+                             (512, 64, 64, 64), (2048, 64, 64, 32), (3, 130, 100, 200)]:
+            check_bmm(B, M, N, K, dt)
+    print("=== bmm: rank-1 batched (M==1 / N==1) ===")
+    for dt in bmm_dtypes:
+        check_bmm(8, 1, 512, 256, dt)
+        check_bmm(8, 512, 1, 256, dt)
+    print("=== bmm: transposed batched views (col-major matrices) ===")
+    for dt in bmm_dtypes:
+        check_bmm(8, 256, 256, 256, dt, layout="tr")
+    print("=== baddbmm: bias broadcast shapes ===")
+    for dt in bmm_dtypes:
+        B, M, N, K = 4, 128, 96, 256
+        for bshape in [(B, M, N), (B, 1, N), (B, M, 1), (1, M, N), (M, N), (N,), (1,), ()]:
+            check_baddbmm(B, M, N, K, dt, bshape)
+    print("=== baddbmm: beta/alpha scaling ===")
+    for dt in bmm_dtypes:
+        for (beta, alpha) in [(2, 3), (0, 1), (1, 0), (0, 0)]:
+            check_baddbmm(4, 128, 96, 256, dt, (96,), beta=beta, alpha=alpha)
+    print("=== baddbmm: partial-edge tiles ===")
+    for dt in [torch.float32, torch.float16, torch.bfloat16]:
+        for (M, N, K) in [(130, 100, 200), (257, 129, 257)]:
+            for bshape in [(4, M, N), (N,), ()]:
+                check_baddbmm(4, M, N, K, dt, bshape)
 
 
 if __name__ == "__main__":

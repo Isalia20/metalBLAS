@@ -1509,5 +1509,280 @@ def addmm(input: torch.Tensor, mat1: torch.Tensor, mat2: torch.Tensor, *,
     return _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out)
 
 
+def _pick_bmm_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int]:
+    """(BM, BN, NSG) for a batched matmul (autotuner candidate 0 / autotune-off pick).
+
+    Unlike the 2-D pick, the batch already saturates the cores, so we never need tiny
+    tiles to make work - a bigger tile (more K-reuse) and NSG=4 (latency hiding across
+    the independent batch) win. From M5 Pro batched sweeps."""
+    if M == 1 or N == 1:                     # rank-1: reuse the padded-GEMV tile
+        return _pick_mpp_tensor_tile(M, N, K, dtype)
+    mx, mn = max(M, N), min(M, N)
+    if K <= 128 and mx >= 512:               # wide-N / tiny-K (attention scores): wide BN
+        return (32, 128, 4)
+    if mn <= 32:                             # tiny matrix: match it, don't pad to 64x64
+        return (32, 32, 4)
+    if mx <= 256:                            # small per-matrix: 64x64x4 (2-D pick goes tiny)
+        return (64, 64, 4)
+    return (64, 64, 2)                        # medium / large default
+
+
+# Batched tile candidates probed by the autotuner; the winning tile shifts with
+# aspect/K (sweeps), so probe on the real operands and cache by (dtype,M,N,K,trans).
+_BMM_TILES = [(64, 64, 2), (64, 64, 4), (32, 64, 2), (32, 128, 4), (64, 128, 4),
+              (128, 64, 4), (128, 32, 4), (128, 128, 8)]
+_BMM_PLAN: dict = {}
+
+
+def _bmm_candidates(M, N, K, dtype):
+    """Candidate 0 = the heuristic; then the curated batched set, deduped and pruned
+    of tiles far larger than the problem (cuts probe cost without losing a winner)."""
+    primary = _pick_bmm_tile(M, N, K, dtype)
+    cands = [primary]
+    for t in _BMM_TILES:
+        if t not in cands and t[0] <= 2 * M and t[1] <= 2 * N:
+            cands.append(t)
+    return cands
+
+
+def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, cands, margin):
+    """Time each candidate's batched launch (best-of-reps), returning (fn, BM, BN, NSG).
+    Candidate 0 (heuristic) is kept unless beaten by >margin. Mirrors _autotune_mppt."""
+    in_t, _, out_t = _PROFILE[dtype]
+    warmup, iters, reps = _probe_params(Bb * M, N, K)
+    o = a.new_empty(Bb, M, N)
+    sC, ldc = int(o.stride(0)), int(o.stride(1))
+    dims, bstr = _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0)
+    cand = []
+    for (BM, BN, NSG) in cands:
+        mn = (M % BM == 0) and (N % BN == 0)
+        fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
+                                        relaxed=True, swizzle_log=0, mn_aligned=mn, batched=True)
+        grp = (NSG * 32, 1, 1)
+        thr = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+        run = (lambda fn=fn, thr=thr, grp=grp: fn(a, b, o, dims, bstr, threads=thr, group_size=grp))
+        cand.append(((fn, BM, BN, NSG), run))
+    for (_, run) in cand:                    # warm every candidate before timing any
+        for _ in range(warmup):
+            run()
+    torch.mps.synchronize()
+    times = [float("inf")] * len(cand)
+    for _ in range(reps):
+        for j, (_, run) in enumerate(cand):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                run()
+            torch.mps.synchronize()
+            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
+    i = min(range(len(times)), key=lambda j: times[j])
+    return cand[i][0] if (i != 0 and times[i] < times[0] * (1.0 - margin)) else cand[0][0]
+
+
+def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA=0, sB=0):
+    """Resolve (fn, BM, BN, NSG) for a batched mpp_tensor launch, autotuning the tile
+    on first sight of (dtype,M,N,K,trans) and caching the winner."""
+    key = (dtype, M, N, K, trans_a, trans_b)
+    plan = _BMM_PLAN.get(key)
+    if plan is None:
+        cands = _bmm_candidates(M, N, K, dtype)
+        if _AUTOTUNE and a is not None and len(cands) > 1:
+            plan = _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb,
+                                 trans_a, trans_b, sA, sB, cands, _AUTOTUNE_MARGIN)
+        else:
+            BM, BN, NSG = cands[0]
+            in_t, _, out_t = _PROFILE[dtype]
+            mn = (M % BM == 0) and (N % BN == 0)
+            fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
+                                            relaxed=True, swizzle_log=0, mn_aligned=mn, batched=True)
+            plan = (fn, BM, BN, NSG)
+        _BMM_PLAN[key] = plan
+    return plan
+
+
+def _resolve_bmm_inputs(a: torch.Tensor, b: torch.Tensor):
+    """3-D analogue of _resolve_inputs for (B,M,K) @ (B,K,N). Each matrix needs a
+    unit-stride inner dim (row- or col-major) plus a uniform batch stride; anything
+    else is contiguified. -> (A,B, M,N,K, lda,ldb, trans_a,trans_b, sA,sB)."""
+    _, M, K = a.shape
+    _, _, N = b.shape
+    sa, sb = a.stride(), b.stride()
+    if sa[2] == 1 and sa[1] >= K:
+        trans_a, lda, A_view = False, sa[1], a
+    elif sa[1] == 1 and sa[2] >= M:
+        trans_a, lda, A_view = True, sa[2], a
+    else:
+        A_view, trans_a, lda = a.contiguous(), False, K
+    if sb[2] == 1 and sb[1] >= N:
+        trans_b, ldb, B_view = False, sb[1], b
+    elif sb[1] == 1 and sb[2] >= K:
+        trans_b, ldb, B_view = True, sb[2], b
+    else:
+        B_view, trans_b, ldb = b.contiguous(), False, N
+    return (A_view, B_view, int(M), int(N), int(K), int(lda), int(ldb),
+            trans_a, trans_b, int(A_view.stride(0)), int(B_view.stride(0)))
+
+
+def _bmm_out(ref: torch.Tensor, out, Bb, M, N, dtype):
+    """(write_target, needs_copyback). A user `out` whose N dim is unit-stride is
+    written in place; otherwise a contiguous scratch is allocated and copied back."""
+    if out is not None:
+        assert out.shape == (Bb, M, N) and out.dtype == dtype and out.is_mps, \
+            f"out must be ({Bb}, {M}, {N}) {dtype} on mps"
+        if out.stride(2) == 1 and out.stride(1) >= N:
+            return out, False
+        return ref.new_empty(Bb, M, N), True
+    return ref.new_empty(Bb, M, N), False
+
+
+def _bmm_loop(a, b, out=None):
+    """Per-matrix fallback: loop the 2-D matmul over the batch. Correct for every
+    dtype/shape (integer, non-Metal4); not launch-optimal for large B."""
+    Bb, M = a.shape[0], a.shape[1]
+    N = b.shape[2]
+    if out is None:
+        out = a.new_empty(Bb, M, N)
+    for i in range(Bb):
+        out[i].copy_(matmul(a[i], b[i]))
+    return out
+
+
+def _complex_bmm(a, b, out=None):
+    """Complex batched GEMM: deinterleave to real planes, four batched real bmm
+    (ar@br - ai@bi) + i(ar@bi + ai@br), fold back to interleaved complex."""
+    cdt = a.dtype if a.dtype in _COMPLEX else b.dtype
+    if a.dtype != cdt:
+        a = a.to(cdt)
+    if b.dtype != cdt:
+        b = b.to(cdt)
+    a = a.resolve_conj().contiguous() if a.is_conj() else a.contiguous()
+    b = b.resolve_conj().contiguous() if b.is_conj() else b.contiguous()
+    Bb, M, K = a.shape
+    N = b.shape[2]
+    rdt = _COMPLEX_REAL[cdt]
+    c2, r = _COMPLEX[cdt]
+    ar = torch.empty(Bb, M, K, dtype=rdt, device=a.device)
+    ai = torch.empty(Bb, M, K, dtype=rdt, device=a.device)
+    br = torch.empty(Bb, K, N, dtype=rdt, device=b.device)
+    bi = torch.empty(Bb, K, N, dtype=rdt, device=b.device)
+    split, combine = kernels.complex_pack(c2, r)
+    nA, nB = Bb * M * K, Bb * K * N
+    split(a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
+    split(b, br, bi, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
+    P, Q, S, T = bmm(ar, br), bmm(ai, bi), bmm(ar, bi), bmm(ai, br)
+    if out is None:
+        out = torch.empty(Bb, M, N, dtype=cdt, device=a.device)
+    nC = Bb * M * N
+    combine(P, Q, S, T, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
+    return out
+
+
+def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Batched C[i] = a[i] @ b[i] for 3-D (B,M,K) @ (B,K,N), matching torch.bmm.
+
+    Real dtypes on Metal 4 run as a single batched mpp_tensor launch; complex
+    deinterleaves into four batched real bmm; integer / non-Metal4 loop the 2-D matmul.
+    """
+    assert a.is_mps and b.is_mps, "bmm expects mps tensors"
+    assert a.dim() == 3 and b.dim() == 3, "bmm expects 3-D inputs"
+    assert a.dtype == b.dtype, "bmm requires both operands the same dtype"
+    Bb, M, K = a.shape
+    Bb2, K2, N = b.shape
+    assert Bb == Bb2 and K == K2, f"bmm shape mismatch: {a.shape} @ {b.shape}"
+    dtype = a.dtype
+
+    if Bb == 0 or M == 0 or N == 0:                  # empty output
+        o = out if out is not None else a.new_empty(Bb, M, N)
+        return o
+    if K == 0:                                       # sum over nothing -> zeros
+        o = out if out is not None else a.new_empty(Bb, M, N)
+        return o.zero_()
+    if dtype in _COMPLEX:
+        return _complex_bmm(a, b, out=out)
+    if dtype not in _PROFILE or not kernels.has_metal4():
+        return _bmm_loop(a, b, out)                  # integer / no cooperative-tensor headers
+
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
+    oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
+    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
+    fn, BM, BN, NSG = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
+                                A_view, B_view, sA, sB)
+    grp = (NSG * 32, 1, 1)
+    threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
+       threads=threads, group_size=grp)
+    if needs_copy:
+        out.copy_(oc)
+        return out
+    return oc
+
+
+def _baddbmm_loop(input, batch1, batch2, beta, alpha, out=None):
+    """Per-matrix fallback for baddbmm (integer / complex / non-Metal4)."""
+    Bb, M = batch1.shape[0], batch1.shape[1]
+    N = batch2.shape[2]
+    x = input if input.dtype == batch1.dtype else input.to(batch1.dtype)
+    xe = x.expand(Bb, M, N)
+    if out is None:
+        out = batch1.new_empty(Bb, M, N)
+    for i in range(Bb):
+        out[i].copy_(addmm(xe[i], batch1[i], batch2[i], beta=beta, alpha=alpha))
+    return out
+
+
+def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
+            beta=1, alpha=1, out: torch.Tensor | None = None) -> torch.Tensor:
+    """C = beta*input + alpha*(batch1 @ batch2), matching torch.baddbmm (3-D).
+
+    `input` is broadcastable to (B,M,N). Real dtypes fuse the bias into the batched
+    mpp_tensor epilogue; complex / integer loop the 2-D addmm.
+    """
+    assert batch1.is_mps and batch2.is_mps, "baddbmm expects mps tensors"
+    assert batch1.dim() == 3 and batch2.dim() == 3, "baddbmm expects 3-D batch1, batch2"
+    assert batch1.dtype == batch2.dtype, "baddbmm requires batch1.dtype == batch2.dtype"
+    Bb, M, K = batch1.shape
+    Bb2, K2, N = batch2.shape
+    assert Bb == Bb2 and K == K2, f"baddbmm shape mismatch: {batch1.shape} @ {batch2.shape}"
+    dtype = batch1.dtype
+
+    # Coerce scalars to the kernel arg type (mirrors addmm).
+    if dtype in _INT_PROFILE:
+        beta, alpha = int(beta), int(alpha)
+    elif dtype not in _COMPLEX:
+        beta, alpha = float(beta), float(alpha)
+    bnz, anz = beta != 0, alpha != 0
+
+    # Complex / integer / no-Metal4: the batched real epilogue kernel doesn't cover
+    # them, so loop the 2-D addmm (which has the tuned complex/int epilogues).
+    if dtype in _COMPLEX or dtype in _INT_PROFILE or not kernels.has_metal4():
+        return _baddbmm_loop(input, batch1, batch2, beta, alpha, out)
+
+    # input -> (B,M,N) broadcast strides (0 on stretched dims); the buffer is the base
+    # tensor, the kernel reads bias[b*sBias + r*br + c*bc].
+    x = input if input.dtype == dtype else input.to(dtype)
+    xe = x.expand(Bb, M, N)
+    sBias, br, bc = (int(s) for s in xe.stride())
+
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(batch1, batch2)
+    oc, needs_copy = _bmm_out(batch1, out, Bb, M, N, dtype)
+    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
+    in_t, _, out_t = _PROFILE[dtype]
+    # Reuse the (autotuned) bmm tile - the epilogue is a cheap store-time change.
+    _, BM, BN, NSG = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
+                               A_view, B_view, sA, sB)
+    mn_aligned = (M % BM == 0) and (N % BN == 0)
+    fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
+                                    relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
+                                    epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
+    grp = (NSG * 32, 1, 1)
+    threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
+       float(beta), float(alpha), _pk(sA, sB, sC, sBias),
+       threads=threads, group_size=grp)
+    if needs_copy:
+        out.copy_(oc)
+        return out
+    return oc
+
+
 # Convenience aliases
 gemm = matmul
