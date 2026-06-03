@@ -20,6 +20,22 @@ using namespace mpp::tensor_ops;
 #define MN_ALIGNED  __MN_ALIGNED__
 #define STATIC_SLICE __STATIC_SLICE__
 
+// BATCHED (bmm/baddbmm): grid z is the batch index; A/B/C (and the bias) are offset
+// by their per-matrix strides. Defaults to 0 so the 2-D build is unchanged.
+#ifndef BATCHED
+#define BATCHED 0
+#endif
+#if EPILOGUE
+#define MB_BATCH_BUF 8
+#else
+#define MB_BATCH_BUF 4
+#endif
+#if BATCHED && EPILOGUE
+#define MB_BBAT _bbat                      // per-batch bias base (baddbmm)
+#else
+#define MB_BBAT 0
+#endif
+
 // Write the BM x BN tile from cT_f32 into cT_out (addmm epilogue when EPILOGUE); the
 // fragment index gives (col, row) so the broadcast bias lands right. VALIDATE skips
 // out-of-tile elements (partial edge / unaligned tiles).
@@ -31,7 +47,7 @@ using namespace mpp::tensor_ops;
             auto _idx = cT_f32.get_multidimensional_index(_e);                    \
             int _r = m_off + (int)_idx[1], _c = n_off + (int)_idx[0];             \
             cT_out[_e] = mb_epi<OUT_T, float, float>(                             \
-                cT_f32[_e], bias, _r * bstride.x + _c * bstride.y, beta, alpha);  \
+                cT_f32[_e], bias, MB_BBAT + _r * bstride.x + _c * bstride.y, beta, alpha); \
         }                                                                         \
 } while (0)
 #else
@@ -54,8 +70,19 @@ kernel void mpp_tensor_gemm(
     constant float& beta     [[buffer(6)]],
     constant float& alpha    [[buffer(7)]],
 #endif
+#if BATCHED
+    constant int4& batch [[buffer(MB_BATCH_BUF)]],   // (sA, sB, sC, sBias) per-batch element strides
+#endif
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
+#if BATCHED
+    A += (int64_t)tgid.z * (int64_t)batch.x;
+    B += (int64_t)tgid.z * (int64_t)batch.y;
+    C += (int64_t)tgid.z * (int64_t)batch.z;
+  #if EPILOGUE
+    int _bbat = (int)tgid.z * batch.w;
+  #endif
+#endif
     int gM = gP.M, gN = gP.N, gK = gP.K;
     auto eA = TRANS_A ? dextents<int32_t, 2>(gM, gK) : dextents<int32_t, 2>(gK, gM);
     auto eB = TRANS_B ? dextents<int32_t, 2>(gK, gN) : dextents<int32_t, 2>(gN, gK);

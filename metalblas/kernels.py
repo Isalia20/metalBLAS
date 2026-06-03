@@ -141,12 +141,17 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
                    relaxed: bool = True,
                    swizzle_log: int = 0,
                    mn_aligned: bool = False,
-                   epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
+                   epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
+                   batched: bool = False):
     # Static-extent slices only for non-transposed (the orientation auto-dispatch routes here).
     static_slice = (not trans_a) and (not trans_b)
+    # batched (bmm/baddbmm): grid z is the batch; A/B/C/bias offset by per-matrix strides.
+    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
+    if batched:
+        defines = {**(defines or {}), "BATCHED": 1}
     src = _build(
         "MB_BUILD_MPP_TENSOR",
-        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+        defines=defines,
         IN_T=in_t, OUT_T=out_t,
         BM=BM, BN=BN, NSG=NSG,
         TRANS_A=("true" if trans_a else "false"),
