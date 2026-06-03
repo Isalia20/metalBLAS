@@ -221,7 +221,7 @@ def _gemv_plan(dtype, N, K):
     return plan
 
 
-# Memoized m5_tensor plan for the contiguous-GEMM fast path, keyed by
+# Memoized mpp_tensor plan for the contiguous-GEMM fast path, keyed by
 # (dtype, M, N, K); untransposed swizzle-0 so the hot path is a dict hit + enqueue.
 _GEMM_PLAN: dict = {}
 # The (BM,BN,NSG) actually chosen per shape (autotuned winner or heuristic
@@ -240,12 +240,12 @@ _AUTOTUNE_MARGIN = 0.03
 _TALL_NARROW_MARGIN = 0.01
 
 
-def _build_m5t_plan(dtype, M, N, K, BM, BN, NSG):
-    """Compile one m5_tensor tile and return its (fn, threads, group) launch plan
+def _build_mppt_plan(dtype, M, N, K, BM, BN, NSG):
+    """Compile one mpp_tensor tile and return its (fn, threads, group) launch plan
     for the packed, untransposed, swizzle-0 case (lda=K, ldb=N, ldc=N)."""
     in_t, _, out_t = _PROFILE[dtype]
     mn_aligned = (M % BM == 0) and (N % BN == 0)
-    fn, _ = kernels.m5_tensor_gemm(in_t, out_t, BM, BN, NSG, False, False,
+    fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, False, False,
                                    relaxed=True, swizzle_log=0, mn_aligned=mn_aligned)
     tiles_m = (M + BM - 1) // BM
     tiles_n = (N + BN - 1) // BN
@@ -368,13 +368,13 @@ def _conv_specs(M, N, K):
     return specs
 
 
-def _m5_tensor_tile_candidates(M, N, K, dtype):
+def _mpp_tensor_tile_candidates(M, N, K, dtype):
     """Return (candidate tiles, autotuner margin) for (M,N,K,dtype).
 
     A one-element list means the heuristic is confident; a longer list marks an
-    ambiguous regime. Candidate 0 is `_pick_m5_tensor_tile`; margin = win threshold.
+    ambiguous regime. Candidate 0 is `_pick_mpp_tensor_tile`; margin = win threshold.
     """
-    primary = _pick_m5_tensor_tile(M, N, K, dtype)
+    primary = _pick_mpp_tensor_tile(M, N, K, dtype)
     # fp32 wins 2-3x everywhere - never worth a probe.
     if dtype == torch.float32:
         return [primary], _AUTOTUNE_MARGIN
@@ -443,7 +443,7 @@ def _probe_params(M, N, K):
                                       # 3 reps stabilizes the ranking.
 
 
-def _autotune_m5t(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
+def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
                   conv_specs=()):
     """Time each candidate (best-of-reps), returning the fastest (plan, label).
     Candidate 0 (heuristic) is kept unless beaten by >margin; sk/conv_specs add candidates."""
@@ -455,13 +455,13 @@ def _autotune_m5t(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs
         reps = max(reps, 5)
     o = a.new_empty(M, N)             # private scratch - never the pooled output
 
-    # Each candidate is (cached_plan, run(a,b,o), label): m5_tensor tiles keep the
+    # Each candidate is (cached_plan, run(a,b,o), label): mpp_tensor tiles keep the
     # lean (fn, thr, grp) tuple, split-K uses its plan object.
-    m5t_dims = _pk(M, N, K)               # shared by all candidate tiles
+    mppt_dims = _pk(M, N, K, K, N, N)     # packed dims, shared by all candidate tiles
     cand = []
     for (BM, BN, NSG) in cands:
-        fn, thr, grp = _build_m5t_plan(dtype, M, N, K, BM, BN, NSG)
-        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp, d=m5t_dims:
+        fn, thr, grp = _build_mppt_plan(dtype, M, N, K, BM, BN, NSG)
+        run = (lambda a, b, o, fn=fn, thr=thr, grp=grp, d=mppt_dims:
                fn(a, b, o, d, threads=thr, group_size=grp))
         cand.append(((fn, thr, grp), run, (BM, BN, NSG)))
 
@@ -513,7 +513,7 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
     key = (dtype, M, N, K)
     plan = _GEMM_PLAN.get(key)
     if plan is None:
-        cands, margin = _m5_tensor_tile_candidates(M, N, K, dtype)
+        cands, margin = _mpp_tensor_tile_candidates(M, N, K, dtype)
         sk_specs = ()
         conv_specs = ()
         if _AUTOTUNE and a is not None and _is_splitk_regime(M, N, K, dtype):
@@ -521,11 +521,11 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         if _AUTOTUNE and a is not None and _is_conv_regime(M, N, K, dtype):
             conv_specs = _conv_specs(M, N, K)
         if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs):
-            plan, tile = _autotune_m5t(dtype, M, N, K, cands, a, b, margin,
-                                       sk_specs, conv_specs)
+            plan, tile = _autotune_mppt(dtype, M, N, K, cands, a, b, margin,
+                                        sk_specs, conv_specs)
         else:
             tile = cands[0]
-            plan = _build_m5t_plan(dtype, M, N, K, *tile)
+            plan = _build_mppt_plan(dtype, M, N, K, *tile)
         _GEMM_PLAN[key] = plan
         _GEMM_TILE[key] = tile
     return plan
@@ -618,8 +618,8 @@ def _pick_simd_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, in
     return best[1]
 
 
-def _pick_m5_tensor_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int]:
-    """Pick (BM, BN, NSG) for the m5_tensor_gemm kernel.
+def _pick_mpp_tensor_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int]:
+    """Pick (BM, BN, NSG) for the mpp_tensor_gemm kernel.
 
     Tuned from M5 Pro sweeps. Small problems need many small tiles to fill the
     cores; large problems prefer (64,64,2); deep-K large M,N wants (64,128,4).
@@ -706,8 +706,8 @@ def _pick_m5_tensor_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[in
     return (64, 64, 2)
 
 
-def _pick_m5_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int, int, int, bool]:
-    """Pick (BM, BN, BK, WM, WN, dbuf) for the m5_gemm kernel (16x32x16 frags).
+def _pick_mpp_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int, int, int, int, bool]:
+    """Pick (BM, BN, BK, WM, WN, dbuf) for the mpp_gemm kernel (16x32x16 frags).
 
     Hand-tuned from M5 Pro sweeps; falls back to a smaller tile if over budget.
     `dbuf=True` double-buffers the K-loop to overlap loads with the MMA (large K).
@@ -1030,7 +1030,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     Parameters
     ----------
     a, b : torch.Tensor on device 'mps'
-    backend : "auto" (default), "simd", "m5", "gemv"
+    backend : "auto" (default), "simd", "mpp", "gemv"
     tile  : (BM, BN, BK, WM, WN) - override the tile heuristic
     swizzle_log : override the swizzle (0, 1, 2 …)
     out   : optional preallocated output of shape (M, N)
@@ -1080,8 +1080,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
                threads=(grp[0] * n_groups, 1, 1), group_size=grp)
             return o
 
-    # Lean GEMM fast path (contiguous, untransposed, m5_tensor regime)
-    # Common GEMM routes to m5_tensor; the ~2 us preamble isn't hidden behind short
+    # Lean GEMM fast path (contiguous, untransposed, mpp_tensor regime)
+    # Common GEMM routes to mpp_tensor; the ~2 us preamble isn't hidden behind short
     # kernels, so memoize the launch by (dtype,M,N,K). Non-matching inputs fall through.
     if (backend is None and out is None and swizzle_log is None
             and a.is_mps and a.ndim == 2 and b.ndim == 2):
@@ -1089,8 +1089,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         sb = b.shape
         N = sb[1]
         dtype = a.dtype
-        # N>=32 and M>=2: thin-N and batched-decode GEMM belong on m5_tensor
-        # (BN=32/short-BM tiles beat manual m5); autotuner picks the tile.
+        # N>=32 and M>=2: thin-N and batched-decode GEMM belong on mpp_tensor
+        # (BN=32/short-BM tiles beat manual mpp); autotuner picks the tile.
         if (M >= 2 and N >= 32 and K >= 64 and sb[0] == K and dtype in _PROFILE
                 and a.is_contiguous() and b.is_contiguous()
                 and kernels.has_metal4()):
@@ -1100,7 +1100,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             o = _pooled_out(a, M, N)
             if type(plan) is tuple:
                 fn, thr, grp = plan
-                fn(a, b, o, _pk(M, N, K), threads=thr, group_size=grp)
+                fn(a, b, o, _pk(M, N, K, K, N, N), threads=thr, group_size=grp)
             else:
                 plan.run(a, b, o)
             return o
@@ -1129,17 +1129,19 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
 
     if backend == "auto":
         is_lp = (dtype != torch.float32)
-        # m5_tensor assumes PACKED storage (ignores lda/ldb), so a strided sub-view
-        # reads wrong elements; those fall back to the manual m5 kernel.
-        packed_ab = (lda_ == K_ and ldb_ == N_)
-        # The m5_tensor / m5 kernels need Metal 4 cooperative-tensor headers
+        # mpp_tensor reads any unit-inner-stride operand directly through a strided
+        # tensor_inline view (leading dim = lda/ldb), so packed, [::2]-strided and
+        # col-major all ride it. _resolve_inputs already contiguified anything with
+        # no unit-stride dim, so by here every operand is expressible that way.
+        packed_ab = (lda_ == K_ and ldb_ == N_)                  # NN-packed (M==1 fallback below)
+        # The mpp_tensor / mpp kernels need Metal 4 cooperative-tensor headers
         # (macOS 26+). When absent, route everything non-GEMV to the simd kernel.
         m4 = kernels.has_metal4()
         # Wide-N M==1 fallback (only when an explicit arg bypassed gemv_t): padded
-        # m5_tensor zeros OOB rows, beating VEC=1 gemv on views. bf16/fp16 only.
+        # mpp_tensor zeros OOB rows, beating VEC=1 gemv on views. bf16/fp16 only.
         if (m4 and M == 1 and N >= 4096 and K >= 256 and is_lp
                 and not trans_a and not trans_b and packed_ab):
-            backend = "m5_tensor"
+            backend = "mpp_tensor"
         # Everything else GEMV-shaped goes to the dedicated kernel, which fills
         # the GPU on small-N by splitting K across 32 simdgroups. fp32 too.
         elif M == 1 and N >= 16:
@@ -1150,13 +1152,13 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             # macOS < 26: no cooperative-tensor headers. The SIMD-group GEMM is the
             # general fallback (handles transposed / unaligned / tiny shapes too).
             backend = "simd"
-        # m5_tensor (MPP op.run) wins across all sizes/dtypes (fp32 TF32-relaxed);
-        # bounds-checked reads handle tiny shapes. Only transposed/non-packed fall to m5.
-        elif (M >= 2 and N >= 32 and K >= 64
-                and not trans_a and not trans_b and packed_ab):
-            backend = "m5_tensor"
+        # mpp_tensor (MPP op.run) wins across all sizes/dtypes (fp32 TF32-relaxed);
+        # the strided view absorbs transposed + leading-dim ([::2]) operands, so
+        # everything above the tile floor rides it. Tiny shapes fall to mpp.
+        elif (M >= 2 and N >= 32 and K >= 64):
+            backend = "mpp_tensor"
         else:
-            backend = "m5"
+            backend = "mpp"
 
     if backend == "gemv":
         return _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, out)
@@ -1179,10 +1181,10 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
            threads=total, group_size=group_size)
         return out
 
-    if backend == "m5_tensor":
+    if backend == "mpp_tensor":
         # Tile = (BM, BN, NSG)
         if tile is None:
-            BM, BN, NSG = _pick_m5_tensor_tile(M_, N_, K_, dtype)
+            BM, BN, NSG = _pick_mpp_tensor_tile(M_, N_, K_, dtype)
         else:
             assert len(tile) >= 3
             BM, BN, NSG = tile[0], tile[1], tile[2]
@@ -1192,7 +1194,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         # MPP path has its own internal scheduling; an external swizzle
         # hurts it (empirically loses 15-20% TF).  Leave it at 0.
         swz = swizzle_log if swizzle_log is not None else 0
-        fn, _ = kernels.m5_tensor_gemm(
+        fn, _ = kernels.mpp_tensor_gemm(
             in_t, out_t, BM, BN, NSG, trans_a, trans_b,
             relaxed=True, swizzle_log=swz, mn_aligned=mn_aligned,
         )
@@ -1201,14 +1203,14 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         tn_swz = tiles_n * tile_factor
         tm_swz = (tiles_m + tile_factor - 1) // tile_factor
         total = (group_size[0] * tn_swz, tm_swz, 1)
-        fn(A_view, B_view, out, _pk(M_, N_, K_),   # lda/ldb/ldc unused (packed storage)
+        fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
            threads=total, group_size=group_size)
         return out
 
-    if backend == "m5":
+    if backend == "mpp":
         pad = None
         if tile is None:
-            BM, BN, BK, WM, WN, dbuf = _pick_m5_tile(M_, N_, K_, dtype)
+            BM, BN, BK, WM, WN, dbuf = _pick_mpp_tile(M_, N_, K_, dtype)
         elif len(tile) == 7:
             BM, BN, BK, WM, WN, dbuf, pad = tile
         elif len(tile) == 6:
@@ -1221,9 +1223,9 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         tiles_m = (M_ + BM - 1) // BM
         tiles_n = (N_ + BN - 1) // BN
         swz = swizzle_log if swizzle_log is not None else _round_swizzle_log(tiles_m, tiles_n)
-        fn, _ = kernels.m5_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
-                                trans_a, trans_b, mn_aligned, k_aligned,
-                                relaxed=True, swizzle_log=swz, dbuf=dbuf, pad=pad)
+        fn, _ = kernels.mpp_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
+                                 trans_a, trans_b, mn_aligned, k_aligned,
+                                 relaxed=True, swizzle_log=swz, dbuf=dbuf, pad=pad)
         group_size = (WM * WN * 32, 1, 1)
         tile_factor = 1 << swz
         tn_swz = tiles_n * tile_factor
@@ -1384,25 +1386,25 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
         # cheap store-time change), so awkward shapes get the same fast tile here.
         _gemm_plan(dtype, M_, N_, K_, A_view, B_view)
         tile = _GEMM_TILE[(dtype, M_, N_, K_)]
-        # An m5_tensor tile is a 3-tuple; a 4/5-tuple means the autotuner chose a
+        # An mpp_tensor tile is a 3-tuple; a 4/5-tuple means the autotuner chose a
         # split-K or conv plan (no epilogue) - fall back to the heuristic tile.
         if len(tile) == 3:
             BM, BN, NSG = tile
         else:
-            BM, BN, NSG = _pick_m5_tensor_tile(M_, N_, K_, dtype)
+            BM, BN, NSG = _pick_mpp_tensor_tile(M_, N_, K_, dtype)
         mn_aligned = (M_ % BM == 0) and (N_ % BN == 0)
-        fn, _ = kernels.m5_tensor_gemm(in_t, out_t, BM, BN, NSG, False, False,
+        fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, False, False,
                                        relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
                                        epilogue=True, beta_nz=bnz, alpha_nz=anz)
         grp = (NSG * 32, 1, 1)
-        fn(A_view, B_view, out, _pk(M_, N_, K_), x, bstride, float(beta), float(alpha),
+        fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_), x, bstride, float(beta), float(alpha),
            threads=(grp[0] * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=grp)
         return out
 
     # Transposed / non-packed (m4) or no Metal 4: the manual tiled fallbacks.
     if m4:
-        BM, BN, BK, WM, WN, dbuf = _pick_m5_tile(M_, N_, K_, dtype)
-        builder = lambda: kernels.m5_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN, trans_a, trans_b,
+        BM, BN, BK, WM, WN, dbuf = _pick_mpp_tile(M_, N_, K_, dtype)
+        builder = lambda: kernels.mpp_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN, trans_a, trans_b,
                                           (M_ % BM == 0) and (N_ % BN == 0), K_ % BK == 0,
                                           relaxed=True, swizzle_log=0, dbuf=dbuf,
                                           epilogue=True, beta_nz=bnz, alpha_nz=anz)

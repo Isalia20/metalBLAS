@@ -1,5 +1,5 @@
-// m5_gemm.h - Manual threadgroup-tiled GEMM over matmul2d 16x32x16 cooperative tensors.
-#ifdef MB_BUILD_M5_GEMM
+// mpp_gemm.h - Manual threadgroup-tiled GEMM over matmul2d 16x32x16 cooperative tensors.
+#ifdef MB_BUILD_MPP_GEMM
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
@@ -151,7 +151,7 @@ static inline void load_B_tile(threadgroup IN_T *Bs,
 // Dims + leading strides packed into one constant buffer (one setBytes, not six).
 struct MBGemmDims { int M, N, K, lda, ldb, ldc; };
 
-kernel void m5_gemm(
+kernel void mpp_gemm(
     device const IN_T   *A           [[buffer(0)]],
     device const IN_T   *B           [[buffer(1)]],
     device       OUT_T  *C           [[buffer(2)]],
@@ -438,4 +438,4 @@ kernel void m5_gemm(
         }
     }
 }
-#endif  // MB_BUILD_M5_GEMM
+#endif  // MB_BUILD_MPP_GEMM

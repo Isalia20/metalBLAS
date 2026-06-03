@@ -47,7 +47,7 @@ y = addmm(bias, x, w, beta=0.5, alpha=2.0)
 You can override the backend and tile for the real dtypes if needed:
 
 ```python
-c = matmul(a, b, backend="m5_tensor", tile=(64, 128, 4))  # (BM, BN, NSG)
+c = matmul(a, b, backend="mpp_tensor", tile=(64, 128, 4))  # (BM, BN, NSG)
 c = matmul(a, b, backend="gemv") # rank-1 problems
 ```
 
@@ -55,13 +55,15 @@ c = matmul(a, b, backend="gemv") # rank-1 problems
 
 Dispatch picks a kernel from shape and dtype:
 
-- **`m5_tensor`** - the primary path for nearly everything. Uses Apple's
+- **`mpp_tensor`** - the primary path for nearly everything. Uses Apple's
   `mpp::tensor_ops::matmul2d` on the tensor unit, with static-extent tile slices
-  so interior tiles skip per-tile edge predication.
+  so interior tiles skip per-tile edge predication. A strided `tensor_inline`
+  view (leading dim `lda`/`ldb` + the descriptor's transpose flags) lets the same
+  path consume col-major and `[::2]`-strided operands directly, with no copy.
 - **`gemv_nt` / `gemv_t`** - bandwidth-bound rank-1 fast paths (M=1 / N=1) with
   cache-line-wide coalesced loads.
-- **`m5_gemm` / `simd_gemm`** - threadgroup-tiled fallbacks for sub-64 dims,
-  transposed or non-packed inputs.
+- **`mpp_gemm` / `simd_gemm`** - threadgroup-tiled fallbacks for sub-tile-floor
+  shapes (and the general path when Metal 4 is unavailable).
 - **complex** - `cgemv_t` / `cgemv_nt` are native interleaved-complex GEMV
   kernels (read the matrix once as `float2`/`half2`, fp32 accumulate). Complex
   GEMM deinterleaves into real planes and runs four real products
@@ -122,7 +124,19 @@ python bench/bench_matmul.py --dtype fp32 --group llm
 python bench/bench_matmul.py --dtype c64 --group square    # complex64
 python bench/bench_matmul.py --dtype i32 --group square    # int32 (also i8/u8/i16/i64)
 python bench/bench_matmul.py --report          # write perf_benchs/<chip>.md for your Mac
+
+# Layout sweep: same shapes, awkward operand strides (row/col-major, sliced, offset)
+python bench/bench_matmul.py --layout all                     # all layouts, bf16
+python bench/bench_matmul.py --layout cm_cm,sliced --check    # subset + correctness probe
+python bench/bench_matmul.py --report --layout all            # report incl. layout section
 ```
+
+Layouts: `rm_rm` (row-major, the packed fast path), `rm_cm` / `cm_rm` / `cm_cm`
+(col-major views — descriptor transpose flags), `sliced` (`[::2]` rows: leading
+dim `lda=2K`), `offset` (`[1:, 1:]`: nonzero storage offset). All of these read
+in place on `mpp_tensor` via a strided `tensor_inline` view (no copy); only
+`colsl` (`[:, ::2]`, unit stride on neither dim) still needs a contiguous copy.
+Each prints a `mb layout tax` line — throughput vs the packed `rm_rm` baseline.
 
 ## License
 

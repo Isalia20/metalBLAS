@@ -18,9 +18,9 @@ def check(M, N, K, dtype, backend="auto", tile=None, atol=None):
     a = torch.randn(M, K, dtype=dtype, device='mps')
     b = torch.randn(K, N, dtype=dtype, device='mps')
     if atol is None:
-        # Loose tolerances - m5 backend uses TF32-like relaxed precision for fp32.
+        # Loose tolerances - mpp backend uses TF32-like relaxed precision for fp32.
         if dtype == torch.float32:
-            atol = max(0.1, 5e-3 * K**0.5) if backend == "m5" else max(1e-3, 1e-5 * K)
+            atol = max(0.1, 5e-3 * K**0.5) if backend == "mpp" else max(1e-3, 1e-5 * K)
         elif dtype == torch.bfloat16:
             # bf16 has only 7 mantissa bits → errors grow ~ K * 2^-7
             atol = max(5e-1, 3e-2 * K**0.5)
@@ -234,24 +234,24 @@ def main():
     print("=== fp16, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
         check(*shape, dtype=torch.float16, backend="simd")
-    # m5 / m5_tensor backends need Metal 4 cooperative-tensor headers (macOS 26+).
+    # mpp / mpp_tensor backends need Metal 4 cooperative-tensor headers (macOS 26+).
     m4 = has_metal4()
     if m4:
-        print("=== fp32, m5 backend ===")
+        print("=== fp32, mpp backend ===")
         for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-            check(*shape, dtype=torch.float32, backend="m5")
-        print("=== fp16, m5 backend ===")
+            check(*shape, dtype=torch.float32, backend="mpp")
+        print("=== fp16, mpp backend ===")
         for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-            check(*shape, dtype=torch.float16, backend="m5")
+            check(*shape, dtype=torch.float16, backend="mpp")
     else:
-        print("=== m5 backend: SKIPPED (Metal 4 / macOS 26+ not available) ===")
+        print("=== mpp backend: SKIPPED (Metal 4 / macOS 26+ not available) ===")
     print("=== bf16, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
         check(*shape, dtype=torch.bfloat16, backend="simd")
     if m4:
-        print("=== bf16, m5 backend ===")
+        print("=== bf16, mpp backend ===")
         for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
-            check(*shape, dtype=torch.bfloat16, backend="m5")
+            check(*shape, dtype=torch.bfloat16, backend="mpp")
     print("=== Transposed inputs ===")
     for shape in [(128, 128, 128), (513, 257, 129), (1024, 1024, 256)]:
         for dt in [torch.float32, torch.float16, torch.bfloat16]:
@@ -308,7 +308,7 @@ def main():
         M, N, K = 128, 96, 256
         for bshape in [(M, N), (1, N), (M, 1), (N,), (1,), ()]:
             check_addmm(M, N, K, dt, bshape)
-    print("=== addmm: unaligned edge tiles (m5_tensor VALIDATE path) ===")
+    print("=== addmm: unaligned edge tiles (mpp_tensor VALIDATE path) ===")
     # M%BM / N%BN != 0 routes interior tiles through the static store and the
     # final row/col strip through the dynamic per-element edge store; exercise both
     # with every bias broadcast so the epilogue index math is checked on partials.

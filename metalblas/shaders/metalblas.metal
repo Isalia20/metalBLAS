@@ -3,8 +3,8 @@
 
 #include "mb_epi.h"
 #include "simd_gemm.h"
-#include "m5_gemm.h"
-#include "m5_tensor.h"
+#include "mpp_gemm.h"
+#include "mpp_tensor.h"
 #include "splitk.h"
 #include "conv1x1.h"
 #include "gemv_nt.h"
