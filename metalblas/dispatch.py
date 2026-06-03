@@ -1020,6 +1020,47 @@ def _int_matmul(a: torch.Tensor, b: torch.Tensor,
     return out
 
 
+def _matmul_nd(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Full torch.matmul for non-2-D operands: 1-D dot/promotion and batched
+    broadcasting, built on the 2-D `matmul` and 3-D `bmm` kernels."""
+    da, db = a.ndim, b.ndim
+    assert da >= 1 and db >= 1, "matmul operands must be at least 1-D"
+
+    # 1-D @ 1-D -> 0-D dot product (route through the (1,K)@(K,1) GEMM).
+    if da == 1 and db == 1:
+        assert a.shape[0] == b.shape[0], f"size mismatch: {a.shape} @ {b.shape}"
+        r = matmul(a.reshape(1, -1), b.reshape(-1, 1)).reshape(())
+        return out.copy_(r) if out is not None else r
+
+    # 1-D @ N-D: prepend a 1, matmul, then drop that row dim from the result.
+    if da == 1:
+        r = _matmul_nd(a.unsqueeze(0), b)
+        r = r.squeeze(-2)
+        return out.copy_(r) if out is not None else r
+
+    # N-D @ 1-D: append a 1, matmul, then drop that column dim from the result.
+    if db == 1:
+        r = _matmul_nd(a, b.unsqueeze(-1))
+        r = r.squeeze(-1)
+        return out.copy_(r) if out is not None else r
+
+    # Both >= 2-D: broadcast the batch dims, flatten to one batch, run bmm.
+    M, K = a.shape[-2], a.shape[-1]
+    K2, N = b.shape[-2], b.shape[-1]
+    assert K == K2, f"shape mismatch: A is {a.shape}, B is {b.shape}"
+    batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    if not batch:                        # no batch (incl. 1-D-promoted mv/vec): tuned 2-D path
+        r = matmul(a, b)
+        return out.copy_(r) if out is not None else r
+    B = 1
+    for d in batch:
+        B *= d
+    a3 = a.expand(*batch, M, K).reshape(B, M, K)
+    b3 = b.expand(*batch, K, N).reshape(B, K, N)
+    r = bmm(a3, b3).reshape(*batch, M, N)
+    return out.copy_(r) if out is not None else r
+
+
 def matmul(a: torch.Tensor, b: torch.Tensor, *,
            backend: str | None = None,
            tile: tuple | None = None,
@@ -1034,7 +1075,14 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     tile  : (BM, BN, BK, WM, WN) - override the tile heuristic
     swizzle_log : override the swizzle (0, 1, 2 …)
     out   : optional preallocated output of shape (M, N)
+
+    Non-2-D inputs (1-D operands, batched / broadcast N-D) route to `_matmul_nd`,
+    matching full torch.matmul semantics; backend/tile/swizzle apply to 2-D only.
     """
+    # N-D / 1-D operands: full torch.matmul algorithm built on the 2-D + bmm kernels.
+    if a.ndim != 2 or b.ndim != 2:
+        return _matmul_nd(a, b, out=out)
+
     # Complex dtypes route to the dedicated complex path (native GEMV for rank-1
     # problems, decomposed real GEMMs otherwise). backend/tile/swizzle don't apply.
     if a.is_mps and (a.dtype in _COMPLEX or b.dtype in _COMPLEX):
@@ -1646,6 +1694,78 @@ def _bmm_loop(a, b, out=None):
     return out
 
 
+def _int_bmm(a, b, dtype, out=None):
+    """Batched integer bmm: one batched int_gemm launch (grid z = batch). Rank-1
+    (M==1 / N==1) keeps the loop - the GEMM tile is wrong there."""
+    Bb = a.shape[0]
+    if a.shape[1] == 1 or b.shape[2] == 1:
+        return _bmm_loop(a, b, out)
+    in_t, acc_t, out_t = _INT_PROFILE[dtype]
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
+    oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
+    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
+    BM, BN, BK, TX, TY = _pick_int_tile(M, N, K, dtype)
+    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b,
+                             batched=True)
+    grp = TX * TY
+    threads = (grp * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
+       threads=threads, group_size=(grp, 1, 1))
+    if needs_copy:
+        out.copy_(oc)
+        return out
+    return oc
+
+
+def _int_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, dtype, out=None):
+    """Batched integer baddbmm: one batched int_gemm epilogue launch. Rank-1
+    (M==1 / N==1) keeps the loop - the GEMM tile is wrong there."""
+    Bb = batch1.shape[0]
+    if batch1.shape[1] == 1 or batch2.shape[2] == 1:
+        return _baddbmm_loop(input, batch1, batch2, beta, alpha, out)
+    in_t, acc_t, out_t = _INT_PROFILE[dtype]
+    # input -> (B,M,N) broadcast strides (0 on stretched dims); read bias[b*sBias + r*br + c*bc].
+    x = input if input.dtype == dtype else input.to(dtype)
+    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(batch1, batch2)
+    xe = x.expand(Bb, M, N)
+    sBias, br, bc = (int(s) for s in xe.stride())
+    oc, needs_copy = _bmm_out(batch1, out, Bb, M, N, dtype)
+    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
+    BM, BN, BK, TX, TY = _pick_int_tile(M, N, K, dtype)
+    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b,
+                             epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
+    grp = TX * TY
+    threads = (grp * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
+       int(beta), int(alpha), _pk(sA, sB, sC, sBias),
+       threads=threads, group_size=(grp, 1, 1))
+    if needs_copy:
+        out.copy_(oc)
+        return out
+    return oc
+
+
+def _complex_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out=None):
+    """Batched complex baddbmm: batched complex product (4 real bmm), then
+    beta*input + alpha*product over (B,M,N). NaN-safe: drop the dropped term (no
+    0*NaN). beta/alpha are real."""
+    cdt = batch1.dtype
+    prod = _complex_bmm(batch1, batch2)
+    Bb, M, N = prod.shape
+    x = input if input.dtype == cdt else input.to(cdt)
+    if anz:
+        r = alpha * prod
+        if bnz:
+            r = r + beta * x.expand(Bb, M, N)
+    elif bnz:
+        r = beta * x.expand(Bb, M, N).to(cdt)
+    else:
+        r = torch.zeros_like(prod)
+    if out is None:
+        return r.contiguous() if not r.is_contiguous() else r
+    return out.copy_(r)
+
+
 def _complex_bmm(a, b, out=None):
     """Complex batched GEMM: deinterleave to real planes, four batched real bmm
     (ar@br - ai@bi) + i(ar@bi + ai@br), fold back to interleaved complex."""
@@ -1680,7 +1800,8 @@ def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) ->
     """Batched C[i] = a[i] @ b[i] for 3-D (B,M,K) @ (B,K,N), matching torch.bmm.
 
     Real dtypes on Metal 4 run as a single batched mpp_tensor launch; complex
-    deinterleaves into four batched real bmm; integer / non-Metal4 loop the 2-D matmul.
+    deinterleaves into four batched real bmm; integer is one batched int_gemm launch
+    (rank-1 / non-Metal4 loop the 2-D matmul).
     """
     assert a.is_mps and b.is_mps, "bmm expects mps tensors"
     assert a.dim() == 3 and b.dim() == 3, "bmm expects 3-D inputs"
@@ -1698,8 +1819,10 @@ def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) ->
         return o.zero_()
     if dtype in _COMPLEX:
         return _complex_bmm(a, b, out=out)
+    if dtype in _INT_PROFILE:
+        return _int_bmm(a, b, dtype, out)            # single batched int_gemm launch
     if dtype not in _PROFILE or not kernels.has_metal4():
-        return _bmm_loop(a, b, out)                  # integer / no cooperative-tensor headers
+        return _bmm_loop(a, b, out)                  # no cooperative-tensor headers
 
     A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
     oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
@@ -1734,7 +1857,8 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
     """C = beta*input + alpha*(batch1 @ batch2), matching torch.baddbmm (3-D).
 
     `input` is broadcastable to (B,M,N). Real dtypes fuse the bias into the batched
-    mpp_tensor epilogue; complex / integer loop the 2-D addmm.
+    mpp_tensor epilogue; integer into the batched int_gemm epilogue; complex applies
+    beta*input + alpha*(batched product) elementwise.
     """
     assert batch1.is_mps and batch2.is_mps, "baddbmm expects mps tensors"
     assert batch1.dim() == 3 and batch2.dim() == 3, "baddbmm expects 3-D batch1, batch2"
@@ -1751,9 +1875,13 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
         beta, alpha = float(beta), float(alpha)
     bnz, anz = beta != 0, alpha != 0
 
-    # Complex / integer / no-Metal4: the batched real epilogue kernel doesn't cover
-    # them, so loop the 2-D addmm (which has the tuned complex/int epilogues).
-    if dtype in _COMPLEX or dtype in _INT_PROFILE or not kernels.has_metal4():
+    # Complex -> batched complex product + elementwise AXPY; integer -> one batched
+    # int_gemm epilogue launch. No-Metal4 real loops the 2-D addmm.
+    if dtype in _COMPLEX:
+        return _complex_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out)
+    if dtype in _INT_PROFILE:
+        return _int_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, dtype, out)
+    if not kernels.has_metal4():
         return _baddbmm_loop(input, batch1, batch2, beta, alpha, out)
 
     # input -> (B,M,N) broadcast strides (0 on stretched dims); the buffer is the base
@@ -1784,5 +1912,76 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
     return oc
 
 
+def addbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
+           beta=1, alpha=1, out: torch.Tensor | None = None) -> torch.Tensor:
+    """C = beta*input + alpha*(Σᵢ batch1[i] @ batch2[i]) -> 2-D (M,N), matching torch.addbmm.
+
+    The batch is REDUCED: it folds to one deep-K addmm over the batch-flattened
+    operands (concat batch1 along columns, batch2 along rows), reusing addmm's
+    tuned epilogue/complex/int paths. `input` is broadcastable to (M,N).
+    """
+    assert batch1.is_mps and batch2.is_mps, "addbmm expects mps tensors"
+    assert batch1.dim() == 3 and batch2.dim() == 3, "addbmm expects 3-D batch1, batch2"
+    assert batch1.dtype == batch2.dtype, "addbmm requires batch1.dtype == batch2.dtype"
+    Bb, M, K = batch1.shape
+    Bb2, K2, N = batch2.shape
+    assert Bb == Bb2 and K == K2, f"addbmm shape mismatch: {batch1.shape} @ {batch2.shape}"
+    dtype = batch1.dtype
+
+    # Empty batch / K: the sum is empty -> just beta*input broadcast to (M,N).
+    # (torch's MPS addbmm mishandles B==0; this matches the CPU/spec result.)
+    if Bb == 0 or K == 0:
+        x = input if input.dtype == dtype else input.to(dtype)
+        b = int(beta) if dtype in _INT_PROFILE else beta
+        r = (x * b).expand(M, N).contiguous() if b != 0 else x.new_zeros(M, N)
+        if out is not None:
+            assert out.shape == (M, N) and out.dtype == dtype and out.is_mps
+            return out.copy_(r)
+        return r
+
+    # Σᵢ b1[i]@b2[i] == [b1[0]|…|b1[B-1]] @ [b2[0];…;b2[B-1]]: concat b1's K-blocks
+    # along cols -> (M,B*K) (one copy via permute), b2's along rows -> (B*K,N) (free
+    # for contiguous b2). Deep-K addmm accumulates once -> bit-exact ints, all dtypes.
+    A = batch1.permute(1, 0, 2).reshape(M, Bb * K)
+    Bm = batch2.reshape(Bb * K, N)
+    return addmm(input, A, Bm, beta=beta, alpha=alpha, out=out)
+
+
+def dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """1-D inner product, matching torch.dot (0-D scalar)."""
+    assert a.dim() == 1 and b.dim() == 1, \
+        f"1D tensors expected, but got {a.dim()}D and {b.dim()}D tensors"
+    assert a.shape[0] == b.shape[0], \
+        f"inconsistent tensor size, expected [{a.shape[0]}] and [{b.shape[0]}]"
+    assert a.dtype == b.dtype, \
+        f"dot : expected both vectors to have same dtype, got {a.dtype} and {b.dtype}"
+    return matmul(a, b)
+
+
+def vdot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """1-D inner product conjugating the FIRST arg, matching torch.vdot."""
+    if a.is_complex():
+        return dot(a.conj().resolve_conj(), b)
+    return dot(a, b)
+
+
+def outer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Outer product a[i]*b[j] -> (M, N), matching torch.outer."""
+    assert a.dim() == 1, f"outer: Expected 1-D argument self, but got {a.dim()}-D"
+    assert b.dim() == 1, f"outer: Expected 1-D argument vec2, but got {b.dim()}-D"
+    # elementwise broadcast (K=1 GEMM wouldn't hit a tuned kernel); bit-exact vs torch.
+    return a.unsqueeze(1) * b.unsqueeze(0)
+
+
+def mv(mat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Matrix-vector product (M,K)@(K,) -> (M,), matching torch.mv."""
+    assert mat.dim() == 2 and vec.dim() == 1, \
+        f"vector + matrix @ vector expected, got {mat.dim()}, {mat.dim()}, {vec.dim()}"
+    assert mat.shape[1] == vec.shape[0], \
+        f"size mismatch, got mat ({mat.shape[0]}x{mat.shape[1]}), vec ({vec.shape[0]})"
+    return matmul(mat, vec)
+
+
 # Convenience aliases
 gemm = matmul
+ger = outer

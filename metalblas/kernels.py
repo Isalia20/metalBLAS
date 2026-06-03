@@ -244,9 +244,14 @@ def complex_pack(c2_t: str, r_t: str,
 @functools.lru_cache(maxsize=None)
 def int_gemm(in_t: str, acc_t: str, out_t: str, BM: int, BN: int, BK: int,
              TX: int, TY: int, trans_a: bool, trans_b: bool,
-             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
+             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
+             batched: bool = False):
     """Register-tiled integer GEMM (simdgroup_matrix / the tensor unit are float-only)."""
-    src = _build("MB_BUILD_INT_GEMM", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+    # batched (bmm/baddbmm): grid z is the batch; A/B/C/bias offset by per-matrix strides.
+    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
+    if batched:
+        defines = {**(defines or {}), "BATCHED": 1}
+    src = _build("MB_BUILD_INT_GEMM", defines=defines,
                  IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  BM=BM, BN=BN, BK=BK, TX=TX, TY=TY,
                  TRANS_A=int(trans_a), TRANS_B=int(trans_b))

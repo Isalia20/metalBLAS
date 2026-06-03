@@ -18,6 +18,22 @@ using namespace metal;
 
 #define TGP_SIZE (TX * TY)
 
+// BATCHED (bmm/baddbmm): grid z is the batch index; A/B/C (and bias) offset by their
+// per-matrix strides. Defaults to 0 so the 2-D build is byte-identical at runtime.
+#ifndef BATCHED
+#define BATCHED 0
+#endif
+#if EPILOGUE
+#define MB_BATCH_BUF 8
+#else
+#define MB_BATCH_BUF 4
+#endif
+#if BATCHED && EPILOGUE
+#define MB_BBAT _bbat                      // per-batch bias base (baddbmm)
+#else
+#define MB_BBAT 0
+#endif
+
 constant constexpr int TM = BM / TY;   // rows each thread owns
 constant constexpr int TN = BN / TX;   // cols each thread owns
 
@@ -38,9 +54,20 @@ kernel void int_gemm(
     constant ACC_T& beta      [[buffer(6)]],
     constant ACC_T& alpha     [[buffer(7)]],
 #endif
+#if BATCHED
+    constant int4& batch [[buffer(MB_BATCH_BUF)]],   // (sA, sB, sC, sBias) per-batch element strides
+#endif
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]])
 {
+#if BATCHED
+    A += (int64_t)tgid.z * (int64_t)batch.x;
+    B += (int64_t)tgid.z * (int64_t)batch.y;
+    C += (int64_t)tgid.z * (int64_t)batch.z;
+  #if EPILOGUE
+    int _bbat = (int)tgid.z * batch.w;
+  #endif
+#endif
     const int gM = gP.M, gN = gP.N, gK = gP.K;
     const int gLda = gP.lda, gLdb = gP.ldb, gLdc = gP.ldc;
 
@@ -126,7 +153,7 @@ kernel void int_gemm(
             if (gn < gN)
 #if EPILOGUE
                 C[gm * gLdc + gn] = mb_epi<OUT_T, ACC_T, ACC_T>(
-                    acc[i][j], bias, gm * bstride.x + gn * bstride.y, beta, alpha);
+                    acc[i][j], bias, MB_BBAT + gm * bstride.x + gn * bstride.y, beta, alpha);
 #else
                 C[gm * gLdc + gn] = (OUT_T)acc[i][j];
 #endif

@@ -257,6 +257,64 @@ def check_baddbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
     return ok
 
 
+def _addbmm_int_ref(inp, a, b, beta, alpha, dtype):
+    """Exact int addbmm: beta*input + alpha*Σᵢ(a[i]@b[i]) in int64, wrap to width.
+    torch.addbmm errors on int/mps, so build the reference on CPU."""
+    prod = (a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)).sum(0)   # (M,N)
+    M, N = prod.shape
+    r = alpha * prod + beta * inp.cpu().to(torch.int64).expand(M, N)
+    if dtype == torch.int64:
+        return r
+    mod = 1 << _INT_BITS[dtype]
+    r = r % mod
+    if dtype != torch.uint8:
+        r = torch.where(r >= (mod >> 1), r - mod, r)
+    return r.to(dtype)
+
+
+def check_addbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
+    """metalblas.addbmm vs torch.addbmm: C = beta*input + alpha*Σᵢ(b1[i]@b2[i]) (2-D)."""
+    torch.manual_seed(0)
+    is_int = dtype in _INT_BITS or dtype == torch.int64
+    if dtype.is_floating_point or dtype.is_complex:
+        a = torch.randn(B, M, K, dtype=dtype, device='mps')
+        b = torch.randn(B, K, N, dtype=dtype, device='mps')
+    else:
+        a = _int_rand(B, M, K, dtype=dtype)
+        b = _int_rand(B, K, N, dtype=dtype)
+    inp = _bias(bshape, dtype)
+    got = metalblas.addbmm(inp, a, b, beta=beta, alpha=alpha)
+    shape_ok = tuple(got.shape) == (M, N) and got.dtype == dtype
+    if is_int:                                  # torch.addbmm errors on int/mps -> CPU ref
+        ref = _addbmm_int_ref(inp, a, b, beta, alpha, dtype)
+        ok = shape_ok and torch.equal(got.cpu(), ref)
+        metric = "bit-exact" if ok else "MISMATCH"
+    elif dtype.is_complex:
+        hp = torch.complex64
+        prod = (a.cpu().to(hp) @ b.cpu().to(hp)).sum(0)
+        ref = (alpha * prod if alpha != 0 else torch.zeros_like(prod))
+        if beta != 0:
+            ref = ref + beta * inp.cpu().to(hp).expand(M, N)
+        err = (got.cpu().to(hp) - ref).abs().max().item()
+        rel = err / (ref.abs().max().item() + 1e-9)
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+        ok = shape_ok and rel <= rtol
+        metric = f"rel={rel:.2e}"
+    else:
+        ref = torch.addbmm(inp.float(), a.float(), b.float(), beta=beta, alpha=alpha).to(dtype)
+        sc = abs(alpha) + abs(beta)
+        base = (max(0.1, 5e-3 * (B * K)**0.5) if dtype == torch.float32
+                else max(5e-1, 3e-2 * (B * K)**0.5) if dtype == torch.bfloat16
+                else max(5e-2, 1e-2 * (B * K)**0.5))
+        err = (got.float() - ref.float()).abs().max().item()
+        ok = shape_ok and err <= sc * base
+        metric = f"err={err:.2e} atol={sc*base:.2e}"
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:9s} {str(bshape):9s} b={beta} a={alpha} "
+          f"B={B} {M}x{N}x{K} {metric}")
+    return ok
+
+
 def _bias(bshape, dtype):
     if dtype in (torch.complex64, torch.complex32) or dtype.is_floating_point:
         return torch.randn(bshape, dtype=dtype, device='mps')
@@ -320,6 +378,119 @@ def check_addmm_beta0_nan(M, N, K, dtype):
     print(f"  [{'OK' if ok else 'FAIL'}] {str(dtype).split('.')[-1]:9s} beta=0 NaN-bias "
           f"{M}x{N}x{K} {'no NaN leaked' if ok else 'NaN LEAKED'}")
     return ok
+
+
+def check_matmul_nd(sa, sb, dtype):
+    """metalblas.matmul vs torch.matmul for N-D / 1-D operands (drop-in semantics).
+    Bit-exact for ints; atol for fp; relative for complex. K is the contracted dim."""
+    torch.manual_seed(0)
+    is_int = dtype in _INT_BITS or dtype == torch.int64
+    rand = (lambda s: _int_rand(*s, dtype=dtype)) if is_int else \
+           (lambda s: torch.randn(*s, dtype=dtype, device='mps'))
+    a = rand(sa)
+    b = rand(sb)
+    K = sa[-1] if len(sa) >= 2 else sa[0]
+    got = mb_matmul(a, b)
+    ref = torch.matmul(a, b)
+    shape_ok = tuple(got.shape) == tuple(ref.shape) and got.dtype == dtype
+    if is_int:
+        hp = torch.matmul(a.cpu().to(torch.int64), b.cpu().to(torch.int64))
+        if dtype != torch.int64:
+            mod = 1 << _INT_BITS[dtype]
+            hp = hp % mod
+            if dtype != torch.uint8:
+                hp = torch.where(hp >= (mod >> 1), hp - mod, hp)
+        ok = shape_ok and torch.equal(got.cpu(), hp.to(dtype))
+        metric = "bit-exact" if ok else "MISMATCH"
+    elif dtype.is_complex:
+        hp = torch.complex64
+        rref = torch.matmul(a.cpu().to(hp), b.cpu().to(hp))
+        err = (got.cpu().to(hp) - rref).abs().max().item()
+        rel = err / (rref.abs().max().item() + 1e-9)
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+        ok = shape_ok and rel <= rtol
+        metric = f"rel={rel:.2e}"
+    else:
+        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
+                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
+                else max(5e-2, 1e-2 * K**0.5))
+        err = (got.float() - ref.float()).abs().max().item()
+        ok = shape_ok and err <= atol
+        metric = f"err={err:.2e} atol={atol:.2e}"
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {str(dtype).split('.')[-1]:9s} {str(sa):16s} @ {str(sb):16s} "
+          f"-> {str(tuple(got.shape)):14s} {metric}")
+    return ok
+
+
+# Vector / rank-1 ops (dot / vdot / outer / mv) vs torch.
+_IS_INT = lambda dt: dt in _INT_BITS or dt == torch.int64
+
+
+def _vrand(shape, dtype):
+    return _int_rand(*shape, dtype=dtype) if _IS_INT(dtype) else \
+        torch.randn(*shape, dtype=dtype, device='mps')
+
+
+def _vcheck(name, got, ref, dtype, tag):
+    """Shared pass/print: ints bit-exact, complex relative, fp atol (K-scaled)."""
+    shape_ok = tuple(got.shape) == tuple(ref.shape) and got.dtype == dtype
+    K = max(got.shape[-1] if got.ndim else 1, 1)
+    if _IS_INT(dtype):
+        ok = shape_ok and torch.equal(got.cpu(), ref.cpu())
+        metric = "bit-exact" if ok else "MISMATCH"
+    elif dtype.is_complex:
+        hp = torch.complex64
+        err = (got.cpu().to(hp) - ref.cpu().to(hp)).abs().max().item()
+        rel = err / (ref.cpu().to(hp).abs().max().item() + 1e-9)
+        rtol = 3e-2 if dtype == torch.complex32 else 5e-3
+        ok = shape_ok and rel <= rtol
+        metric = f"rel={rel:.2e} rtol={rtol:.1e}"
+    else:
+        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
+                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
+                else max(5e-2, 1e-2 * K**0.5))
+        err = (got.float() - ref.float()).abs().max().item()
+        ok = shape_ok and err <= atol
+        metric = f"err={err:.2e} atol={atol:.2e}"
+    status = "OK" if ok else "FAIL"
+    print(f"  [{status}] {name:6s} {str(dtype).split('.')[-1]:9s} {tag:14s} {metric}")
+    return ok
+
+
+def check_dot(K, dtype):
+    torch.manual_seed(0)
+    a, b = _vrand((K,), dtype), _vrand((K,), dtype)
+    return _vcheck("dot", metalblas.dot(a, b), torch.dot(a, b), dtype, f"K={K}")
+
+
+def check_vdot(K, dtype):
+    """vdot conjugates the FIRST arg; complex inputs have nonzero imaginary parts."""
+    torch.manual_seed(1)
+    a, b = _vrand((K,), dtype), _vrand((K,), dtype)
+    got, ref = metalblas.vdot(a, b), torch.vdot(a, b)
+    ok = _vcheck("vdot", got, ref, dtype, f"K={K}")
+    if dtype.is_complex:                # vdot must DIFFER from dot (conj effect)
+        hp = torch.complex64
+        same = (metalblas.dot(a, b).cpu().to(hp) - ref.cpu().to(hp)).abs().max().item()
+        ok = ok and same > 1e-3        # un-conjugated dot is measurably different
+    return ok
+
+
+def check_outer(M, N, dtype):
+    torch.manual_seed(0)
+    a, b = _vrand((M,), dtype), _vrand((N,), dtype)
+    got = metalblas.outer(a, b)
+    ok = _vcheck("outer", got, torch.outer(a, b), dtype, f"{M}x{N}")
+    return ok and torch.equal(metalblas.ger(a, b).cpu().to(torch.complex64) if dtype.is_complex
+                              else metalblas.ger(a, b).cpu(),
+                              got.cpu().to(torch.complex64) if dtype.is_complex else got.cpu())
+
+
+def check_mv(M, K, dtype):
+    torch.manual_seed(0)
+    mat, vec = _vrand((M, K), dtype), _vrand((K,), dtype)
+    return _vcheck("mv", metalblas.mv(mat, vec), torch.mv(mat, vec), dtype, f"{M}x{K}")
 
 
 def main():
@@ -454,6 +625,61 @@ def main():
         for (M, N, K) in [(130, 100, 200), (257, 129, 257)]:
             for bshape in [(4, M, N), (N,), ()]:
                 check_baddbmm(4, M, N, K, dt, bshape)
+
+    # addbmm: 2-D C = beta*input + alpha*Σᵢ(b1[i]@b2[i]); batch REDUCED (vs baddbmm).
+    print("=== addbmm (batch-reduced) ===")
+    for dt in bmm_dtypes:
+        B, M, N, K = 8, 128, 96, 256
+        for bshape in [(M, N), (1, N), (M, 1), (N,), (1,), ()]:
+            check_addbmm(B, M, N, K, dt, bshape)
+    print("=== addbmm: shapes / beta-alpha ===")
+    for dt in bmm_dtypes:
+        for (B, M, N, K) in [(32, 64, 64, 64), (4, 256, 256, 512)]:
+            check_addbmm(B, M, N, K, dt, (N,))
+        for (beta, alpha) in [(1, 1), (2, 3), (0, 1), (1, 0)]:
+            check_addbmm(8, 128, 96, 256, dt, (96,), beta=beta, alpha=alpha)
+
+    # batched int/complex under load: exercise the single batched int_gemm launch and
+    # the batched complex baddbmm path at large B. Bit-exact (int) / relative (complex).
+    print("=== batched int/complex (large B) ===")
+    for dt in [torch.int8, torch.int32, torch.int64]:
+        for (B, M, N, K) in [(256, 128, 128, 128), (512, 64, 64, 64)]:
+            check_bmm(B, M, N, K, dt)
+            check_baddbmm(B, M, N, K, dt, (N,))
+    check_baddbmm(64, 256, 256, 128, torch.complex64, (256,))
+    check_baddbmm(64, 256, 256, 128, torch.complex64, (64, 256, 256), beta=2, alpha=3)
+
+    # matmul N-D / 1-D: drop-in torch.matmul (1-D dot/promotion + batched broadcast).
+    print("=== matmul N-D / 1-D ===")
+    nd_dtypes = [torch.float32, torch.bfloat16, torch.float16,
+                 torch.complex64, torch.int32, torch.int8, torch.int64]
+    nd_cases = [
+        ((64,), (64,)),                       # 1-D @ 1-D -> scalar
+        ((32,), (32, 48)),                    # 1-D @ 2-D
+        ((40, 32), (32,)),                    # 2-D @ 1-D
+        ((32,), (8, 32, 48)),                 # 1-D @ 3-D
+        ((6, 40, 32), (32,)),                 # 3-D @ 1-D
+        ((8, 40, 32), (8, 32, 48)),           # (B,M,K)@(B,K,N)
+        ((8, 40, 32), (32, 48)),              # (B,M,K)@(K,N)
+        ((40, 32), (8, 32, 48)),              # (M,K)@(B,K,N)
+        ((2, 3, 40, 32), (2, 3, 32, 48)),     # 4-D @ 4-D
+        ((3, 1, 64, 32), (1, 5, 32, 48)),     # true broadcast -> (3,5,64,48)
+    ]
+    for dt in nd_dtypes:
+        for (sa, sb) in nd_cases:
+            check_matmul_nd(sa, sb, dt)
+
+    # vector ops (dot / vdot / outer / mv): drop-in torch.dot/vdot/outer/mv.
+    print("=== vector ops (dot / vdot / outer / mv) ===")
+    vec_dtypes = [torch.float32, torch.bfloat16, torch.float16,
+                  torch.complex64, torch.complex32,
+                  torch.int8, torch.int32, torch.int64]
+    for dt in vec_dtypes:
+        for K in (4096, 7, 1):
+            check_dot(K, dt)
+            check_vdot(K, dt)          # asserts conj-of-first for complex
+        check_outer(128, 96, dt)
+        check_mv(256, 512, dt)
 
 
 if __name__ == "__main__":
