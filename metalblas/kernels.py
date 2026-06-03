@@ -69,7 +69,7 @@ def _compile(src: str):
 def has_metal4() -> bool:
     """True if the Metal 4 cooperative-tensor headers are available (macOS 26+).
 
-    The m5_tensor / m5_gemm / splitk / conv1x1 kernels #include
+    The mpp_tensor / mpp_gemm / splitk / conv1x1 kernels #include
     <metal_cooperative_tensor> and use mpp::tensor_ops, which only ship with
     Metal 4. On older macOS, compile_shader fails with "file not found". Probe
     once with a minimal kernel and cache the result so dispatch can route to the
@@ -105,7 +105,7 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
 
 
 @functools.lru_cache(maxsize=None)
-def m5_gemm(in_t: str, acc_t: str, out_t: str,
+def mpp_gemm(in_t: str, acc_t: str, out_t: str,
             BM: int, BN: int, BK: int, WM: int, WN: int,
             trans_a: bool, trans_b: bool,
             mn_aligned: bool, k_aligned: bool,
@@ -119,7 +119,7 @@ def m5_gemm(in_t: str, acc_t: str, out_t: str,
         in_bytes = 4 if in_t == "float" else 2
         pad = 16 // in_bytes
     src = _build(
-        "MB_BUILD_M5_GEMM",
+        "MB_BUILD_MPP_GEMM",
         defines=_epi_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
         BM=BM, BN=BN, BK=BK, WM=WM, WN=WN,
@@ -131,11 +131,11 @@ def m5_gemm(in_t: str, acc_t: str, out_t: str,
         PAD=int(pad),
     )
     lib = _compile(src)
-    return lib.m5_gemm, src
+    return lib.mpp_gemm, src
 
 
 @functools.lru_cache(maxsize=None)
-def m5_tensor_gemm(in_t: str, out_t: str,
+def mpp_tensor_gemm(in_t: str, out_t: str,
                    BM: int, BN: int, NSG: int,
                    trans_a: bool, trans_b: bool,
                    relaxed: bool = True,
@@ -145,7 +145,7 @@ def m5_tensor_gemm(in_t: str, out_t: str,
     # Static-extent slices only for non-transposed (the orientation auto-dispatch routes here).
     static_slice = (not trans_a) and (not trans_b)
     src = _build(
-        "MB_BUILD_M5_TENSOR",
+        "MB_BUILD_MPP_TENSOR",
         defines=_epi_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, OUT_T=out_t,
         BM=BM, BN=BN, NSG=NSG,
@@ -157,13 +157,13 @@ def m5_tensor_gemm(in_t: str, out_t: str,
         STATIC_SLICE=int(static_slice),
     )
     lib = _compile(src)
-    return lib.m5_tensor_gemm, src
+    return lib.mpp_tensor_gemm, src
 
 
 @functools.lru_cache(maxsize=None)
 def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
                 relaxed: bool = True):
-    """Split-K m5_tensor GEMM -> (splitk_fn, reduce_fn). KCHUNK must divide K (caller guarantees)."""
+    """Split-K mpp_tensor GEMM -> (splitk_fn, reduce_fn). KCHUNK must divide K (caller guarantees)."""
     src = _build(
         "MB_BUILD_SPLITK",
         IN_T=in_t, OUT_T=out_t,

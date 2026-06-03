@@ -1,5 +1,5 @@
-// m5_tensor.h - matmul2d tensor-view GEMM - the primary backend.
-#ifdef MB_BUILD_M5_TENSOR
+// mpp_tensor.h - matmul2d tensor-view GEMM - the primary backend.
+#ifdef MB_BUILD_MPP_TENSOR
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_cooperative_tensor>
@@ -41,12 +41,13 @@ using namespace mpp::tensor_ops;
             cT_out[_i] = (OUT_T)cT_f32[_i];                                        \
 } while (0)
 #endif
+struct MBTensorDims { int M, N, K, lda, ldb, ldc; };
 
-kernel void m5_tensor_gemm(
+kernel void mpp_tensor_gemm(
     device IN_T   *A   [[buffer(0)]],
     device IN_T   *B   [[buffer(1)]],
     device OUT_T  *C   [[buffer(2)]],
-    constant int4&  gP [[buffer(3)]],   // packed (gM, gN, gK); lda/ldb/ldc unused (packed storage)
+    constant MBTensorDims& gP [[buffer(3)]],   // (M, N, K, lda, ldb, ldc)
 #if EPILOGUE
     device const OUT_T *bias [[buffer(4)]],   // addmm input; bstride = (row, col) broadcast strides
     constant int2&  bstride  [[buffer(5)]],
@@ -55,12 +56,12 @@ kernel void m5_tensor_gemm(
 #endif
     uint3 tgid         [[threadgroup_position_in_grid]])
 {
-    int gM = gP.x, gN = gP.y, gK = gP.z;
-    // Tensor views from raw pointers; extent order is (cols, rows) for row-major.
-    // Transposed A keeps extents (gK, gM) but flags transposed in the descriptor.
-    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(gK, gM));
-    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tB(B, dextents<int32_t, 2>(gN, gK));
-    tensor<device OUT_T, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(gN, gM));
+    int gM = gP.M, gN = gP.N, gK = gP.K;
+    auto eA = TRANS_A ? dextents<int32_t, 2>(gM, gK) : dextents<int32_t, 2>(gK, gM);
+    auto eB = TRANS_B ? dextents<int32_t, 2>(gK, gN) : dextents<int32_t, 2>(gN, gK);
+    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tA(A, eA, array<int32_t, 2>{1, gP.lda});
+    tensor<device IN_T, dextents<int32_t, 2>, tensor_inline> tB(B, eB, array<int32_t, 2>{1, gP.ldb});
+    tensor<device OUT_T, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(gN, gM), array<int32_t, 2>{1, gP.ldc});
 
     constexpr auto desc = matmul2d_descriptor(
         BM, BN, dynamic_extent, TRANS_A, TRANS_B, RELAXED,
@@ -106,10 +107,8 @@ kernel void m5_tensor_gemm(
     MB_STORE_TILE(0);
     cT_out.store(mC);
 #else
-    // Transposed operands keep the dynamic-slice path; it is off the hot path
-    // (auto-dispatch routes transposed inputs to m5_gemm).
-    auto mA = tA.slice(0, m_off);
-    auto mB = tB.slice(n_off, 0);
+    auto mA = TRANS_A ? tA.slice(m_off, 0) : tA.slice(0, m_off);
+    auto mB = TRANS_B ? tB.slice(0, n_off) : tB.slice(n_off, 0);
     auto mC = tC.slice(n_off, m_off);
     auto cT_f32 = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
     op.run(mA, mB, cT_f32);
@@ -122,4 +121,4 @@ kernel void m5_tensor_gemm(
     cT_out.store(mC);
 #endif
 }
-#endif  // MB_BUILD_M5_TENSOR
+#endif  // MB_BUILD_MPP_TENSOR
