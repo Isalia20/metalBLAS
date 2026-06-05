@@ -368,6 +368,93 @@ def _conv_specs(M, N, K):
     return specs
 
 
+# Batched thin-M GEMV (Y = X @ B, M=2..16): stream B once, M dot-products in registers,
+# recovering the GEMV bandwidth mpp_tensor loses on thin-M. Autotuner candidate, never forced.
+_GEMV_BT_MAX_M = 16
+_GEMV_BT_TG_BUDGET = 192     # NWARPS*MROWS*VEC <= this -> partials tile (x BLOCK_N*4B) < 32KB
+
+
+class _GemvBtPlan:
+    """gemv_bt launch for one (dtype, M, N, K, vec, nwarps). trans_b=column-major B
+    (warp-per-column, reduce over K); else row-major (lanes own N, K split over NWARPS)."""
+
+    def __init__(self, fn, M, N, K, vec, nwarps, trans_b=False, ldb=None, ldx=None, ldy=None, ncols=1):
+        self.fn = fn
+        ldb = ldb if ldb is not None else (K if trans_b else N)
+        self.dims = _pk(N, K, ldb, ldx if ldx is not None else K, ldy if ldy is not None else N)
+        if trans_b:                                       # each warp = NCOLS output columns
+            ntg = (N + nwarps * ncols - 1) // (nwarps * ncols)
+        else:                                             # each tg = BLOCK_N columns
+            ntg = (N + 32 * vec - 1) // (32 * vec)
+        self.threads = (nwarps * 32 * ntg, 1, 1)
+        self.group = (nwarps * 32, 1, 1)
+
+    def run(self, a, b, o):
+        # a = X (M,K), b = B (K,N), o = Y (M,N).
+        self.fn(b, a, o, self.dims, threads=self.threads, group_size=self.group)
+
+
+def _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps, trans_b=False, ldb=None, ldx=None, ldy=None,
+                        ncols=1, trans_a=False):
+    in_t, acc_t, out_t = _PROFILE[dtype]
+    fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
+                            trans_b=trans_b, NCOLS=ncols, trans_a=trans_a)
+    return _GemvBtPlan(fn, M, N, K, vec, nwarps, trans_b, ldb, ldx, ldy, ncols)
+
+
+def _is_gemv_bt_regime(M, N, K, dtype):
+    """Thin-M low-precision GEMV (2..16 rows), narrow/medium N only. Wide N / fp32 stay
+    on mpp's tensor tile; the N cap also keeps the probe off vocab-scale matrices."""
+    return (dtype is not torch.float32 and 2 <= M <= _GEMV_BT_MAX_M
+            and 16 <= N <= 8192 and K >= 64)
+
+
+def _largest_pow2_le(x):
+    x = int(x)
+    return 1 << (x.bit_length() - 1) if x >= 1 else 1
+
+
+def _gemv_bt_specs(M, N, K, dtype, align, trans_b=False):
+    """(vec, nwarps) autotuner candidates. trans_b: VEC vectorizes K (clamped to align),
+    NWARPS = cols/tg. Row-major: VEC by N (+M*VEC<=32 reg cap), NWARPS maxes the K-split."""
+    if trans_b:
+        # VEC vectorizes K; NCOLS>1 blocks output columns to reuse X (cuts the X re-read
+        # that bounds high-M). acc[MROWS][NCOLS] <= ~48 regs caps NCOLS.
+        v = 8 if K >= 2048 else (4 if K >= 512 else 2)
+        while v > 1 and (align % v):
+            v >>= 1
+        ncol_opts = [1]
+        if M >= 6:                                  # below ~6 rows X isn't the bottleneck
+            for nc in (2, 4):
+                if M * nc <= 48:
+                    ncol_opts.append(nc)
+        specs = []
+        for nc in ncol_opts:
+            for nw in ((8, 4) if nc == 1 else (8,)):
+                specs.append((v, nw, nc))
+        return specs
+    nat = 4 if N >= 4096 else (2 if N >= 256 else 1)
+    vecs = []
+    for v0 in (nat, 1):
+        v = v0
+        while v > 1 and (align % v):        # VecT load needs VEC | (ldb | offset)
+            v >>= 1
+        while v > 1 and M * v > 32:          # cap accumulator registers
+            v >>= 1
+        if v not in vecs:
+            vecs.append(v)
+    specs, seen = [], set()
+    for vi, v in enumerate(vecs):
+        cap = min(32, _GEMV_BT_TG_BUDGET // (M * v), max(1, (K + 31) // 32))
+        wants = (cap, min(cap, 8)) if vi == 0 else (cap,)
+        for want in wants:
+            nw = max(1, min(cap, _largest_pow2_le(want)))
+            if (v, nw) not in seen:
+                seen.add((v, nw))
+                specs.append((v, nw))
+    return specs
+
+
 def _mpp_tensor_tile_candidates(M, N, K, dtype):
     """Return (candidate tiles, autotuner margin) for (M,N,K,dtype).
 
@@ -444,9 +531,9 @@ def _probe_params(M, N, K):
 
 
 def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
-                  conv_specs=()):
+                  conv_specs=(), bt_specs=()):
     """Time each candidate (best-of-reps), returning the fastest (plan, label).
-    Candidate 0 (heuristic) is kept unless beaten by >margin; sk/conv_specs add candidates."""
+    Candidate 0 (heuristic) is kept unless beaten by >margin; sk/conv/bt_specs add candidates."""
     warmup, iters, reps = _probe_params(M, N, K)
     # A tight margin must resolve a ~1% gap, so spend more iters/reps to push
     # noise below it. Still one-time, and only the few tall-narrow shapes probe.
@@ -467,11 +554,17 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
 
     # Add split-K / 1x1-conv candidates, but only those whose result matches the
     # single-pass primary (guards a precision surprise). Checked once.
-    if sk_specs or conv_specs:
+    if sk_specs or conv_specs or bt_specs:
         ref = a.new_empty(M, N)
         cand[0][1](a, b, ref)
         torch.mps.synchronize()
         scale = ref.abs().max().item() + 1e-6
+        for (vec, nwarps) in bt_specs:
+            plan = _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps)
+            plan.run(a, b, o)
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                cand.append((plan, plan.run, (vec, nwarps, 0, "bt")))
         for (BM, BN, NSG, G) in sk_specs:
             plan = _build_splitk_plan(dtype, M, N, K, BM, BN, NSG, G)
             plan.run(a, b, o)
@@ -516,19 +609,140 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         cands, margin = _mpp_tensor_tile_candidates(M, N, K, dtype)
         sk_specs = ()
         conv_specs = ()
+        bt_specs = ()
         if _AUTOTUNE and a is not None and _is_splitk_regime(M, N, K, dtype):
             sk_specs = _splitk_specs(M, N, K)
         if _AUTOTUNE and a is not None and _is_conv_regime(M, N, K, dtype):
             conv_specs = _conv_specs(M, N, K)
-        if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs):
+        if _AUTOTUNE and a is not None and _is_gemv_bt_regime(M, N, K, dtype):
+            align = int(b.stride(0)) | int(b.storage_offset())
+            bt_specs = _gemv_bt_specs(M, N, K, dtype, align)
+        if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs or bt_specs):
             plan, tile = _autotune_mppt(dtype, M, N, K, cands, a, b, margin,
-                                        sk_specs, conv_specs)
+                                        sk_specs, conv_specs, bt_specs)
         else:
             tile = cands[0]
             plan = _build_mppt_plan(dtype, M, N, K, *tile)
         _GEMM_PLAN[key] = plan
         _GEMM_TILE[key] = tile
     return plan
+
+
+# Transposed thin-M (any of x/W column-major): gemv_bt (TRANS_A/TRANS_B) vs mpp, autotuned.
+# Keyed by (dtype,M,N,K,trans_a,trans_b). The (F,F) packed case stays on _gemm_plan.
+_GEMM_TRANS_PLAN: dict = {}
+_GEMM_TRANS_TILE: dict = {}
+
+
+class _MppTransPlan:
+    """mpp_tensor launch for a transposed thin-M shape: the gemv_bt baseline + fallback."""
+
+    def __init__(self, fn, M, N, K, BM, BN, NSG, lda, ldb):
+        self.fn = fn
+        self.dims = _pk(M, N, K, lda, ldb, N)        # ldc = N
+        self.threads = (NSG * 32 * ((N + BN - 1) // BN), (M + BM - 1) // BM, 1)
+        self.group = (NSG * 32, 1, 1)
+
+    def run(self, a, b, o):
+        self.fn(a, b, o, self.dims, threads=self.threads, group_size=self.group)
+
+
+def _build_mpp_trans_plan(dtype, M, N, K, BM, BN, NSG, trans_a, trans_b, lda, ldb):
+    in_t, _, out_t = _PROFILE[dtype]
+    fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b, relaxed=True,
+                                    swizzle_log=0, mn_aligned=(M % BM == 0) and (N % BN == 0))
+    return _MppTransPlan(fn, M, N, K, BM, BN, NSG, lda, ldb)
+
+
+def _autotune_trans(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
+    """Faster of mpp(trans) vs gemv_bt(trans) candidates, correctness-guarded; mpp kept
+    unless beaten by the margin. ldx=lda (X leading dim, TRANS_A-interpreted). (plan, label)."""
+    BM, BN, NSG = _pick_mpp_tensor_tile(M, N, K, dtype)
+    cand = [(_build_mpp_trans_plan(dtype, M, N, K, BM, BN, NSG, trans_a, trans_b, lda, ldb),
+             ("mpp_tr", BM, BN, NSG))]
+    align = lda | ldb | int(a.storage_offset()) | int(b.storage_offset())
+    o, ref = a.new_empty(M, N), a.new_empty(M, N)
+    cand[0][0].run(a, b, ref)                          # warms mpp + produces ref
+    torch.mps.synchronize()
+    scale = ref.abs().max().item() + 1e-6
+    # Time-bounded probe: scale iters to ~constant wall-time (flops-based _probe_params
+    # over-iterates this bandwidth-bound kernel -> ~seconds stall at vocab-scale N).
+    t0 = time.perf_counter()
+    for _ in range(3):
+        cand[0][0].run(a, b, o)
+    torch.mps.synchronize()
+    est = (time.perf_counter() - t0) / 3
+    iters = max(3, min(120, int(0.02 / max(est, 1e-7))))
+    reps, warmup = 5, min(iters, 12)
+    for spec in _gemv_bt_specs(M, N, K, dtype, align, trans_b=trans_b):
+        vec, nwarps, ncols = spec if trans_b else (spec[0], spec[1], 1)
+        plan = _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps, trans_b=trans_b,
+                                   ldb=ldb, ldx=lda, ldy=N, ncols=ncols, trans_a=trans_a)
+        plan.run(a, b, o)
+        torch.mps.synchronize()
+        if (o - ref).abs().max().item() <= 0.02 * scale:
+            cand.append((plan, (vec, nwarps, ncols, "bt_tr")))
+    for (p, _) in cand:
+        for _ in range(warmup):
+            p.run(a, b, o)
+    torch.mps.synchronize()
+    times = [float("inf")] * len(cand)
+    for _ in range(reps):
+        for j, (p, _) in enumerate(cand):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                p.run(a, b, o)
+            torch.mps.synchronize()
+            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
+    i = min(range(len(times)), key=lambda j: times[j])
+    return cand[i] if (i != 0 and times[i] < times[0] * (1.0 - _AUTOTUNE_MARGIN)) else cand[0]
+
+
+def _gemm_trans_plan(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
+    """Resolve + cache the transposed thin-M plan (gemv_bt(trans) vs mpp), keyed incl. trans."""
+    key = (dtype, M, N, K, trans_a, trans_b)
+    plan = _GEMM_TRANS_PLAN.get(key)
+    if plan is None:
+        if _AUTOTUNE:
+            plan, tile = _autotune_trans(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb)
+        else:
+            BM, BN, NSG = _pick_mpp_tensor_tile(M, N, K, dtype)
+            plan = _build_mpp_trans_plan(dtype, M, N, K, BM, BN, NSG, trans_a, trans_b, lda, ldb)
+            tile = ("mpp_tr", BM, BN, NSG)
+        _GEMM_TRANS_PLAN[key] = plan
+        _GEMM_TRANS_TILE[key] = tile
+    return plan
+
+
+# Column-major B's mpp baseline is the (strided) trans_b tensor path, weak even at wide N,
+# so bt_tb's win band runs to vocab scale (incl. lm_head x@W.T). The 2-D probe is
+# time-bounded; the batched path keeps a lower cap (_probe_params isn't time-bounded).
+_GEMV_BT_TB_MAX_N = 262144
+_GEMV_BT_TB_MAX_N_BMM = 16384
+
+
+def _unit_lead(t, d0, d1):
+    """(trans, lead) for a 2-D (d0,d1) tensor with a unit-stride inner dim: row-major
+    (False, stride0) or column-major (True, stride1); None if neither (fully strided)."""
+    s0, s1 = int(t.stride(0)), int(t.stride(1))
+    if s1 == 1 and s0 >= d1:
+        return (False, s0)
+    if s0 == 1 and s1 >= d0:
+        return (True, s1)
+    return None
+
+
+def _thin_trans_layout(a, b, M, N, K, dtype):
+    """For a thin-M low-precision (M,K)@(K,N) with >=1 transposed operand and both inner
+    dims unit-stride, return (trans_a, trans_b, lda, ldb); else None. (F,F) -> None
+    (the packed case rides _gemm_plan). N capped at vocab scale (time-bounded probe)."""
+    if (dtype is torch.float32 or not (2 <= M <= _GEMV_BT_MAX_M)
+            or not (16 <= N <= _GEMV_BT_TB_MAX_N) or K < 64):
+        return None
+    la, lb = _unit_lead(a, M, K), _unit_lead(b, K, N)
+    if la is None or lb is None or not (la[0] or lb[0]):
+        return None
+    return (la[0], lb[0], la[1], lb[1])
 
 
 # Recycled output buffers: short ops' per-call new_empty tail can flip a win to a
@@ -1153,6 +1367,21 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
                 plan.run(a, b, o)
             return o
 
+    # Transposed thin-M fast path (column-major x and/or W, e.g. x @ W.T): the row-major
+    # path above needs both contiguous; this routes any unit-inner-stride transposed combo
+    # to gemv_bt's TRANS_A/TRANS_B branches (autotuned vs mpp).
+    if (backend is None and out is None and swizzle_log is None
+            and a.is_mps and a.ndim == 2 and b.ndim == 2):
+        M = sa[0]; K = sa[1]; N = b.shape[1]; dtype = a.dtype
+        if b.shape[0] == K and dtype in _PROFILE and kernels.has_metal4():
+            lay = _thin_trans_layout(a, b, M, N, K, dtype)
+            if lay is not None:
+                trans_a, trans_b, lda, ldb = lay
+                plan = _gemm_trans_plan(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb)
+                o = _pooled_out(a, M, N)
+                plan.run(a, b, o)
+                return o
+
     assert a.device.type == "mps" and b.device.type == "mps"
     assert a.dtype == b.dtype
     dtype = a.dtype
@@ -1434,6 +1663,17 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
         # cheap store-time change), so awkward shapes get the same fast tile here.
         _gemm_plan(dtype, M_, N_, K_, A_view, B_view)
         tile = _GEMM_TILE[(dtype, M_, N_, K_)]
+        # gemv_bt winner: launch the batched-thin-M GEMV with the bias fused (same
+        # (vec,nwarps); ldy is explicit so any output stride works).
+        if len(tile) == 4 and tile[3] == "bt":
+            vec, nwarps = tile[0], tile[1]
+            fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M_, 32 * vec, nwarps, vec,
+                                    epilogue=True, beta_nz=bnz, alpha_nz=anz)
+            ng = (N_ + 32 * vec - 1) // (32 * vec)
+            fn(B_view, A_view, out, _pk(N_, K_, ldb_, lda_, ldc_), x, bstride,
+               float(beta), float(alpha),
+               threads=(nwarps * 32 * ng, 1, 1), group_size=(nwarps * 32, 1, 1))
+            return out
         # An mpp_tensor tile is a 3-tuple; a 4/5-tuple means the autotuner chose a
         # split-K or conv plan (no epilogue) - fall back to the heuristic tile.
         if len(tile) == 3:
@@ -1447,6 +1687,33 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
         grp = (NSG * 32, 1, 1)
         fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_), x, bstride, float(beta), float(alpha),
            threads=(grp[0] * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=grp)
+        return out
+
+    # Transposed thin-M (column-major x and/or W) + bias: gemv_bt(trans) or mpp(trans)
+    # epilogue (autotuned). A_view/B_view are unit-inner-stride here (trans flags set).
+    if (m4 and (trans_a or trans_b) and ldc_ == N_ and dtype is not torch.float32
+            and 2 <= M_ <= _GEMV_BT_MAX_M and 16 <= N_ <= _GEMV_BT_TB_MAX_N and K_ >= 64):
+        _gemm_trans_plan(dtype, M_, N_, K_, A_view, B_view, trans_a, trans_b, lda_, ldb_)
+        tile = _GEMM_TRANS_TILE[(dtype, M_, N_, K_, trans_a, trans_b)]
+        if len(tile) == 4 and tile[3] == "bt_tr":
+            vec, nwarps, ncols = tile[0], tile[1], tile[2]
+            fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M_, 32 * vec, nwarps, vec,
+                                    epilogue=True, beta_nz=bnz, alpha_nz=anz,
+                                    trans_a=trans_a, trans_b=trans_b, NCOLS=ncols)
+            ntg = ((N_ + nwarps * ncols - 1) // (nwarps * ncols) if trans_b
+                   else (N_ + 32 * vec - 1) // (32 * vec))
+            fn(B_view, A_view, out, _pk(N_, K_, ldb_, lda_, ldc_), x, bstride,
+               float(beta), float(alpha),
+               threads=(nwarps * 32 * ntg, 1, 1), group_size=(nwarps * 32, 1, 1))
+        else:
+            BM, BN, NSG = tile[1], tile[2], tile[3]        # ("mpp_tr", BM, BN, NSG)
+            fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b, relaxed=True,
+                                            swizzle_log=0, mn_aligned=(M_ % BM == 0) and (N_ % BN == 0),
+                                            epilogue=True, beta_nz=bnz, alpha_nz=anz)
+            grp = (NSG * 32, 1, 1)
+            fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_), x, bstride,
+               float(beta), float(alpha),
+               threads=(grp[0] * ((N_ + BN - 1) // BN), (M_ + BM - 1) // BM, 1), group_size=grp)
         return out
 
     # Transposed / non-packed (m4) or no Metal 4: the manual tiled fallbacks.
@@ -1593,10 +1860,11 @@ def _bmm_candidates(M, N, K, dtype):
     return cands
 
 
-def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, cands, margin):
-    """Time each candidate's batched launch (best-of-reps), returning (fn, BM, BN, NSG).
-    Candidate 0 (heuristic) is kept unless beaten by >margin. Mirrors _autotune_mppt."""
-    in_t, _, out_t = _PROFILE[dtype]
+def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, cands, margin,
+                  bt_specs=()):
+    """Time each batched candidate (best-of-reps), returning the winning plan label
+    ("mpp",fn,BM,BN,NSG) | ("bt",vec,nwarps). bt_specs add correctness-guarded gemv_bt."""
+    in_t, acc_t, out_t = _PROFILE[dtype]
     warmup, iters, reps = _probe_params(Bb * M, N, K)
     o = a.new_empty(Bb, M, N)
     sC, ldc = int(o.stride(0)), int(o.stride(1))
@@ -1609,7 +1877,33 @@ def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, 
         grp = (NSG * 32, 1, 1)
         thr = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
         run = (lambda fn=fn, thr=thr, grp=grp: fn(a, b, o, dims, bstr, threads=thr, group_size=grp))
-        cand.append(((fn, BM, BN, NSG), run))
+        cand.append((("mpp", fn, BM, BN, NSG), run))
+    # gemv_bt candidates (correctness-guarded vs the mpp primary). a=X (Bb,M,K), b=B (Bb,K,N).
+    if bt_specs:
+        ref = a.new_empty(Bb, M, N)
+        cand[0][1]()                                   # mpp primary writes o
+        ref.copy_(o)
+        torch.mps.synchronize()
+        scale = ref.abs().max().item() + 1e-6
+        dims_bt, batch_bt = _pk(N, K, ldb, lda, ldc), _pk(sB, sA, sC, 0)
+        kind = "bt_tb" if trans_b else "bt"
+        for spec in bt_specs:
+            if trans_b:
+                vec, nwarps, ncols = spec
+                ng = (N + nwarps * ncols - 1) // (nwarps * ncols)
+            else:
+                vec, nwarps = spec; ncols = 1
+                ng = (N + 32 * vec - 1) // (32 * vec)
+            fnbt, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
+                                      batched=True, trans_b=trans_b, NCOLS=ncols)
+            thrbt, grpbt = (nwarps * 32 * ng, 1, Bb), (nwarps * 32, 1, 1)
+            runbt = (lambda fnbt=fnbt, thrbt=thrbt, grpbt=grpbt:
+                     fnbt(b, a, o, dims_bt, batch_bt, threads=thrbt, group_size=grpbt))
+            runbt()
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                label = (kind, vec, nwarps, ncols) if trans_b else (kind, vec, nwarps)
+                cand.append((label, runbt))
     for (_, run) in cand:                    # warm every candidate before timing any
         for _ in range(warmup):
             run()
@@ -1627,22 +1921,32 @@ def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, 
 
 
 def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA=0, sB=0):
-    """Resolve (fn, BM, BN, NSG) for a batched mpp_tensor launch, autotuning the tile
-    on first sight of (dtype,M,N,K,trans) and caching the winner."""
+    """Resolve + cache the batched plan label ("mpp",fn,BM,BN,NSG) | ("bt",vec,nwarps),
+    autotuning on first sight. gemv_bt is a candidate for non-transposed thin-M shapes."""
     key = (dtype, M, N, K, trans_a, trans_b)
     plan = _BMM_PLAN.get(key)
     if plan is None:
         cands = _bmm_candidates(M, N, K, dtype)
-        if _AUTOTUNE and a is not None and len(cands) > 1:
+        bt_specs = ()
+        if (_AUTOTUNE and a is not None and not trans_a and dtype is not torch.float32
+                and 2 <= M <= _GEMV_BT_MAX_M and N >= 16 and K >= 64):
+            if not trans_b and N <= 8192:          # row-major B: X scalar-read, B vectorized over N
+                align = int(ldb) | int(sB) | int(b.storage_offset())
+                bt_specs = _gemv_bt_specs(M, N, K, dtype, align)
+            elif trans_b and N <= _GEMV_BT_TB_MAX_N_BMM:  # column-major B: both X,B vectorized over K
+                align = (int(ldb) | int(lda) | int(sB) | int(sA)
+                         | int(a.storage_offset()) | int(b.storage_offset()))
+                bt_specs = _gemv_bt_specs(M, N, K, dtype, align, trans_b=True)
+        if _AUTOTUNE and a is not None and (len(cands) > 1 or bt_specs):
             plan = _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb,
-                                 trans_a, trans_b, sA, sB, cands, _AUTOTUNE_MARGIN)
+                                 trans_a, trans_b, sA, sB, cands, _AUTOTUNE_MARGIN, bt_specs)
         else:
             BM, BN, NSG = cands[0]
             in_t, _, out_t = _PROFILE[dtype]
             mn = (M % BM == 0) and (N % BN == 0)
             fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
                                             relaxed=True, swizzle_log=0, mn_aligned=mn, batched=True)
-            plan = (fn, BM, BN, NSG)
+            plan = ("mpp", fn, BM, BN, NSG)
         _BMM_PLAN[key] = plan
     return plan
 
@@ -1796,6 +2100,32 @@ def _complex_bmm(a, b, out=None):
     return out
 
 
+def _bmm_gemv_bt(dtype, vec, nwarps, M, N, K, a, b, oc, lda, ldb, ldc, sA, sB, sC, Bb,
+                 trans_b=False, ncols=1):
+    """Batched thin-M GEMV launch for bmm (no epilogue). a=X (Bb,M,K), b=B (Bb,K,N)."""
+    in_t, acc_t, out_t = _PROFILE[dtype]
+    fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
+                            batched=True, trans_b=trans_b, NCOLS=ncols)
+    ng = (N + nwarps * ncols - 1) // (nwarps * ncols) if trans_b else (N + 32 * vec - 1) // (32 * vec)
+    fn(b, a, oc, _pk(N, K, ldb, lda, ldc), _pk(sB, sA, sC, 0),
+       threads=(nwarps * 32 * ng, 1, Bb), group_size=(nwarps * 32, 1, 1))
+
+
+def _baddbmm_gemv_bt(dtype, vec, nwarps, M, N, K, a, b, oc, lda, ldb, ldc,
+                     sA, sB, sC, sBias, bias, br, bc, beta, alpha, bnz, anz, Bb,
+                     trans_b=False, ncols=1):
+    """Batched thin-M GEMV launch for baddbmm (bias fused). a=X, b=B; bias index is
+    z*sBias + m*br + n*bc (the kernel's per-batch base + (row,col) broadcast strides)."""
+    in_t, acc_t, out_t = _PROFILE[dtype]
+    fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
+                            epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True,
+                            trans_b=trans_b, NCOLS=ncols)
+    ng = (N + nwarps * ncols - 1) // (nwarps * ncols) if trans_b else (N + 32 * vec - 1) // (32 * vec)
+    fn(b, a, oc, _pk(N, K, ldb, lda, ldc), bias, _pk(br, bc),
+       float(beta), float(alpha), _pk(sB, sA, sC, sBias),
+       threads=(nwarps * 32 * ng, 1, Bb), group_size=(nwarps * 32, 1, 1))
+
+
 def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
     """Batched C[i] = a[i] @ b[i] for 3-D (B,M,K) @ (B,K,N), matching torch.bmm.
 
@@ -1827,12 +2157,18 @@ def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) ->
     A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
     oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
     ldc, sC = int(oc.stride(1)), int(oc.stride(0))
-    fn, BM, BN, NSG = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
-                                A_view, B_view, sA, sB)
-    grp = (NSG * 32, 1, 1)
-    threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
-       threads=threads, group_size=grp)
+    plan = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
+                     A_view, B_view, sA, sB)
+    if plan[0] in ("bt", "bt_tb"):
+        is_tb = plan[0] == "bt_tb"
+        _bmm_gemv_bt(dtype, plan[1], plan[2], M, N, K, A_view, B_view, oc,
+                     lda, ldb, ldc, sA, sB, sC, Bb, trans_b=is_tb, ncols=(plan[3] if is_tb else 1))
+    else:
+        _, fn, BM, BN, NSG = plan
+        grp = (NSG * 32, 1, 1)
+        threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+        fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
+           threads=threads, group_size=grp)
     if needs_copy:
         out.copy_(oc)
         return out
@@ -1894,18 +2230,25 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
     oc, needs_copy = _bmm_out(batch1, out, Bb, M, N, dtype)
     ldc, sC = int(oc.stride(1)), int(oc.stride(0))
     in_t, _, out_t = _PROFILE[dtype]
-    # Reuse the (autotuned) bmm tile - the epilogue is a cheap store-time change.
-    _, BM, BN, NSG = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
-                               A_view, B_view, sA, sB)
-    mn_aligned = (M % BM == 0) and (N % BN == 0)
-    fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
-                                    relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
-                                    epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
-    grp = (NSG * 32, 1, 1)
-    threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
-       float(beta), float(alpha), _pk(sA, sB, sC, sBias),
-       threads=threads, group_size=grp)
+    # Reuse the (autotuned) bmm plan - the epilogue is a cheap store-time change.
+    plan = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
+                     A_view, B_view, sA, sB)
+    if plan[0] in ("bt", "bt_tb"):
+        is_tb = plan[0] == "bt_tb"
+        _baddbmm_gemv_bt(dtype, plan[1], plan[2], M, N, K, A_view, B_view, oc,
+                         lda, ldb, ldc, sA, sB, sC, sBias, x, br, bc, beta, alpha, bnz, anz, Bb,
+                         trans_b=is_tb, ncols=(plan[3] if is_tb else 1))
+    else:
+        _, _fn0, BM, BN, NSG = plan
+        mn_aligned = (M % BM == 0) and (N % BN == 0)
+        fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
+                                        relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
+                                        epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
+        grp = (NSG * 32, 1, 1)
+        threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
+        fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
+           float(beta), float(alpha), _pk(sA, sB, sC, sBias),
+           threads=threads, group_size=grp)
     if needs_copy:
         out.copy_(oc)
         return out
