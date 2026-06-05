@@ -9,6 +9,7 @@
 #include "conv1x1.h"
 #include "gemv_nt.h"
 #include "gemv_t.h"
+#include "gemv_bt.h"
 #include "cgemv_nt.h"
 #include "cgemv_t.h"
 #include "complex_pack.h"

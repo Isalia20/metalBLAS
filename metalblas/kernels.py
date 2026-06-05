@@ -215,6 +215,27 @@ def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4
 
 
 @functools.lru_cache(maxsize=None)
+def gemv_bt(in_t: str, acc_t: str, out_t: str, MROWS: int,
+            BLOCK_N: int = 64, NWARPS: int = 8, VEC: int = 2,
+            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
+            batched: bool = False, trans_b: bool = False, NCOLS: int = 1, trans_a: bool = False):
+    # Batched thin-M GEMV (Y = X @ B, M=MROWS rows). trans_b=column-major B (reduce over K,
+    # NCOLS blocks cols to reuse X); trans_a=column-major X. epilogue folds bias; batched=grid z.
+    assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
+    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
+    if batched:
+        defines = {**(defines or {}), "BATCHED": 1}
+    if trans_b:
+        defines = {**(defines or {}), "TRANS_B": 1}
+    if trans_a:
+        defines = {**(defines or {}), "TRANS_A": 1}
+    src = _build("MB_BUILD_GEMV_BT", defines=defines,
+                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                 MROWS=MROWS, BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC, NCOLS=NCOLS)
+    return _compile(src).gemv_bt, src
+
+
+@functools.lru_cache(maxsize=None)
 def cgemv_t(c2_t: str, acc2_t: str, r_t: str, BLOCK_N: int = 32, NWARPS: int = 8,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     src = _build("MB_BUILD_CGEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
