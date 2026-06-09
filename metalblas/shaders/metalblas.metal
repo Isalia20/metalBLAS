@@ -7,6 +7,8 @@
 #include "mpp_tensor.h"
 #include "splitk.h"
 #include "conv1x1.h"
+#include "mpp_pf.h"
+#include "flipt.h"
 #include "gemv_nt.h"
 #include "gemv_t.h"
 #include "gemv_bt.h"

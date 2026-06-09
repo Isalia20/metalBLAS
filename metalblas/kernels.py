@@ -192,6 +192,33 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 
 @functools.lru_cache(maxsize=None)
+def mppf_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KC: int, PFD: int):
+    """Prefetched thin-N GEMM (shaders/mpp_pf.h): software-prefetch A's next K-chunk.
+    Packed shapes with M%BM == N%BN == K%KC == 0 only (caller guarantees)."""
+    src = _build(
+        "MB_BUILD_MPP_PF",
+        IN_T=in_t, OUT_T=out_t,
+        BM=BM, BN=BN, NSG=NSG, KC=KC, PFD=PFD,
+    )
+    return _compile(src).mppf_gemm, src
+
+
+@functools.lru_cache(maxsize=None)
+def flipt_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int,
+               KC: int = 0, PFD: int = 0):
+    """Flipped thin-N GEMM (shaders/flipt.h): C^T = B^T A^T tiles, transposed TG store.
+    KC>0 chunks K and software-prefetches A's next chunk PFD chunks ahead (needs
+    4-B-aligned A and K%KC == 0).
+    Packed shapes with N%BM == M%BN == 0 only (caller guarantees)."""
+    src = _build(
+        "MB_BUILD_FLIPT",
+        IN_T=in_t, OUT_T=out_t,
+        BM=BM, BN=BN, NSG=NSG, KC=KC, PFD=PFD,
+    )
+    return _compile(src).flipt_gemm, src
+
+
+@functools.lru_cache(maxsize=None)
 def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
             VEC: int = 1, red_tg: bool = False,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):

@@ -60,6 +60,12 @@ Dispatch picks a kernel from shape and dtype:
   so interior tiles skip per-tile edge predication. A strided `tensor_inline`
   view (leading dim `lda`/`ldb` + the descriptor's transpose flags) lets the same
   path consume col-major and `[::2]`-strided operands directly, with no copy.
+- **`mpp_pf` / `flipt`** - thin-N (wide M, narrow N) overlap variants probed by
+  the autotuner. `matmul2d` alone leaves the streamed A operand ~15%
+  under-overlapped with the MMA there; `mpp_pf` software-prefetches A's next
+  K-chunk in place (N=64), and `flipt` computes `C^T = B^T A^T` (the flipped
+  RHS streams A near its MMA roof; N=128/256) as a full-N-width tile with the
+  same chunked prefetch, transposing through threadgroup memory on store.
 - **`gemv_nt` / `gemv_t`** - bandwidth-bound rank-1 fast paths (M=1 / N=1) with
   cache-line-wide coalesced loads.
 - **`mpp_gemm` / `simd_gemm`** - threadgroup-tiled fallbacks for sub-tile-floor
