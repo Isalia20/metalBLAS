@@ -368,6 +368,87 @@ def _conv_specs(M, N, K):
     return specs
 
 
+# Thin-N overlap kernels (sgpipe / flipt)
+# matmul2d under-overlaps the A stream on thin-N (in-cache tile rate ~24 TF vs ~18
+# streamed on M5 Pro); sgpipe stages A K-chunks through per-SG input cooperative
+# tensors (N=64..128), flipt computes C^T = B^T A^T (the flipped RHS streams A near
+# its MMA roof; N up to 256), storing through TG memory transposed.
+class _GridPlan:
+    """Launch plan for kernels taking (A, B, C, packed(M,N,K)) on an x=N-tiles,
+    y=M-tiles grid (sgpipe; flipt passes its flipped tile counts)."""
+
+    def __init__(self, fn, M, N, K, tiles_x, tiles_y, NSG):
+        self.fn = fn
+        self.threads = (NSG * 32 * tiles_x, tiles_y, 1)
+        self.group = (NSG * 32, 1, 1)
+        self.dims = _pk(M, N, K)
+
+    def run(self, a, b, o):
+        self.fn(a, b, o, self.dims, threads=self.threads, group_size=self.group)
+
+
+def _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK=0):
+    # Only K is baked (GK): it unrolls the chunk loop (+2-5%); baking M/N too
+    # measured slightly slower, so they stay runtime.
+    in_t, _, out_t = _PROFILE[dtype]
+    fn, _ = kernels.sgpipe_gemm(in_t, out_t, SGM, SGN, KC, NSGX, NSGY, GK)
+    return _GridPlan(fn, M, N, K, N // (NSGX * SGN), M // (NSGY * SGM), NSGX * NSGY)
+
+
+def _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC=0, PFD=0):
+    # flipt tiles the flipped problem: BM over N (thin), BN over M (long).
+    in_t, _, out_t = _PROFILE[dtype]
+    fn, _ = kernels.flipt_gemm(in_t, out_t, BM, BN, NSG, KC, PFD)
+    return _GridPlan(fn, M, N, K, (M + BN - 1) // BN, (N + BM - 1) // BM, NSG)
+
+
+def _is_flipt_regime(M, N, K, dtype):
+    """Thin N (128..256, 64-aligned) over long M: the flipped orientation wins at
+    M>=8192 and ties below, so probe and let the timing decide."""
+    return (dtype is not torch.float32 and 128 <= N <= 256 and N % 64 == 0
+            and M >= 2048 and M % 64 == 0 and K >= 512)
+
+
+def _is_sgpipe_regime(M, N, K, dtype):
+    """Thin N (64..128) over long M: per-SG ops with register-staged A chunks beat
+    every TG-scope matmul2d structure (the op's own device staging under-overlaps)."""
+    return (dtype is not torch.float32 and N in (64, 128)
+            and M >= 1024 and K >= 1024 and K % 128 == 0)
+
+
+def _sgpipe_specs(M, N, K):
+    """(SGM, SGN, KC, NSGX, NSGY, GK) candidates. (32,64,KC64) is the M5 Pro sweet
+    spot at N=128; N=64 prefers the (16,64) tile. K % (2*KC) == 0 required. Baking
+    K (GK=K) unrolls the chunk loop (+2-5% when A is cache-resident); probed against
+    the dynamic-K build, and skipped for deep K where the unroll bloats the binary."""
+    if N == 128:
+        cands = [(32, 64, 64, 2, 1), (32, 64, 64, 2, 2)]
+    else:
+        cands = [(16, 64, 64, 1, 2), (32, 64, 64, 1, 2)]
+    specs = []
+    for s in cands:
+        if M % (s[4] * s[0]) == 0:
+            if K <= 8192:
+                specs.append(s + (K,))
+            specs.append(s + (0,))
+    return specs
+
+
+def _flipt_specs(M, N, K, a):
+    """(BM, BN, NSG, KC, PFD) flipped candidates. The full-N-width prefetch tiles
+    are the M5 Pro winners (streamed-A rate ~22.6 vs 21.5 TF); the (64,64,2)
+    single-shot covers K%128 != 0 and unaligned A."""
+    specs = []
+    pf_ok = K % 128 == 0 and int(a.storage_offset()) % 2 == 0
+    if pf_ok and N % 128 == 0 and M % 32 == 0:
+        specs.append((128, 32, 2, 128, 2))
+    if pf_ok and N % 128 == 0 and M % 64 == 0:
+        specs.append((128, 64, 4, 128, 2))
+    if N % 64 == 0 and M % 64 == 0:
+        specs.append((64, 64, 2, 0, 0))
+    return specs
+
+
 # Batched thin-M GEMV (Y = X @ B, M=2..16): stream B once, M dot-products in registers,
 # recovering the GEMV bandwidth mpp_tensor loses on thin-M. Autotuner candidate, never forced.
 _GEMV_BT_MAX_M = 16
@@ -531,15 +612,19 @@ def _probe_params(M, N, K):
 
 
 def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
-                  conv_specs=(), bt_specs=()):
+                  conv_specs=(), bt_specs=(), flip_specs=(), sgp_specs=()):
     """Time each candidate (best-of-reps), returning the fastest (plan, label).
-    Candidate 0 (heuristic) is kept unless beaten by >margin; sk/conv/bt_specs add candidates."""
+    Candidate 0 (heuristic) is kept unless beaten by >margin; the *_specs add candidates."""
     warmup, iters, reps = _probe_params(M, N, K)
     # A tight margin must resolve a ~1% gap, so spend more iters/reps to push
     # noise below it. Still one-time, and only the few tall-narrow shapes probe.
     if margin < _AUTOTUNE_MARGIN:
         iters = max(iters * 2, 6)
         reps = max(reps, 5)
+    # sgpipe rides ~2-5% gaps on ~0.2ms kernels; 6 iters mispicks under noise,
+    # so spend more (one-time, thin-N shapes only).
+    if sgp_specs:
+        iters = max(iters, 12)
     o = a.new_empty(M, N)             # private scratch - never the pooled output
 
     # Each candidate is (cached_plan, run(a,b,o), label): mpp_tensor tiles keep the
@@ -552,13 +637,25 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
                fn(a, b, o, d, threads=thr, group_size=grp))
         cand.append(((fn, thr, grp), run, (BM, BN, NSG)))
 
-    # Add split-K / 1x1-conv candidates, but only those whose result matches the
-    # single-pass primary (guards a precision surprise). Checked once.
-    if sk_specs or conv_specs or bt_specs:
+    # Add split-K / 1x1-conv / prefetch / flipped candidates, but only those whose
+    # result matches the single-pass primary (guards a precision surprise). Checked once.
+    if sk_specs or conv_specs or bt_specs or flip_specs or sgp_specs:
         ref = a.new_empty(M, N)
         cand[0][1](a, b, ref)
         torch.mps.synchronize()
         scale = ref.abs().max().item() + 1e-6
+        for (SGM, SGN, KC, NSGX, NSGY, GK) in sgp_specs:
+            plan = _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK)
+            plan.run(a, b, o)
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                cand.append((plan, plan.run, (SGM, SGN, KC, NSGX, NSGY, GK, "sgp")))
+        for (BM, BN, NSG, KC, PFD) in flip_specs:
+            plan = _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC, PFD)
+            plan.run(a, b, o)
+            torch.mps.synchronize()
+            if (o - ref).abs().max().item() <= 0.02 * scale:
+                cand.append((plan, plan.run, (BM, BN, NSG, KC, PFD, "flip")))
         for (vec, nwarps) in bt_specs:
             plan = _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps)
             plan.run(a, b, o)
@@ -610,6 +707,8 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         sk_specs = ()
         conv_specs = ()
         bt_specs = ()
+        flip_specs = ()
+        sgp_specs = ()
         if _AUTOTUNE and a is not None and _is_splitk_regime(M, N, K, dtype):
             sk_specs = _splitk_specs(M, N, K)
         if _AUTOTUNE and a is not None and _is_conv_regime(M, N, K, dtype):
@@ -617,9 +716,14 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         if _AUTOTUNE and a is not None and _is_gemv_bt_regime(M, N, K, dtype):
             align = int(b.stride(0)) | int(b.storage_offset())
             bt_specs = _gemv_bt_specs(M, N, K, dtype, align)
-        if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs or bt_specs):
+        if _AUTOTUNE and a is not None and _is_flipt_regime(M, N, K, dtype):
+            flip_specs = _flipt_specs(M, N, K, a)
+        if _AUTOTUNE and a is not None and _is_sgpipe_regime(M, N, K, dtype):
+            sgp_specs = _sgpipe_specs(M, N, K)
+        if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs
+                                            or bt_specs or flip_specs or sgp_specs):
             plan, tile = _autotune_mppt(dtype, M, N, K, cands, a, b, margin,
-                                        sk_specs, conv_specs, bt_specs)
+                                        sk_specs, conv_specs, bt_specs, flip_specs, sgp_specs)
         else:
             tile = cands[0]
             plan = _build_mppt_plan(dtype, M, N, K, *tile)
@@ -1674,8 +1778,8 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
                float(beta), float(alpha),
                threads=(nwarps * 32 * ng, 1, 1), group_size=(nwarps * 32, 1, 1))
             return out
-        # An mpp_tensor tile is a 3-tuple; a 4/5-tuple means the autotuner chose a
-        # split-K or conv plan (no epilogue) - fall back to the heuristic tile.
+        # An mpp_tensor tile is a 3-tuple; anything longer means the autotuner chose
+        # a split-K/conv/pf/flip plan (no epilogue) - fall back to the heuristic tile.
         if len(tile) == 3:
             BM, BN, NSG = tile
         else:
