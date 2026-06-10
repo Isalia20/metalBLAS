@@ -368,14 +368,14 @@ def _conv_specs(M, N, K):
     return specs
 
 
-# Thin-N overlap kernels (mppf / flipt)
+# Thin-N overlap kernels (sgpipe / flipt)
 # matmul2d under-overlaps the A stream on thin-N (in-cache tile rate ~24 TF vs ~18
-# streamed on M5 Pro); mppf prefetches A's next K-chunk in place, flipt computes
-# C^T = B^T A^T (the flipped RHS streams A near its MMA roof), best as a full-N-width
-# tile with the same chunked prefetch, storing through TG memory transposed.
+# streamed on M5 Pro); sgpipe stages A K-chunks through per-SG input cooperative
+# tensors (N=64..128), flipt computes C^T = B^T A^T (the flipped RHS streams A near
+# its MMA roof; N up to 256), storing through TG memory transposed.
 class _GridPlan:
     """Launch plan for kernels taking (A, B, C, packed(M,N,K)) on an x=N-tiles,
-    y=M-tiles grid (mppf; flipt passes its flipped tile counts)."""
+    y=M-tiles grid (sgpipe; flipt passes its flipped tile counts)."""
 
     def __init__(self, fn, M, N, K, tiles_x, tiles_y, NSG):
         self.fn = fn
@@ -387,10 +387,12 @@ class _GridPlan:
         self.fn(a, b, o, self.dims, threads=self.threads, group_size=self.group)
 
 
-def _build_mppf_plan(dtype, M, N, K, BM, BN, NSG, KC, PFD):
+def _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK=0):
+    # Only K is baked (GK): it unrolls the chunk loop (+2-5%); baking M/N too
+    # measured slightly slower, so they stay runtime.
     in_t, _, out_t = _PROFILE[dtype]
-    fn, _ = kernels.mppf_gemm(in_t, out_t, BM, BN, NSG, KC, PFD)
-    return _GridPlan(fn, M, N, K, (N + BN - 1) // BN, (M + BM - 1) // BM, NSG)
+    fn, _ = kernels.sgpipe_gemm(in_t, out_t, SGM, SGN, KC, NSGX, NSGY, GK)
+    return _GridPlan(fn, M, N, K, N // (NSGX * SGN), M // (NSGY * SGM), NSGX * NSGY)
 
 
 def _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC=0, PFD=0):
@@ -400,28 +402,36 @@ def _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC=0, PFD=0):
     return _GridPlan(fn, M, N, K, (M + BN - 1) // BN, (N + BM - 1) // BM, NSG)
 
 
-def _is_mppf_regime(M, N, K, dtype, a):
-    """N==64 over wide M: every plain tile leaves ~20% bandwidth unhidden; the
-    prefetch variant recovers it. The uint prefetch reads need a 4-B-aligned base."""
-    return (dtype is not torch.float32 and N == 64
-            and M >= 1024 and M % 32 == 0 and K >= 1024 and K % 128 == 0
-            and int(a.storage_offset()) % 2 == 0)
-
-
-def _mppf_specs(M, N, K):
-    """(BM, BN, NSG, KC, PFD) prefetch candidates; KC=128/PFD=2 and KC=256/PFD=1
-    bracket the best prefetch distance on M5 Pro."""
-    return [(BM, BN, NSG, KC, PFD)
-            for (BM, BN, NSG, KC, PFD) in [(64, 64, 4, 128, 2), (64, 64, 4, 256, 1),
-                                           (32, 64, 2, 128, 2)]
-            if M % BM == 0 and N % BN == 0 and K % KC == 0]
-
-
 def _is_flipt_regime(M, N, K, dtype):
     """Thin N (128..256, 64-aligned) over long M: the flipped orientation wins at
     M>=8192 and ties below, so probe and let the timing decide."""
     return (dtype is not torch.float32 and 128 <= N <= 256 and N % 64 == 0
             and M >= 2048 and M % 64 == 0 and K >= 512)
+
+
+def _is_sgpipe_regime(M, N, K, dtype):
+    """Thin N (64..128) over long M: per-SG ops with register-staged A chunks beat
+    every TG-scope matmul2d structure (the op's own device staging under-overlaps)."""
+    return (dtype is not torch.float32 and N in (64, 128)
+            and M >= 1024 and K >= 1024 and K % 128 == 0)
+
+
+def _sgpipe_specs(M, N, K):
+    """(SGM, SGN, KC, NSGX, NSGY, GK) candidates. (32,64,KC64) is the M5 Pro sweet
+    spot at N=128; N=64 prefers the (16,64) tile. K % (2*KC) == 0 required. Baking
+    K (GK=K) unrolls the chunk loop (+2-5% when A is cache-resident); probed against
+    the dynamic-K build, and skipped for deep K where the unroll bloats the binary."""
+    if N == 128:
+        cands = [(32, 64, 64, 2, 1), (32, 64, 64, 2, 2)]
+    else:
+        cands = [(16, 64, 64, 1, 2), (32, 64, 64, 1, 2)]
+    specs = []
+    for s in cands:
+        if M % (s[4] * s[0]) == 0:
+            if K <= 8192:
+                specs.append(s + (K,))
+            specs.append(s + (0,))
+    return specs
 
 
 def _flipt_specs(M, N, K, a):
@@ -602,7 +612,7 @@ def _probe_params(M, N, K):
 
 
 def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
-                  conv_specs=(), bt_specs=(), pf_specs=(), flip_specs=()):
+                  conv_specs=(), bt_specs=(), flip_specs=(), sgp_specs=()):
     """Time each candidate (best-of-reps), returning the fastest (plan, label).
     Candidate 0 (heuristic) is kept unless beaten by >margin; the *_specs add candidates."""
     warmup, iters, reps = _probe_params(M, N, K)
@@ -611,6 +621,10 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
     if margin < _AUTOTUNE_MARGIN:
         iters = max(iters * 2, 6)
         reps = max(reps, 5)
+    # sgpipe rides ~2-5% gaps on ~0.2ms kernels; 6 iters mispicks under noise,
+    # so spend more (one-time, thin-N shapes only).
+    if sgp_specs:
+        iters = max(iters, 12)
     o = a.new_empty(M, N)             # private scratch - never the pooled output
 
     # Each candidate is (cached_plan, run(a,b,o), label): mpp_tensor tiles keep the
@@ -625,17 +639,17 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
 
     # Add split-K / 1x1-conv / prefetch / flipped candidates, but only those whose
     # result matches the single-pass primary (guards a precision surprise). Checked once.
-    if sk_specs or conv_specs or bt_specs or pf_specs or flip_specs:
+    if sk_specs or conv_specs or bt_specs or flip_specs or sgp_specs:
         ref = a.new_empty(M, N)
         cand[0][1](a, b, ref)
         torch.mps.synchronize()
         scale = ref.abs().max().item() + 1e-6
-        for (BM, BN, NSG, KC, PFD) in pf_specs:
-            plan = _build_mppf_plan(dtype, M, N, K, BM, BN, NSG, KC, PFD)
+        for (SGM, SGN, KC, NSGX, NSGY, GK) in sgp_specs:
+            plan = _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK)
             plan.run(a, b, o)
             torch.mps.synchronize()
             if (o - ref).abs().max().item() <= 0.02 * scale:
-                cand.append((plan, plan.run, (BM, BN, NSG, KC, PFD, "pf")))
+                cand.append((plan, plan.run, (SGM, SGN, KC, NSGX, NSGY, GK, "sgp")))
         for (BM, BN, NSG, KC, PFD) in flip_specs:
             plan = _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC, PFD)
             plan.run(a, b, o)
@@ -693,8 +707,8 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         sk_specs = ()
         conv_specs = ()
         bt_specs = ()
-        pf_specs = ()
         flip_specs = ()
+        sgp_specs = ()
         if _AUTOTUNE and a is not None and _is_splitk_regime(M, N, K, dtype):
             sk_specs = _splitk_specs(M, N, K)
         if _AUTOTUNE and a is not None and _is_conv_regime(M, N, K, dtype):
@@ -702,14 +716,14 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
         if _AUTOTUNE and a is not None and _is_gemv_bt_regime(M, N, K, dtype):
             align = int(b.stride(0)) | int(b.storage_offset())
             bt_specs = _gemv_bt_specs(M, N, K, dtype, align)
-        if _AUTOTUNE and a is not None and _is_mppf_regime(M, N, K, dtype, a):
-            pf_specs = _mppf_specs(M, N, K)
         if _AUTOTUNE and a is not None and _is_flipt_regime(M, N, K, dtype):
             flip_specs = _flipt_specs(M, N, K, a)
+        if _AUTOTUNE and a is not None and _is_sgpipe_regime(M, N, K, dtype):
+            sgp_specs = _sgpipe_specs(M, N, K)
         if _AUTOTUNE and a is not None and (len(cands) > 1 or sk_specs or conv_specs
-                                            or bt_specs or pf_specs or flip_specs):
+                                            or bt_specs or flip_specs or sgp_specs):
             plan, tile = _autotune_mppt(dtype, M, N, K, cands, a, b, margin,
-                                        sk_specs, conv_specs, bt_specs, pf_specs, flip_specs)
+                                        sk_specs, conv_specs, bt_specs, flip_specs, sgp_specs)
         else:
             tile = cands[0]
             plan = _build_mppt_plan(dtype, M, N, K, *tile)

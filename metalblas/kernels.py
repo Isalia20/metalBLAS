@@ -192,15 +192,18 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 
 @functools.lru_cache(maxsize=None)
-def mppf_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KC: int, PFD: int):
-    """Prefetched thin-N GEMM (shaders/mpp_pf.h): software-prefetch A's next K-chunk.
-    Packed shapes with M%BM == N%BN == K%KC == 0 only (caller guarantees)."""
+def sgpipe_gemm(in_t: str, out_t: str, SGM: int, SGN: int, KC: int,
+                NSGX: int, NSGY: int, GK: int = 0, GM: int = 0, GN: int = 0):
+    """Per-simdgroup register-staged thin-N GEMM (shaders/mpp_sgpipe.h): each SG
+    loads its A K-chunk into the op's input cooperative tensor. GK/GM/GN > 0 bake
+    the shape (the chunk loop unrolls, stride math folds). Packed shapes with
+    M % (NSGY*SGM) == N % (NSGX*SGN) == K % (2*KC) == 0 only (caller guarantees)."""
     src = _build(
-        "MB_BUILD_MPP_PF",
+        "MB_BUILD_MPP_SGPIPE",
         IN_T=in_t, OUT_T=out_t,
-        BM=BM, BN=BN, NSG=NSG, KC=KC, PFD=PFD,
+        SGM=SGM, SGN=SGN, KC=KC, NSGX=NSGX, NSGY=NSGY, GK=GK, GM=GM, GN=GN,
     )
-    return _compile(src).mppf_gemm, src
+    return _compile(src).sgpipe_gemm, src
 
 
 @functools.lru_cache(maxsize=None)

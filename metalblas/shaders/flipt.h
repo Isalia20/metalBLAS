@@ -37,7 +37,7 @@ kernel void flipt_gemm(
 
 #if KC > 0
     // Chunked accumulate: touching A's next K-chunk (one word per 128-B line)
-    // overlaps its DRAM fetch with the current chunk's MMA (same trick as mpp_pf).
+    // overlaps its DRAM fetch with the current chunk's MMA.
     constexpr auto desc = matmul2d_descriptor(
         BM, BN, KC, true, true, true, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<NSG>> op;
