@@ -92,9 +92,10 @@ SHAPES = {
     # thin-M (small rows, wide N): batched-decode / small-batch prefill GEMM.
     "thin_m": [(96, 4096, 4096), (128, 4096, 4096), (192, 4096, 4096),
                (256, 4096, 4096), (128, 8192, 4096)],
-    # thin-N (wide M, narrow N): below MPS here
+    # thin-N (wide M, narrow N): sgpipe per-SG kernel (SGN=N down to 8) holds parity
     "thin_n": [(4096, 128, 4096), (4096, 256, 4096), (8192, 128, 4096),
-               (4096, 64, 4096)],
+               (4096, 64, 4096), (4096, 32, 4096), (4096, 16, 4096),
+               (4096, 8, 4096)],
     "odd": [(257, 257, 257), (1023, 1023, 1023), (4097, 4097, 4097),
             (511, 511, 511), (333, 444, 555)],
 }

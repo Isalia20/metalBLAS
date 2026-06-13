@@ -410,21 +410,27 @@ def _is_flipt_regime(M, N, K, dtype):
 
 
 def _is_sgpipe_regime(M, N, K, dtype):
-    """Thin N (64..128) over long M: per-SG ops with register-staged A chunks beat
-    every TG-scope matmul2d structure (the op's own device staging under-overlaps)."""
-    return (dtype is not torch.float32 and N in (64, 128)
+    """Thin N (8..128) over long M: per-SG ops with register-staged A chunks beat
+    every TG-scope matmul2d structure (the op's own device staging under-overlaps).
+    SGN=N for N<=32 - per-SG matmul2d fills 8/16/32-wide N tiles fine (the sub-32
+    crater is a TG-scope failure mode, not a per-SG one); matches/beats MPS there."""
+    return (dtype is not torch.float32 and N in (8, 16, 32, 64, 128)
             and M >= 1024 and K >= 1024 and K % 128 == 0)
 
 
 def _sgpipe_specs(M, N, K):
-    """(SGM, SGN, KC, NSGX, NSGY, GK) candidates. (32,64,KC64) is the M5 Pro sweet
-    spot at N=128; N=64 prefers the (16,64) tile. K % (2*KC) == 0 required. Baking
-    K (GK=K) unrolls the chunk loop (+2-5% when A is cache-resident); probed against
-    the dynamic-K build, and skipped for deep K where the unroll bloats the binary."""
+    """(SGM, SGN, KC, NSGX, NSGY, GK) candidates. N=128 -> (32,64); N=64 -> (16,64);
+    very-thin N (8/16/32) -> SGN=N so one SG-column spans every output column, tiling
+    only M (SGM=64 is excluded: 64x32 = 64 fp32 acc/lane spills, 255us at N=32). K %
+    (2*KC) == 0 required. Baking K (GK=K) unrolls the chunk loop (+2-5% at small or
+    cache-resident K)"""
     if N == 128:
         cands = [(32, 64, 64, 2, 1), (32, 64, 64, 2, 2)]
-    else:
+    elif N == 64:
         cands = [(16, 64, 64, 1, 2), (32, 64, 64, 1, 2)]
+    else:   # N in (8, 16, 32)
+        cands = [(16, N, 64, 1, 2), (32, N, 64, 1, 2),
+                 (16, N, 64, 1, 4), (32, N, 64, 1, 1)]
     specs = []
     for s in cands:
         if M % (s[4] * s[0]) == 0:
@@ -557,6 +563,9 @@ def _mpp_tensor_tile_candidates(M, N, K, dtype):
         return [primary], _AUTOTUNE_MARGIN
     if mx <= 256:
         return [primary], _AUTOTUNE_MARGIN
+
+    if N < 32 and M >= 1024:
+        return [primary], _TALL_NARROW_MARGIN
 
     # Thin min-dim: square default makes too few tiles on the short axis. Offer
     # both tall-narrow orientations plus the NSG/BM ambiguity for the autotuner.
@@ -1455,9 +1464,11 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         sb = b.shape
         N = sb[1]
         dtype = a.dtype
-        # N>=32 and M>=2: thin-N and batched-decode GEMM belong on mpp_tensor
-        # (BN=32/short-BM tiles beat manual mpp); autotuner picks the tile.
-        if (M >= 2 and N >= 32 and K >= 64 and sb[0] == K and dtype in _PROFILE
+        # N>=32: thin-N and batched-decode GEMM belong on mpp_tensor (BN=32/short-BM
+        # tiles beat manual mpp); autotuner picks the tile. Very-thin N (8/16) over
+        # long M routes in too so the autotuner can pick the per-SG sgpipe kernel
+        if (M >= 2 and K >= 64 and sb[0] == K and dtype in _PROFILE
+                and (N >= 32 or _is_sgpipe_regime(M, N, K, dtype))
                 and a.is_contiguous() and b.is_contiguous()
                 and kernels.has_metal4()):
             # Pass a, b so a first-sight ambiguous shape autotunes, cached thereafter.
