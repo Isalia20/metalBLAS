@@ -44,6 +44,18 @@ y = addmm(bias, x, w)                 # == nn.Linear(x, w, bias)
 y = addmm(bias, x, w, beta=0.5, alpha=2.0)
 ```
 
+`conv1d` / `conv2d` / `conv3d` mirror `torch.nn.functional` (stride, padding
+incl. `'same'`/`'valid'`, dilation, groups, bias, NCHW + channels_last, batched
+or not). bf16 and fp32 run on custom kernels; fp16 currently falls back to torch:
+
+```python
+from metalblas import conv2d
+
+x = torch.randn(8, 256, 14, 14, device="mps", dtype=torch.bfloat16)
+w = torch.randn(256, 256, 3, 3, device="mps", dtype=torch.bfloat16)
+y = conv2d(x, w, bias, padding=1)     # ~1.3x torch; conv3d runs ~10x
+```
+
 You can override the backend and tile for the real dtypes if needed:
 
 ```python
@@ -94,9 +106,28 @@ Dispatch picks a kernel from shape and dtype:
   `C`, matching torch's drop-the-operand rule. fp32 ~2x and integer ~3x vs
   `torch.addmm`; bf16/fp16 ~parity.
 
+- **conv** - `mpp::tensor_ops::convolution2d` on the tensor unit, NHWC-native
+  with the tile + kernel/stride/dilation baked per build and shape dims left
+  runtime (tensor extents carry the bounds). channels_last tensors are already
+  NHWC memory and run zero-copy; NCHW inputs pay one tiled-transpose pass in
+  and scatter straight back to NCHW from the cooperative store (bias fused).
+  1x1 stride-1 convs route to the GEMM stack (batched broadcast-weights `bmm`
+  for NCHW - no layout work at all), stride-1 conv1d to a shift-GEMM kernel
+  (k accumulated column-shifted `matmul2d` runs on raw NCL memory - no layout
+  transforms either direction; a tiny pass fixes the left-pad columns),
+  depthwise (`groups == C`) to a direct bandwidth-bound kernel (~2.5-6x torch),
+  and conv3d runs an in-kernel accumulating depth loop over
+  `mode::multiply_accumulate` (~10x torch, whose MPSGraph conv3d is very slow).
+  Transformed weights are cached across calls keyed on tensor identity +
+  version + layout. The autotuner also probes torch itself (with deep warmup -
+  MPSGraph keeps tiering up over its first ~100 calls) and keeps a shape on our
+  kernels only when they win by >6%; near-ties route to torch, so parity is the
+  floor and our kernels only own shapes they solidly win.
+
 A runtime autotuner probes a short tile-candidate list on the real operands the
 first time it sees a bf16/fp16 shape and caches the winner (disable with
-`METALBLAS_AUTOTUNE=0`). The tile-picker logic lives in `metalblas/dispatch.py`.
+`METALBLAS_AUTOTUNE=0`). The tile-picker logic lives in `metalblas/dispatch.py`
+(matmul) and `metalblas/conv.py` (conv).
 
 ## Benchmarks
 
@@ -110,14 +141,27 @@ best-of-N):
 | complex64   | square/medium GEMM ~1.3-3.3x (median ~2.1x); large 4096³ ~5.6x and LLM ~5.8x (torch's complex GEMM scales poorly); GEMV ~2.0-4.7x (native interleaved kernels, ~280 GB/s vs torch's ~138) |
 | int8 / uint8 | square GEMM ~1.8-2.1x (median); int16 ~2.2x, int32 ~3.0x, int64 ~1.4x; thin/LLM-shaped ~1.3-3.1x; rank-1 GEMV ~2.5-12x (coalesced loads vs torch's bandwidth-starved path). |
 
-Per-shape tables: [`perf_benchs/`](perf_benchs/).
+Speedup vs `torch.nn.functional.conv*` on the same machine (`bench/bench_conv.py`,
+ResNet/SD-UNet/MobileNet/Whisper/Mamba/video shape families, every shape swept
+over batch 1/2/4/8/16/32). Shapes the kernels don't beat MPSGraph by >6% on
+route to torch, so parity is the floor:
+
+| op          | bf16                          | fp32                          |
+| ----------- | ----------------------------- | ----------------------------- |
+| conv2d      | median 1.68x (1x1s ~2-3.5x, depthwise up to 6.5x) | median 1.98x |
+| conv2d (channels_last) | median 1.25x            | median 1.71x                  |
+| conv1d      | median 1.33x (Mamba depthwise ~5x) | median 2.73x            |
+| conv3d      | median 10.9x (MPSGraph conv3d is very slow) | median 8.1x     |
+
+Per-shape tables: [`perf_benchs/`](perf_benchs/), conv: [`perf_benchs/M5_Pro_conv.md`](perf_benchs/M5_Pro_conv.md).
 
 ## Layout
 
 ```
-metalblas/   kernels.py (MSL source + JIT cache), dispatch.py (dispatch + tile picker)
-bench/       bench_matmul.py
-tests/       test_basic.py
+metalblas/   kernels.py (MSL source + JIT cache), dispatch.py (matmul dispatch),
+             conv.py (conv dispatch), shaders/ (MSL kernel templates)
+bench/       bench_matmul.py, bench_conv.py
+tests/       test_basic.py, test_conv.py
 ```
 
 ## Running
@@ -131,6 +175,8 @@ pip install -e .
 
 ```bash
 python tests/test_basic.py
+python tests/test_conv.py
+python bench/bench_conv.py --dtype bf16                    # conv1d/2d/3d vs torch
 python bench/bench_matmul.py --dtype bf16
 python bench/bench_matmul.py --dtype fp32 --group llm
 python bench/bench_matmul.py --dtype c64 --group square    # complex64

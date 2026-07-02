@@ -1,8 +1,3 @@
-"""Loads and compiles the metalBLAS Metal kernels from shaders/.
-
-Per call: inline the binder's local #includes, enable one family via
--DMB_BUILD_<NAME>, substitute its __PARAM__ tile tokens, compile (cached).
-"""
 from __future__ import annotations
 
 import os
@@ -22,7 +17,6 @@ def _read(path: str) -> str:
 
 
 def _inline_includes(path: str) -> str:
-    """Inline local #include "x" (recursively); leave system #include <...> for the compiler."""
     base = os.path.dirname(path)
     return _LOCAL_INCLUDE.sub(
         lambda m: _inline_includes(os.path.join(base, m.group(1))),
@@ -42,11 +36,6 @@ def _subst(src: str, **kw) -> str:
 
 
 def _build(build_flag: str, *, defines=None, **params) -> str:
-    """Assemble one kernel's source: enable its build flag, inline the shaders, substitute params.
-
-    `defines` prepends extra `#define`s (e.g. the addmm EPILOGUE flags); omitting it
-    leaves the source byte-identical to a plain build.
-    """
     prelude = f"#define {build_flag} 1\n"
     if defines:
         prelude += "".join(f"#define {k} {int(v)}\n" for k, v in defines.items())
@@ -54,7 +43,6 @@ def _build(build_flag: str, *, defines=None, **params) -> str:
 
 
 def _epi_defines(epilogue: bool, beta_nz: bool, alpha_nz: bool):
-    """addmm epilogue flags for _build, or None for a plain (non-fused) matmul build."""
     if not epilogue:
         return None
     return {"EPILOGUE": 1, "BETA_NZ": int(beta_nz), "ALPHA_NZ": int(alpha_nz)}
@@ -67,14 +55,6 @@ def _compile(src: str):
 
 @functools.lru_cache(maxsize=1)
 def has_metal4() -> bool:
-    """True if the Metal 4 cooperative-tensor headers are available (macOS 26+).
-
-    The mpp_tensor / mpp_gemm / splitk / conv1x1 kernels #include
-    <metal_cooperative_tensor> and use mpp::tensor_ops, which only ship with
-    Metal 4. On older macOS, compile_shader fails with "file not found". Probe
-    once with a minimal kernel and cache the result so dispatch can route to the
-    simd/gemv fallbacks instead of emitting a cryptic compile error.
-    """
     probe = "#include <metal_cooperative_tensor>\n[[kernel]] void _mb_metal4_probe() {}\n"
     try:
         torch.mps.compile_shader(probe)
@@ -114,7 +94,6 @@ def mpp_gemm(in_t: str, acc_t: str, out_t: str,
             dbuf: bool = False,
             pad: int | None = None,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    # pad defaults to 16/sizeof(IN_T) for VecF alignment (0 is OK when BK/BN are VEC-aligned).
     if pad is None:
         in_bytes = 4 if in_t == "float" else 2
         pad = 16 // in_bytes
@@ -143,9 +122,8 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
                    mn_aligned: bool = False,
                    epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
                    batched: bool = False):
-    # Static-extent slices only for non-transposed (the orientation auto-dispatch routes here).
     static_slice = (not trans_a) and (not trans_b)
-    # batched (bmm/baddbmm): grid z is the batch; A/B/C/bias offset by per-matrix strides.
+
     defines = _epi_defines(epilogue, beta_nz, alpha_nz)
     if batched:
         defines = {**(defines or {}), "BATCHED": 1}
@@ -168,7 +146,6 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
 @functools.lru_cache(maxsize=None)
 def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
                 relaxed: bool = True):
-    """Split-K mpp_tensor GEMM -> (splitk_fn, reduce_fn). KCHUNK must divide K (caller guarantees)."""
     src = _build(
         "MB_BUILD_SPLITK",
         IN_T=in_t, OUT_T=out_t,
@@ -182,7 +159,6 @@ def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
 @functools.lru_cache(maxsize=None)
 def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
                  relaxed: bool = True):
-    """1x1-conv GEMM for very-thin-N (shaders/conv1x1.h). K is baked into the descriptor, so it's per-K."""
     src = _build(
         "MB_BUILD_CONV1X1",
         IN_T=in_t, OUT_T=out_t,
@@ -192,12 +168,82 @@ def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int,
 
 
 @functools.lru_cache(maxsize=None)
+def conv2d_mpp(in_t: str, out_t: str, BO: int, BW: int, BH: int, NSG: int,
+               KH: int, KW: int, SX: int, SY: int, DX: int, DY: int,
+               relaxed: bool = True,
+               bias: bool = False, d_nchw: bool = False, grouped: bool = False,
+               conv3d: bool = False, KD: int = 1, SZ: int = 1, DZ: int = 1,
+               srcw: int = 16384, srch: int = 16384, srcc: int = -1):
+    defines = {}
+    if bias:
+        defines["BIAS"] = 1
+    if d_nchw:
+        defines["D_NCHW"] = 1
+    if grouped:
+        defines["GROUPED"] = 1
+    if conv3d:
+        defines.update(CONV3D=1, KD=KD, SZ=SZ, DZ=DZ)
+    src = _build(
+        "MB_BUILD_CONV2D",
+        defines=defines or None,
+        IN_T=in_t, OUT_T=out_t,
+        BO=BO, BW=BW, BH=BH, NSG=NSG,
+        KH=KH, KW=KW, SX=SX, SY=SY, DX=DX, DY=DY,
+        RELAXED=("true" if relaxed else "false"),
+        SRCW=srcw, SRCH=srch, SRCC=srcc,
+    )
+    return _compile(src).conv2d_mpp, src
+
+
+@functools.lru_cache(maxsize=None)
+def conv1d_bw(in_t: str, out_t: str, BO: int, BW: int, BH: int, NSG: int,
+              K: int, S: int, DIL: int, relaxed: bool = True, bias: bool = False):
+    src = _build(
+        "MB_BUILD_CONV1D_BW",
+        defines={"BIAS": 1} if bias else None,
+        IN_T=in_t, OUT_T=out_t, BO=BO, BW=BW, BH=BH, NSG=NSG,
+        K=K, S=S, DIL=DIL, RELAXED=("true" if relaxed else "false"),
+    )
+    return _compile(src).conv1d_bw, src
+
+
+@functools.lru_cache(maxsize=None)
+def conv1d_sg(in_t: str, out_t: str, BM: int, BN: int, NSG: int,
+              K: int, DIL: int, relaxed: bool = True, bias: bool = False):
+    src = _build(
+        "MB_BUILD_CONV1D_SG",
+        defines={"BIAS": 1} if bias else None,
+        IN_T=in_t, OUT_T=out_t, BM=BM, BN=BN, NSG=NSG,
+        K=K, DIL=DIL, RELAXED=("true" if relaxed else "false"),
+    )
+    lib = _compile(src)
+    return lib.conv1d_sg, lib.conv1d_sgfix
+
+
+@functools.lru_cache(maxsize=None)
+def dw_conv(elt_t: str, KH: int, KW: int, SX: int, SY: int, DX: int, DY: int,
+            bias: bool = False, nhwc: bool = False, OPT: int = 4):
+    defines = {}
+    if bias:
+        defines["BIAS"] = 1
+    if nhwc:
+        defines["NHWC"] = 1
+    src = _build("MB_BUILD_DWCONV", defines=defines or None,
+                 ELT_T=elt_t, KH=KH, KW=KW, SX=SX, SY=SY, DX=DX, DY=DY, OPT=OPT)
+    return _compile(src).dw_conv, src
+
+
+@functools.lru_cache(maxsize=None)
+def nchw_to_nhwc(elt_t: str, TC: int = 32, TX: int = 32, NTH: int = 256,
+                 vecr: bool = True, vecw: bool = True):
+    src = _build("MB_BUILD_NCHW_NHWC", ELT_T=elt_t, TC=TC, TX=TX, NTH=NTH,
+                 VECR=int(vecr), VECW=int(vecw))
+    return _compile(src).nchw_to_nhwc, src
+
+
+@functools.lru_cache(maxsize=None)
 def sgpipe_gemm(in_t: str, out_t: str, SGM: int, SGN: int, KC: int,
                 NSGX: int, NSGY: int, GK: int = 0, GM: int = 0, GN: int = 0):
-    """Per-simdgroup register-staged thin-N GEMM (shaders/mpp_sgpipe.h): each SG
-    loads its A K-chunk into the op's input cooperative tensor. GK/GM/GN > 0 bake
-    the shape (the chunk loop unrolls, stride math folds). Packed shapes with
-    M % (NSGY*SGM) == N % (NSGX*SGN) == K % (2*KC) == 0 only (caller guarantees)."""
     src = _build(
         "MB_BUILD_MPP_SGPIPE",
         IN_T=in_t, OUT_T=out_t,
@@ -209,10 +255,6 @@ def sgpipe_gemm(in_t: str, out_t: str, SGM: int, SGN: int, KC: int,
 @functools.lru_cache(maxsize=None)
 def flipt_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int,
                KC: int = 0, PFD: int = 0):
-    """Flipped thin-N GEMM (shaders/flipt.h): C^T = B^T A^T tiles, transposed TG store.
-    KC>0 chunks K and software-prefetches A's next chunk PFD chunks ahead (needs
-    4-B-aligned A and K%KC == 0).
-    Packed shapes with N%BM == M%BN == 0 only (caller guarantees)."""
     src = _build(
         "MB_BUILD_FLIPT",
         IN_T=in_t, OUT_T=out_t,
@@ -225,7 +267,6 @@ def flipt_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int,
 def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
             VEC: int = 1, red_tg: bool = False,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    # red_tg: reduce via threadgroup mem instead of simd_sum (int64: no simd_sum(long)).
     src = _build("MB_BUILD_GEMV_NT", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
                  IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
                  ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC, RED_TG=int(red_tg))
@@ -236,7 +277,6 @@ def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int
 def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4,
            VEC: int = 1,
            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    # Each lane owns VEC columns, so a threadgroup spans BLOCK_N == 32*VEC cols.
     assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
     src = _build("MB_BUILD_GEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
                  IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
@@ -249,8 +289,6 @@ def gemv_bt(in_t: str, acc_t: str, out_t: str, MROWS: int,
             BLOCK_N: int = 64, NWARPS: int = 8, VEC: int = 2,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
             batched: bool = False, trans_b: bool = False, NCOLS: int = 1, trans_a: bool = False):
-    # Batched thin-M GEMV (Y = X @ B, M=MROWS rows). trans_b=column-major B (reduce over K,
-    # NCOLS blocks cols to reuse X); trans_a=column-major X. epilogue folds bias; batched=grid z.
     assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
     defines = _epi_defines(epilogue, beta_nz, alpha_nz)
     if batched:
@@ -284,8 +322,6 @@ def cgemv_nt(c2_t: str, acc2_t: str, r_t: str, NWARPS: int = 4,
 @functools.lru_cache(maxsize=None)
 def complex_pack(c2_t: str, r_t: str,
                  epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    """-> (split_fn, combine_fn) for the given complex element type (float2/half2).
-    epilogue folds the complex addmm bias+scales into complex_combine."""
     src = _build("MB_BUILD_COMPLEX_PACK", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
                  C2=c2_t, R=r_t)
     lib = _compile(src)
@@ -297,8 +333,7 @@ def int_gemm(in_t: str, acc_t: str, out_t: str, BM: int, BN: int, BK: int,
              TX: int, TY: int, trans_a: bool, trans_b: bool,
              epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
              batched: bool = False):
-    """Register-tiled integer GEMM (simdgroup_matrix / the tensor unit are float-only)."""
-    # batched (bmm/baddbmm): grid z is the batch; A/B/C/bias offset by per-matrix strides.
+
     defines = _epi_defines(epilogue, beta_nz, alpha_nz)
     if batched:
         defines = {**(defines or {}), "BATCHED": 1}
