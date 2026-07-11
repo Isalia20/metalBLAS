@@ -1,16 +1,21 @@
-"""Correctness tests against torch.matmul on MPS.
-
-Run with:  python tests/test_basic.py
-"""
+"""Correctness checks against PyTorch on MPS."""
 import os
 import sys
+
 import torch
 
-# Allow running from project root or anywhere
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import metalblas
 from metalblas import matmul as mb_matmul
 from metalblas.kernels import has_metal4
+
+
+def _atol(dtype, k, *, strict_float32=False):
+    if dtype == torch.float32:
+        return max(1e-3, 1e-5 * k) if strict_float32 else max(0.1, 5e-3 * k**0.5)
+    if dtype == torch.bfloat16:
+        return max(5e-1, 3e-2 * k**0.5)
+    return max(5e-2, 1e-2 * k**0.5)
 
 
 def check(M, N, K, dtype, backend="auto", tile=None, atol=None):
@@ -18,18 +23,10 @@ def check(M, N, K, dtype, backend="auto", tile=None, atol=None):
     a = torch.randn(M, K, dtype=dtype, device='mps')
     b = torch.randn(K, N, dtype=dtype, device='mps')
     if atol is None:
-        # Loose tolerances - mpp backend uses TF32-like relaxed precision for fp32.
-        if dtype == torch.float32:
-            atol = max(0.1, 5e-3 * K**0.5) if backend == "mpp" else max(1e-3, 1e-5 * K)
-        elif dtype == torch.bfloat16:
-            # bf16 has only 7 mantissa bits → errors grow ~ K * 2^-7
-            atol = max(5e-1, 3e-2 * K**0.5)
-        else:
-            atol = max(5e-2, 1e-2 * K**0.5)
+        atol = _atol(dtype, K, strict_float32=backend != "mpp")
     c = mb_matmul(a, b, backend=backend, tile=tile)
     ref = (a.to(torch.float32) @ b.to(torch.float32)).to(dtype)
     err = (c.to(torch.float32) - ref.to(torch.float32)).abs()
-    rel = err / (ref.to(torch.float32).abs() + 1e-6)
     ok = err.max().item() <= atol
     status = "OK" if ok else "FAIL"
     print(f"  [{status}] {dtype} {backend:5s} {M:5d}x{N:5d}x{K:5d} "
@@ -38,21 +35,11 @@ def check(M, N, K, dtype, backend="auto", tile=None, atol=None):
     return ok
 
 
-def check_transposed(M, N, K, dtype, backend="auto"):
-    """Test with transposed A and B (views into col-major memory)."""
+def check_transposed(M, N, K, dtype):
     torch.manual_seed(0)
-    if dtype == torch.float32:
-        atol = max(0.1, 5e-3 * K**0.5)
-    elif dtype == torch.bfloat16:
-        atol = max(5e-1, 3e-2 * K**0.5)
-    else:
-        atol = max(5e-2, 1e-2 * K**0.5)
-    # A is M x K but stored as K x M with .T view
-    a_raw = torch.randn(K, M, dtype=dtype, device='mps')
-    a = a_raw.t()  # M x K view, stride (1, M)
-    # B is K x N but stored as N x K with .T view
-    b_raw = torch.randn(N, K, dtype=dtype, device='mps')
-    b = b_raw.t()  # K x N view, stride (1, K)
+    atol = _atol(dtype, K)
+    a = torch.randn(K, M, dtype=dtype, device='mps').t()
+    b = torch.randn(N, K, dtype=dtype, device='mps').t()
     c = mb_matmul(a, b)
     ref = (a.to(torch.float32) @ b.to(torch.float32)).to(dtype)
     err = (c.to(torch.float32) - ref.to(torch.float32)).abs()
@@ -64,23 +51,15 @@ def check_transposed(M, N, K, dtype, backend="auto"):
 
 
 def check_gemv_strided_vec(M, N, K, dtype):
-    """Regression for the strided-GEMV-vector bug: the vector operand is a
-    non-contiguous sub-view (a sliced column/row off a wider buffer). The kernel
-    reads the vector as unit-stride, so _dispatch_gemv must contiguify it while
-    leaving the matrix strided. Compares against a reference on the SAME views."""
+    """Exercise a non-contiguous vector operand in the GEMV path."""
     torch.manual_seed(0)
-    if dtype == torch.float32:
-        atol = max(0.1, 5e-3 * K**0.5)
-    elif dtype == torch.bfloat16:
-        atol = max(5e-1, 3e-2 * K**0.5)
-    else:
-        atol = max(5e-2, 1e-2 * K**0.5)
-    if N == 1:                       # matrix @ strided column vector
+    atol = _atol(dtype, K)
+    if N == 1:
         a = torch.randn(M, K, dtype=dtype, device='mps')
-        b = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1]   # (K,1) stride (2,1)
+        b = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1]
         tag = "vecB"
-    else:                            # strided row vector @ matrix  (M == 1)
-        a = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1].t()  # (1,K) stride (1,2)
+    else:
+        a = torch.randn(K, 2, dtype=dtype, device='mps')[:, :1].t()
         b = torch.randn(K, N, dtype=dtype, device='mps')
         tag = "vecA"
     assert not (a.is_contiguous() and b.is_contiguous()), "vector should be strided"
@@ -95,20 +74,15 @@ def check_gemv_strided_vec(M, N, K, dtype):
 
 
 def check_complex(M, N, K, dtype, layout="rm", rtol=None):
-    """
-    Complex matmul vs a full-precision CPU reference (relative max-error).
-
-    complex64 GEMM rides the TF32-relaxed fp32 backend (rel ~1e-3); the native
-    complex GEMV path accumulates in fp32 (rel ~1e-5)
-    """
+    """Compare complex matmul with a complex64 CPU reference."""
     torch.manual_seed(0)
     if rtol is None:
         rtol = 3e-2 if dtype == torch.complex32 else 5e-3
     a = torch.randn(M, K, dtype=dtype, device='mps')
     b = torch.randn(K, N, dtype=dtype, device='mps')
-    if layout == "tr":            # transposed (col-major) A view
+    if layout == "tr":
         a = torch.randn(K, M, dtype=dtype, device='mps').t()
-    elif layout == "conj":        # lazy conjugate view (must be resolved)
+    elif layout == "conj":
         a = a.conj()
     c = mb_matmul(a, b)
     hp = torch.complex64
@@ -123,17 +97,17 @@ def check_complex(M, N, K, dtype, layout="rm", rtol=None):
 
 
 _INT_BITS = {torch.int8: 8, torch.uint8: 8, torch.int16: 16, torch.int32: 32}
+_INT_DTYPES = set(_INT_BITS) | {torch.int64}
 
 
 def _int_ref(a, b, dtype):
-    """Exact integer reference: accumulate in int64 on CPU, then truncate to the
-    output width (two's-complement wrap) - matches torch's integer matmul exactly."""
+    """Accumulate in int64 and wrap to the output width."""
     r = a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)
     if dtype == torch.int64:
-        return r                       # int64 already wrapped mod 2^64 on CPU
+        return r
     mod = 1 << _INT_BITS[dtype]
     r = r % mod
-    if dtype != torch.uint8:           # signed: fold high half to negative
+    if dtype != torch.uint8:
         r = torch.where(r >= (mod >> 1), r - mod, r)
     return r.to(dtype)
 
@@ -146,12 +120,10 @@ def _int_rand(*shape, dtype, lim=40):
 
 
 def check_int(M, N, K, dtype, layout="rm"):
-    """Integer matmul must be BIT-EXACT vs torch (no precision tradeoff: ACC>=output
-    width + truncate is identical to torch's wrap-on-overflow)."""
     torch.manual_seed(0)
     a = _int_rand(M, K, dtype=dtype)
     b = _int_rand(K, N, dtype=dtype)
-    if layout == "tr":            # transposed (col-major) A view
+    if layout == "tr":
         a = _int_rand(K, M, dtype=dtype).t()
     c = mb_matmul(a, b)
     ref = _int_ref(a, b, dtype)
@@ -163,13 +135,11 @@ def check_int(M, N, K, dtype, layout="rm"):
 
 
 def check_bmm(B, M, N, K, dtype, layout="rm"):
-    """metalblas.bmm vs torch.bmm (3-D batched). Bit-exact for ints; atol for fp;
-    relative for complex. layout 'tr' makes both operands col-major (transposed view)."""
     torch.manual_seed(0)
-    is_int = dtype in _INT_BITS or dtype == torch.int64
+    is_int = dtype in _INT_DTYPES
     rand = (lambda *s: _int_rand(*s, dtype=dtype)) if is_int else \
            (lambda *s: torch.randn(*s, dtype=dtype, device='mps'))
-    if layout == "tr":            # col-major matrices (e.g. attention Q@Kᵀ)
+    if layout == "tr":
         a = rand(B, K, M).transpose(-2, -1)
         b = rand(B, N, K).transpose(-2, -1)
     else:
@@ -177,7 +147,7 @@ def check_bmm(B, M, N, K, dtype, layout="rm"):
         b = rand(B, K, N)
     got = metalblas.bmm(a, b)
     if is_int:
-        ref = _int_ref(a, b, dtype)        # int64 @ then wrap (== torch's overflow)
+        ref = _int_ref(a, b, dtype)
         ok = torch.equal(got.cpu(), ref) and got.dtype == dtype
         metric = "bit-exact" if ok else "MISMATCH"
     elif dtype.is_complex:
@@ -190,9 +160,7 @@ def check_bmm(B, M, N, K, dtype, layout="rm"):
         metric = f"rel={rel:.2e}"
     else:
         ref = torch.bmm(a.float(), b.float()).to(dtype)
-        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * K**0.5))
+        atol = _atol(dtype, K)
         err = (got.float() - ref.float()).abs().max().item()
         ok = err <= atol and got.dtype == dtype
         metric = f"err={err:.2e} atol={atol:.2e}"
@@ -202,7 +170,6 @@ def check_bmm(B, M, N, K, dtype, layout="rm"):
 
 
 def _baddbmm_int_ref(inp, a, b, beta, alpha, dtype):
-    """Exact int baddbmm: beta*input + alpha*(a@b) in int64, then wrap to output width."""
     prod = a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)
     Bb, M, N = prod.shape
     r = alpha * prod + beta * inp.cpu().to(torch.int64).expand(Bb, M, N)
@@ -216,9 +183,8 @@ def _baddbmm_int_ref(inp, a, b, beta, alpha, dtype):
 
 
 def check_baddbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
-    """metalblas.baddbmm vs torch.baddbmm: C = beta*input + alpha*(b1 @ b2)."""
     torch.manual_seed(0)
-    is_int = dtype in _INT_BITS or dtype == torch.int64
+    is_int = dtype in _INT_DTYPES
     if dtype.is_floating_point or dtype.is_complex:
         a = torch.randn(B, M, K, dtype=dtype, device='mps')
         b = torch.randn(B, K, N, dtype=dtype, device='mps')
@@ -245,9 +211,7 @@ def check_baddbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
     else:
         ref = torch.baddbmm(inp.float(), a.float(), b.float(), beta=beta, alpha=alpha).to(dtype)
         sc = abs(alpha) + abs(beta)
-        base = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * K**0.5))
+        base = _atol(dtype, K)
         err = (got.float() - ref.float()).abs().max().item()
         ok = err <= sc * base and got.dtype == dtype
         metric = f"err={err:.2e} atol={sc*base:.2e}"
@@ -258,9 +222,7 @@ def check_baddbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
 
 
 def _addbmm_int_ref(inp, a, b, beta, alpha, dtype):
-    """Exact int addbmm: beta*input + alpha*Σᵢ(a[i]@b[i]) in int64, wrap to width.
-    torch.addbmm errors on int/mps, so build the reference on CPU."""
-    prod = (a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)).sum(0)   # (M,N)
+    prod = (a.cpu().to(torch.int64) @ b.cpu().to(torch.int64)).sum(0)
     M, N = prod.shape
     r = alpha * prod + beta * inp.cpu().to(torch.int64).expand(M, N)
     if dtype == torch.int64:
@@ -273,9 +235,8 @@ def _addbmm_int_ref(inp, a, b, beta, alpha, dtype):
 
 
 def check_addbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
-    """metalblas.addbmm vs torch.addbmm: C = beta*input + alpha*Σᵢ(b1[i]@b2[i]) (2-D)."""
     torch.manual_seed(0)
-    is_int = dtype in _INT_BITS or dtype == torch.int64
+    is_int = dtype in _INT_DTYPES
     if dtype.is_floating_point or dtype.is_complex:
         a = torch.randn(B, M, K, dtype=dtype, device='mps')
         b = torch.randn(B, K, N, dtype=dtype, device='mps')
@@ -285,7 +246,7 @@ def check_addbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
     inp = _bias(bshape, dtype)
     got = metalblas.addbmm(inp, a, b, beta=beta, alpha=alpha)
     shape_ok = tuple(got.shape) == (M, N) and got.dtype == dtype
-    if is_int:                                  # torch.addbmm errors on int/mps -> CPU ref
+    if is_int:
         ref = _addbmm_int_ref(inp, a, b, beta, alpha, dtype)
         ok = shape_ok and torch.equal(got.cpu(), ref)
         metric = "bit-exact" if ok else "MISMATCH"
@@ -303,9 +264,7 @@ def check_addbmm(B, M, N, K, dtype, bshape, beta=1, alpha=1):
     else:
         ref = torch.addbmm(inp.float(), a.float(), b.float(), beta=beta, alpha=alpha).to(dtype)
         sc = abs(alpha) + abs(beta)
-        base = (max(0.1, 5e-3 * (B * K)**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * (B * K)**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * (B * K)**0.5))
+        base = _atol(dtype, B * K)
         err = (got.float() - ref.float()).abs().max().item()
         ok = shape_ok and err <= sc * base
         metric = f"err={err:.2e} atol={sc*base:.2e}"
@@ -322,10 +281,8 @@ def _bias(bshape, dtype):
 
 
 def check_addmm(M, N, K, dtype, bshape, beta=1, alpha=1):
-    """metalblas.addmm vs torch.addmm. Bit-exact for ints; |alpha|-scaled atol for
-    fp (the product rides the TF32-relaxed / bf16 backend); relative for complex."""
     torch.manual_seed(0)
-    is_int = dtype in _INT_BITS or dtype == torch.int64
+    is_int = dtype in _INT_DTYPES
     if dtype.is_floating_point or dtype.is_complex:
         a = torch.randn(M, K, dtype=dtype, device='mps')
         b = torch.randn(K, N, dtype=dtype, device='mps')
@@ -339,8 +296,6 @@ def check_addmm(M, N, K, dtype, bshape, beta=1, alpha=1):
         ok = torch.equal(got.cpu(), ref.cpu()) and got.dtype == dtype
         metric = "bit-exact" if ok else "MISMATCH"
     elif dtype.is_complex:
-        # torch's complex (esp. chalf) addmm on MPS is unreliable, so compare to a
-        # high-precision CPU reference: beta*input + alpha*(A@B) in complex64.
         hp = torch.complex64
         prod = a.cpu().to(hp) @ b.cpu().to(hp)
         ref = (alpha * prod if alpha != 0 else torch.zeros_like(prod))
@@ -354,9 +309,7 @@ def check_addmm(M, N, K, dtype, bshape, beta=1, alpha=1):
     else:
         ref = torch.addmm(inp, a, b, beta=beta, alpha=alpha)
         sc = abs(alpha) + abs(beta)
-        base = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * K**0.5))
+        base = _atol(dtype, K)
         atol = sc * base
         err = (got.float() - ref.float()).abs().max().item()
         ok = err <= atol and got.dtype == dtype
@@ -381,10 +334,8 @@ def check_addmm_beta0_nan(M, N, K, dtype):
 
 
 def check_matmul_nd(sa, sb, dtype):
-    """metalblas.matmul vs torch.matmul for N-D / 1-D operands (drop-in semantics).
-    Bit-exact for ints; atol for fp; relative for complex. K is the contracted dim."""
     torch.manual_seed(0)
-    is_int = dtype in _INT_BITS or dtype == torch.int64
+    is_int = dtype in _INT_DTYPES
     rand = (lambda s: _int_rand(*s, dtype=dtype)) if is_int else \
            (lambda s: torch.randn(*s, dtype=dtype, device='mps'))
     a = rand(sa)
@@ -411,9 +362,7 @@ def check_matmul_nd(sa, sb, dtype):
         ok = shape_ok and rel <= rtol
         metric = f"rel={rel:.2e}"
     else:
-        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * K**0.5))
+        atol = _atol(dtype, K)
         err = (got.float() - ref.float()).abs().max().item()
         ok = shape_ok and err <= atol
         metric = f"err={err:.2e} atol={atol:.2e}"
@@ -423,20 +372,15 @@ def check_matmul_nd(sa, sb, dtype):
     return ok
 
 
-# Vector / rank-1 ops (dot / vdot / outer / mv) vs torch.
-_IS_INT = lambda dt: dt in _INT_BITS or dt == torch.int64
-
-
 def _vrand(shape, dtype):
-    return _int_rand(*shape, dtype=dtype) if _IS_INT(dtype) else \
+    return _int_rand(*shape, dtype=dtype) if dtype in _INT_DTYPES else \
         torch.randn(*shape, dtype=dtype, device='mps')
 
 
 def _vcheck(name, got, ref, dtype, tag):
-    """Shared pass/print: ints bit-exact, complex relative, fp atol (K-scaled)."""
     shape_ok = tuple(got.shape) == tuple(ref.shape) and got.dtype == dtype
     K = max(got.shape[-1] if got.ndim else 1, 1)
-    if _IS_INT(dtype):
+    if dtype in _INT_DTYPES:
         ok = shape_ok and torch.equal(got.cpu(), ref.cpu())
         metric = "bit-exact" if ok else "MISMATCH"
     elif dtype.is_complex:
@@ -447,9 +391,7 @@ def _vcheck(name, got, ref, dtype, tag):
         ok = shape_ok and rel <= rtol
         metric = f"rel={rel:.2e} rtol={rtol:.1e}"
     else:
-        atol = (max(0.1, 5e-3 * K**0.5) if dtype == torch.float32
-                else max(5e-1, 3e-2 * K**0.5) if dtype == torch.bfloat16
-                else max(5e-2, 1e-2 * K**0.5))
+        atol = _atol(dtype, K)
         err = (got.float() - ref.float()).abs().max().item()
         ok = shape_ok and err <= atol
         metric = f"err={err:.2e} atol={atol:.2e}"
@@ -500,7 +442,6 @@ def main():
     print("=== fp16, simd backend ===")
     for shape in [(64, 64, 64), (128, 128, 128), (256, 256, 256), (513, 257, 129), (1024, 1024, 256)]:
         check(*shape, dtype=torch.float16, backend="simd")
-    # mpp / mpp_tensor backends need Metal 4 cooperative-tensor headers (macOS 26+).
     m4 = has_metal4()
     if m4:
         print("=== fp32, mpp backend ===")
@@ -566,7 +507,6 @@ def main():
     for dt in int_dtypes:
         check_int(256, 256, 256, dtype=dt, layout="tr")
 
-    # addmm: C = beta*input + alpha*(A@B), matching torch.addmm.
     addmm_dtypes = [torch.float32, torch.float16, torch.bfloat16,
                     torch.complex64, torch.complex32] + int_dtypes
     print("=== addmm: bias broadcast shapes ===")
@@ -575,15 +515,11 @@ def main():
         for bshape in [(M, N), (1, N), (M, 1), (N,), (1,), ()]:
             check_addmm(M, N, K, dt, bshape)
     print("=== addmm: unaligned edge tiles (mpp_tensor VALIDATE path) ===")
-    # M%BM / N%BN != 0 routes interior tiles through the static store and the
-    # final row/col strip through the dynamic per-element edge store; exercise both
-    # with every bias broadcast so the epilogue index math is checked on partials.
     for dt in [torch.float32, torch.float16, torch.bfloat16]:
         for (M, N, K) in [(130, 100, 200), (257, 257, 257), (333, 444, 555)]:
             for bshape in [(M, N), (1, N), (M, 1), (N,), (1,), ()]:
                 check_addmm(M, N, K, dt, bshape)
     print("=== addmm: beta/alpha scaling ===")
-    # torch.addmm only accepts real beta/alpha (even for complex tensors).
     for dt in addmm_dtypes:
         for (beta, alpha) in [(2, 3), (0, 1), (1, 0), (0, 0)]:
             check_addmm(128, 96, 256, dt, (96,), beta=beta, alpha=alpha)
@@ -595,11 +531,9 @@ def main():
     for dt in [torch.float32, torch.float16, torch.bfloat16]:
         check_addmm_beta0_nan(128, 96, 256, dt)
 
-    # bmm / baddbmm: batched 3-D GEMM, matching torch.bmm / torch.baddbmm.
     bmm_dtypes = addmm_dtypes
     print("=== bmm (batched) ===")
     for dt in bmm_dtypes:
-        # square, thin-M/N, attention-shaped, many-small (launch regime), partial-edge.
         for (B, M, N, K) in [(8, 128, 128, 128), (32, 256, 256, 256), (4, 512, 512, 512),
                              (96, 512, 512, 64), (16, 64, 4096, 512), (128, 4096, 64, 256),
                              (512, 64, 64, 64), (2048, 64, 64, 32), (3, 130, 100, 200)]:
@@ -626,7 +560,6 @@ def main():
             for bshape in [(4, M, N), (N,), ()]:
                 check_baddbmm(4, M, N, K, dt, bshape)
 
-    # addbmm: 2-D C = beta*input + alpha*Σᵢ(b1[i]@b2[i]); batch REDUCED (vs baddbmm).
     print("=== addbmm (batch-reduced) ===")
     for dt in bmm_dtypes:
         B, M, N, K = 8, 128, 96, 256
@@ -639,8 +572,6 @@ def main():
         for (beta, alpha) in [(1, 1), (2, 3), (0, 1), (1, 0)]:
             check_addbmm(8, 128, 96, 256, dt, (96,), beta=beta, alpha=alpha)
 
-    # batched int/complex under load: exercise the single batched int_gemm launch and
-    # the batched complex baddbmm path at large B. Bit-exact (int) / relative (complex).
     print("=== batched int/complex (large B) ===")
     for dt in [torch.int8, torch.int32, torch.int64]:
         for (B, M, N, K) in [(256, 128, 128, 128), (512, 64, 64, 64)]:
@@ -649,27 +580,25 @@ def main():
     check_baddbmm(64, 256, 256, 128, torch.complex64, (256,))
     check_baddbmm(64, 256, 256, 128, torch.complex64, (64, 256, 256), beta=2, alpha=3)
 
-    # matmul N-D / 1-D: drop-in torch.matmul (1-D dot/promotion + batched broadcast).
     print("=== matmul N-D / 1-D ===")
     nd_dtypes = [torch.float32, torch.bfloat16, torch.float16,
                  torch.complex64, torch.int32, torch.int8, torch.int64]
     nd_cases = [
-        ((64,), (64,)),                       # 1-D @ 1-D -> scalar
-        ((32,), (32, 48)),                    # 1-D @ 2-D
-        ((40, 32), (32,)),                    # 2-D @ 1-D
-        ((32,), (8, 32, 48)),                 # 1-D @ 3-D
-        ((6, 40, 32), (32,)),                 # 3-D @ 1-D
-        ((8, 40, 32), (8, 32, 48)),           # (B,M,K)@(B,K,N)
-        ((8, 40, 32), (32, 48)),              # (B,M,K)@(K,N)
-        ((40, 32), (8, 32, 48)),              # (M,K)@(B,K,N)
-        ((2, 3, 40, 32), (2, 3, 32, 48)),     # 4-D @ 4-D
-        ((3, 1, 64, 32), (1, 5, 32, 48)),     # true broadcast -> (3,5,64,48)
+        ((64,), (64,)),
+        ((32,), (32, 48)),
+        ((40, 32), (32,)),
+        ((32,), (8, 32, 48)),
+        ((6, 40, 32), (32,)),
+        ((8, 40, 32), (8, 32, 48)),
+        ((8, 40, 32), (32, 48)),
+        ((40, 32), (8, 32, 48)),
+        ((2, 3, 40, 32), (2, 3, 32, 48)),
+        ((3, 1, 64, 32), (1, 5, 32, 48)),
     ]
     for dt in nd_dtypes:
         for (sa, sb) in nd_cases:
             check_matmul_nd(sa, sb, dt)
 
-    # vector ops (dot / vdot / outer / mv): drop-in torch.dot/vdot/outer/mv.
     print("=== vector ops (dot / vdot / outer / mv) ===")
     vec_dtypes = [torch.float32, torch.bfloat16, torch.float16,
                   torch.complex64, torch.complex32,
@@ -677,7 +606,7 @@ def main():
     for dt in vec_dtypes:
         for K in (4096, 7, 1):
             check_dot(K, dt)
-            check_vdot(K, dt)          # asserts conj-of-first for complex
+            check_vdot(K, dt)
         check_outer(128, 96, dt)
         check_mv(256, 512, dt)
 

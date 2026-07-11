@@ -1,4 +1,4 @@
-// mpp_tensor.h - matmul2d tensor-view GEMM - the primary backend.
+// Cooperative-tensor GEMM.
 #ifdef MB_BUILD_MPP_TENSOR
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -20,8 +20,6 @@ using namespace mpp::tensor_ops;
 #define MN_ALIGNED  __MN_ALIGNED__
 #define STATIC_SLICE __STATIC_SLICE__
 
-// BATCHED (bmm/baddbmm): grid z is the batch index; A/B/C (and the bias) are offset
-// by their per-matrix strides. Defaults to 0 so the 2-D build is unchanged.
 #ifndef BATCHED
 #define BATCHED 0
 #endif
@@ -31,14 +29,12 @@ using namespace mpp::tensor_ops;
 #define MB_BATCH_BUF 4
 #endif
 #if BATCHED && EPILOGUE
-#define MB_BBAT _bbat                      // per-batch bias base (baddbmm)
+#define MB_BBAT _bbat
 #else
 #define MB_BBAT 0
 #endif
 
-// Write the BM x BN tile from cT_f32 into cT_out (addmm epilogue when EPILOGUE); the
-// fragment index gives (col, row) so the broadcast bias lands right. VALIDATE skips
-// out-of-tile elements (partial edge / unaligned tiles).
+// Store a tile with an optional fused epilogue and edge validation.
 #if EPILOGUE
 #define MB_STORE_TILE(VALIDATE) do {                                              \
     _Pragma("unroll")                                                            \
@@ -95,7 +91,6 @@ kernel void mpp_tensor_gemm(
         matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<NSG>> op;
 
-    // Swizzle threadgroup ids for L2 reuse.
     int tiles_m = (gM + BM - 1) / BM;
     int tiles_n = (gN + BN - 1) / BN;
     int sw_mask = (1 << SWIZZLE_LOG) - 1;
@@ -107,11 +102,8 @@ kernel void mpp_tensor_gemm(
     int n_off = tgx * BN;
 
 #if STATIC_SLICE
-    // Non-transposed fast path: static-extent slices mark each interior tile exactly
-    // BM x BN and in-bounds, dropping dynamic-slice edge predication (still fp32 accum).
+    // Interior tiles use static extents; edge tiles use validated dynamic slices.
   #if !MN_ALIGNED
-    // Partial edge tiles (M%BM or N%BN != 0) fall back to a dynamic slice with
-    // the per-element validity mask; interior tiles take the static path below.
     bool inside = (m_off + BM <= gM) && (n_off + BN <= gN);
     if (!inside) {
         auto mA = tA.slice(0, m_off);

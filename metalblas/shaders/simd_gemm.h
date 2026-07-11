@@ -1,4 +1,4 @@
-// simd_gemm.h - Portable simdgroup_matrix<T,8,8> tiled GEMM (Metal 3; no tensor unit needed).
+// Portable simdgroup-matrix GEMM.
 #ifdef MB_BUILD_SIMD_GEMM
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -35,7 +35,6 @@ constant constexpr int PAD_B = 16 / sizeof(IN_T);
 constant constexpr int LDA_TGP = BK + PAD_A;
 constant constexpr int LDB_TGP = BN + PAD_B;
 
-// 16-byte load granularity: VEC chosen so VecF is always 16 bytes.
 constant constexpr int VEC = 16 / sizeof(IN_T);
 constant constexpr int A_TCOLS = BK / VEC;
 constant constexpr int A_ROW_STEP = TGP_SIZE / A_TCOLS;
@@ -149,7 +148,6 @@ static inline void load_B_tile(threadgroup IN_T   *Bs,
     }
 }
 
-// Dims + leading strides packed into one constant buffer (one setBytes, not six).
 struct MBGemmDims { int M, N, K, lda, ldb, ldc; };
 
 kernel void simd_gemm(
@@ -256,7 +254,6 @@ kernel void simd_gemm(
     }
 #endif
 
-    // (row, col) each lane owns within an 8x8 simdgroup_matrix.
     const short qid = lane / 4;
     const short fm  = (qid & 4) + ((lane / 2) % 4);
     const short fn  = (qid & 2) * 2 + (lane % 2) * 2;
@@ -268,8 +265,6 @@ kernel void simd_gemm(
             int row = m_block + warp_m + i * 8 + fm;
             int col = n_block + warp_n + j * 8 + fn;
 #if EPILOGUE
-            // addmm always takes the per-element path: the bulk simdgroup_store can't
-            // fold a per-(row,col) bias. The lane owns (row,col) and (row,col+1).
             ACC_T te0 = Cfrag[i][j].thread_elements()[0];
             ACC_T te1 = Cfrag[i][j].thread_elements()[1];
             int cc0 = col, cc1 = col + 1;

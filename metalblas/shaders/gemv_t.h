@@ -1,4 +1,4 @@
-// gemv_t.h - GEMV  y = x @ B  (B row-major); K split across simdgroups, tgroup reduce.
+// GEMV y = x @ B with a threadgroup K reduction.
 #ifdef MB_BUILD_GEMV_T
 #include <metal_stdlib>
 using namespace metal;
@@ -10,8 +10,6 @@ using namespace metal;
 #define NWARPS      __NWARPS__
 #define VEC         __VEC__
 
-// Bandwidth-bound GEMV (B is K x N row-major): y[n] = sum_k B[k,n]*x[k]. Lanes own
-// VEC cols (warp reads BLOCK_N=32*VEC, one coalesced line); NWARPS split K, reduce in tgmem.
 struct alignas(sizeof(IN_T) * VEC) VecT { IN_T v[VEC]; };
 
 kernel void gemv_t(
@@ -36,7 +34,6 @@ kernel void gemv_t(
     int col0 = int(tgid.x) * BLOCK_N;
     int n0   = col0 + int(lane) * VEC;     // first column this lane owns
 
-    // Distribute K across warps: warp sgid handles k in [start, end).
     int k_per_warp = (gK + NWARPS - 1) / NWARPS;
     int k_start    = int(sgid) * k_per_warp;
     int k_end      = min(gK, k_start + k_per_warp);
@@ -47,7 +44,6 @@ kernel void gemv_t(
 
     bool full = (n0 + VEC) <= gN;
     if (full) {
-        // Full-line path: one aligned VEC-wide load per k, 4x unrolled.
         int k = k_start;
         for (; k + 4 <= k_end; k += 4) {
             VecT b0 = *((const device VecT*)(&B[(k+0) * gLdb + n0]));
@@ -71,7 +67,6 @@ kernel void gemv_t(
             for (int i = 0; i < VEC; ++i) acc[i] += (ACC_T)bv.v[i] * xk;
         }
     } else {
-        // Edge block: scalar with per-column bounds for non-VEC-aligned N.
         for (int k = k_start; k < k_end; ++k) {
             ACC_T xk = (ACC_T)x[k*gXs];
             #pragma unroll
@@ -85,7 +80,6 @@ kernel void gemv_t(
     for (int i = 0; i < VEC; ++i) partials[sgid][int(lane) * VEC + i] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First warp aggregates partials; each lane writes its VEC columns.
     if (sgid == 0) {
         #pragma unroll
         for (int i = 0; i < VEC; ++i) {

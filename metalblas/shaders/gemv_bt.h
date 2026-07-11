@@ -1,5 +1,4 @@
-// gemv_bt.h - batched thin-M GEMV (Y = X @ B, M=2..16 rows): stream B once, keep MROWS
-// dot-products in registers. TRANS_B=col-major B; TRANS_A=col-major X; EPILOGUE=bias; BATCHED=bmm.
+// Thin-M GEMV: stream B once and keep MROWS dot products in registers.
 #ifdef MB_BUILD_GEMV_BT
 #include <metal_stdlib>
 using namespace metal;
@@ -33,7 +32,7 @@ using namespace metal;
 #define MB_BBAT 0
 #endif
 
-// X element (m,k): row-major X is m*ldx+k (k unit); col-major X (TRANS_A) is m+k*ldx (m unit).
+// X supports row- and column-major layouts.
 #if TRANS_A
 #define X_AT(m, k) X[(m) + (k) * gLdx]
 #define LOADX(dst, m, k) do { for (int _i = 0; _i < VEC; ++_i) (dst).v[_i] = X[(m) + ((k) + _i) * gLdx]; } while (0)
@@ -42,8 +41,6 @@ using namespace metal;
 #define LOADX(dst, m, k) do { (dst) = *((const device VecT_BT*)(&X[(m) * gLdx + (k)])); } while (0)
 #endif
 
-// Lanes own VEC cols (warp reads a BLOCK_N=32*VEC line); each lane keeps MROWS x VEC
-// accs. Picker caps MROWS*VEC (registers) and NWARPS*MROWS*VEC (partials tile < 32KB).
 struct alignas(sizeof(IN_T) * VEC) VecT_BT { IN_T v[VEC]; };
 struct MBGemvBtDims { int N, K, ldb, ldx, ldy; };
 
@@ -77,9 +74,7 @@ kernel void gemv_bt(
 #endif
 
 #if TRANS_B
-    // Column-major B (B's columns are K-contiguous, e.g. W.t() for W=(N,K) row-major):
-    // a warp reduces over K via simd_sum. NCOLS>1 owns NCOLS columns, loading each X-row
-    // once and reusing it across them (cuts the X re-read that bounds high-M decode).
+    // Column-major B: each warp reduces K for NCOLS output columns.
     const int KS = 32 * VEC;
 #if NCOLS == 1
     int n = int(tgid.x) * NWARPS + int(sgid);
@@ -189,7 +184,6 @@ kernel void gemv_bt(
     int col0 = int(tgid.x) * BLOCK_N;
     int n0   = col0 + int(lane) * VEC;        // first column this lane owns
 
-    // Distribute K across warps: warp sgid handles k in [k_start, k_end).
     int k_per_warp = (gK + NWARPS - 1) / NWARPS;
     int k_start    = int(sgid) * k_per_warp;
     int k_end      = min(gK, k_start + k_per_warp);
@@ -202,8 +196,6 @@ kernel void gemv_bt(
 
     bool full = (n0 + VEC) <= gN;
     if (full) {
-        // Full-line path: aligned VEC-wide B loads, 4x unrolled over k. Each B vector
-        // feeds all MROWS rows (one stream of B, MROWS MACs) -> bandwidth-bound on B.
         int k = k_start;
         for (; k + 4 <= k_end; k += 4) {
             VecT_BT b0 = *((const device VecT_BT*)(&B[(k+0) * gLdb + n0]));
@@ -233,7 +225,6 @@ kernel void gemv_bt(
             }
         }
     } else {
-        // Edge block: scalar with per-column bounds for non-VEC-aligned N.
         for (int k = k_start; k < k_end; ++k) {
             #pragma unroll
             for (int m = 0; m < MROWS; ++m) {
@@ -253,7 +244,6 @@ kernel void gemv_bt(
         for (int i = 0; i < VEC; ++i) partials[sgid][m][int(lane) * VEC + i] = acc[m][i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First warp aggregates the NWARPS K-partials and writes Y for every row.
     if (sgid == 0) {
         #pragma unroll
         for (int m = 0; m < MROWS; ++m) {

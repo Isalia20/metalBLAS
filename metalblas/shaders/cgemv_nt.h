@@ -1,6 +1,4 @@
-// cgemv_nt.h - complex GEMV  y = A @ x  (A is M x K row-major complex).
-// Each simdgroup owns one row; lanes stride K (coalesced C2 row loads) then simd_sum
-// the real and imag parts
+// Complex GEMV y = A @ x; each simdgroup reduces one matrix row.
 #ifdef MB_BUILD_CGEMV_NT
 #include <metal_stdlib>
 using namespace metal;

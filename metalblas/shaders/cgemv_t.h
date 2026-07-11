@@ -1,6 +1,4 @@
-// cgemv_t.h - complex GEMV  y = x @ B  (B is K x N row-major complex).
-// Reads B once as interleaved C2 (vs torch's ~3x matrix re-reads for complex), K
-// split across NWARPS simdgroups and reduced in threadgroup memory. Bandwidth-bound.
+// Complex GEMV y = x @ B with an interleaved matrix and a threadgroup K reduction.
 #ifdef MB_BUILD_CGEMV_T
 #include <metal_stdlib>
 using namespace metal;
@@ -34,7 +32,6 @@ kernel void cgemv_t(
     int col0 = int(tgid.x) * BLOCK_N;
     int n    = col0 + int(lane);              // column this lane owns
 
-    // Split K across the NWARPS simdgroups; warp sgid handles [k_start, k_end).
     int k_per_warp = (gK + NWARPS - 1) / NWARPS;
     int k_start    = int(sgid) * k_per_warp;
     int k_end      = min(gK, k_start + k_per_warp);
@@ -52,7 +49,6 @@ kernel void cgemv_t(
     partials[sgid][lane] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First warp sums the per-warp partials and writes its column.
     if (sgid == 0) {
         ACC2 s = ACC2(0);
         #pragma unroll

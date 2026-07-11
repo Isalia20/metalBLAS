@@ -1,9 +1,4 @@
-// mpp_sgpipe.h - thin-N GEMM from per-simdgroup matmul2d ops with register-staged A:
-// each SG loads its A K-chunk into the op's input cooperative tensor and runs against a
-// device B view. Streaming A through registers sidesteps the TG-scope op's under-
-// overlapped device staging (~23 -> ~24.3 TF at N=128 on M5 Pro). Single-buffered on
-// purpose: a second buffer (ping-pong), touch-prefetch, or a streamer SG all lose
-// (register cliff / issue-slot theft - see perf notes).
+// Thin-N GEMM with one register-staged matmul2d operation per simdgroup.
 #ifdef MB_BUILD_MPP_SGPIPE
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -24,8 +19,7 @@ using namespace mpp::tensor_ops;
 #define GM    __GM__      // 0: M from dims buffer; >0: baked
 #define GN    __GN__      // 0: N from dims buffer; >0: baked (folds B/C stride math)
 
-// Packed shapes only: caller guarantees M % (NSGY*SGM) == 0, N % (NSGX*SGN) == 0,
-// K % (2*KC) == 0. No threadgroup barriers - SGs run fully independently.
+// The caller supplies packed shapes divisible by the tile and 2*KC.
 kernel void sgpipe_gemm(
     device IN_T   *A   [[buffer(0)]],
     device IN_T   *B   [[buffer(1)]],

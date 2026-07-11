@@ -1,7 +1,4 @@
-// complex_pack.h - deinterleave/interleave helpers for the decomposed complex GEMM.
-// A complex GEMM C = A@B is computed as four real GEMMs on the real/imag planes;
-// these two kernels split the interleaved operands into contiguous real planes and
-// fuse the four products back into an interleaved complex result in a single pass.
+// Split and combine the real planes used by complex GEMM.
 #ifdef MB_BUILD_COMPLEX_PACK
 #include <metal_stdlib>
 using namespace metal;
@@ -9,8 +6,6 @@ using namespace metal;
 #define C2 __C2__   // interleaved complex element: float2 (complex64) / half2 (complex32)
 #define R  __R__    // real component scalar: float / half
 
-// Deinterleave src[i] = (re, im) into two contiguous real planes.
-// One thread per complex element; src is read once as a coalesced C2 load.
 kernel void complex_split(
     device const C2 *src [[buffer(0)]],
     device       R  *re  [[buffer(1)]],
@@ -24,10 +19,7 @@ kernel void complex_split(
     im[i] = v.y;
 }
 
-// Fold the four real products into one interleaved complex result:
-//   C = (ar@br - ai@bi) + i*(ar@bi + ai@br) = (P - Q) + i*(S + T).
-// Complex addmm folds beta*input + alpha*(.) into this pass; beta/alpha==0 are
-// compiled out (NaN-safe drop of that operand).
+// C = (P - Q) + i*(S + T), with an optional fused addmm epilogue.
 kernel void complex_combine(
     device const R  *P   [[buffer(0)]],   // ar @ br
     device const R  *Q   [[buffer(1)]],   // ai @ bi

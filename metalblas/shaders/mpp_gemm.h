@@ -1,4 +1,4 @@
-// mpp_gemm.h - Manual threadgroup-tiled GEMM over matmul2d 16x32x16 cooperative tensors.
+// Threadgroup-tiled cooperative-tensor GEMM.
 #ifdef MB_BUILD_MPP_GEMM
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -38,13 +38,10 @@ constant constexpr int FK   = 16;
 constant constexpr int TM   = WT_M / FM;
 constant constexpr int TN   = WT_N / FN;
 
-// Per-thread element counts per fragment (16x16=8, 16x32=16).
 constant constexpr int A_ELEM_PER_THR = (FM * FK) / 32;     // 8
 constant constexpr int B_ELEM_PER_THR = (FK * FN) / 32;     // 16
 constant constexpr int C_ELEM_PER_THR = (FM * FN) / 32;     // 16
 
-// PAD avoids threadgroup bank conflicts and keeps VecF loads 16-byte aligned.
-// __PAD__ comes from the Python wrapper; default is 16/sizeof(IN_T).
 constant constexpr int PAD_A = __PAD__;
 constant constexpr int PAD_B = __PAD__;
 constant constexpr int LDA_TGP = BK + PAD_A;
@@ -148,7 +145,6 @@ static inline void load_B_tile(threadgroup IN_T *Bs,
     }
 }
 
-// Dims + leading strides packed into one constant buffer (one setBytes, not six).
 struct MBGemmDims { int M, N, K, lda, ldb, ldc; };
 
 kernel void mpp_gemm(
@@ -168,7 +164,6 @@ kernel void mpp_gemm(
 {
     int gM = gP.M, gN = gP.N, gK = gP.K;
     int gLda = gP.lda, gLdb = gP.ldb, gLdc = gP.ldc;
-    // Double-buffered (NBUF=2) when DBUF==1, single buffer otherwise.
     threadgroup IN_T As[NBUF * BM * LDA_TGP];
     threadgroup IN_T Bs[NBUF * BK * LDB_TGP];
 
@@ -194,8 +189,7 @@ kernel void mpp_gemm(
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
 
-    // Pre-compute per-thread multidim index -> (row, col) maps once.
-    // get_multidimensional_index() returns [fastest, slowest], hence [k,m]/[n,k]/[n,m].
+    // Cooperative tensors index the fastest dimension first.
     short a_off[A_ELEM_PER_THR];   // idx_m * LDA_TGP + idx_k (within frag)
     short b_off[B_ELEM_PER_THR];
     short c_om[C_ELEM_PER_THR];    // row offset of each ct_c element
@@ -222,12 +216,10 @@ kernel void mpp_gemm(
         }
     }
 
-    // Per-thread accumulator storage.
     ACC_T Cacc[TM * TN * C_ELEM_PER_THR];
     #pragma unroll
     for (int i = 0; i < TM * TN * C_ELEM_PER_THR; ++i) Cacc[i] = (ACC_T)0;
 
-    // Input fragment storage for the inner K-iter, reused across i, j.
     IN_T Astg[TM * A_ELEM_PER_THR];
     IN_T Bstg[TN * B_ELEM_PER_THR];
 
@@ -235,7 +227,6 @@ kernel void mpp_gemm(
     int k_tail       = gK - k_tiles_full * BK;
 
 #if DBUF
-    // Double-buffered K-loop: issue the next K-tile's loads while the current MMA runs.
     if (k_tiles_full > 0) {
         load_A_tile(As, A, gLda, gM, gK, m_block, 0, tid, BK);
         load_B_tile(Bs, B, gLdb, gN, gK, 0, n_block, tid, BK);
@@ -309,7 +300,6 @@ kernel void mpp_gemm(
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk += FK) {
-            // Load all A fragments for this kk (TM of them).
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 int base_row = warp_m + i * FM;
@@ -319,7 +309,6 @@ kernel void mpp_gemm(
                     Astg[i * A_ELEM_PER_THR + e] = src[a_off[e]];
                 }
             }
-            // Load all B fragments for this kk (TN of them).
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
                 int base_col = warp_n + j * FN;
@@ -329,7 +318,6 @@ kernel void mpp_gemm(
                     Bstg[j * B_ELEM_PER_THR + e] = src[b_off[e]];
                 }
             }
-            // Outer-product MMA loop.
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 auto ct_a = op.get_left_input_cooperative_tensor<IN_T, IN_T, ACC_T>();
@@ -410,7 +398,6 @@ kernel void mpp_gemm(
     }
 #endif
 
-    // Store accumulators to C using the pre-computed (row, col) offsets.
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
         #pragma unroll

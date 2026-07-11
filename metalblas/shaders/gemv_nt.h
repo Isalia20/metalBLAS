@@ -1,4 +1,4 @@
-// gemv_nt.h - GEMV  y = A @ x  (A row-major); cache-line-wide coalesced row loads.
+// GEMV y = A @ x with coalesced row loads.
 #ifdef MB_BUILD_GEMV_NT
 #include <metal_stdlib>
 using namespace metal;
@@ -9,11 +9,8 @@ using namespace metal;
 #define ROWS_PER_SG __ROWS_PER_SG__
 #define NWARPS      __NWARPS__
 #define VEC         __VEC__
-// RED_TG=1 reduces per-warp partials via threadgroup mem (int64: no simd_sum(long)).
 #define RED_TG      __RED_TG__
 
-// y = A @ x (A is M x K row-major). Each warp does ROWS_PER_SG rows; lanes split K
-// then simd_sum, each reading VEC elements so a warp spans a full cache line.
 struct alignas(sizeof(IN_T) * VEC) VecT_NT { IN_T v[VEC]; };
 
 kernel void gemv_nt(
@@ -46,7 +43,6 @@ kernel void gemv_nt(
         const device IN_T *Arow = &A[row * gLda];
         ACC_T acc = (ACC_T)0;
         int k = int(lane) * VEC;
-        // 4-way unrolled; last per-lane read at k+3*K_STRIDE+(VEC-1) must be in range.
         for (; k + 3 * K_STRIDE + VEC <= gK; k += 4 * K_STRIDE) {
             VecT_NT a0 = *((const device VecT_NT*)(&Arow[k + 0 * K_STRIDE]));
             VecT_NT a1 = *((const device VecT_NT*)(&Arow[k + 1 * K_STRIDE]));
@@ -64,8 +60,6 @@ kernel void gemv_nt(
                 acc += (ACC_T)a3.v[i] * (ACC_T)x3.v[i];
             }
         }
-        // Single-stride tail: per-lane k+VEC<=gK keeps trailing lanes working when
-        // k+K_STRIDE would overrun gK (else lane 31 skips its last block at small K).
         for (; k + VEC <= gK; k += K_STRIDE) {
             VecT_NT av = *((const device VecT_NT*)(&Arow[k]));
             VecT_NT xv = *((const device VecT_NT*)(&x[k]));
@@ -73,7 +67,6 @@ kernel void gemv_nt(
             for (int i = 0; i < VEC; ++i)
                 acc += (ACC_T)av.v[i] * (ACC_T)xv.v[i];
         }
-        // Scalar tail for K % VEC != 0; only lane 0 runs it, simd_sum picks it up.
         if (lane == 0) {
             int kk = (gK / VEC) * VEC;
             for (; kk < gK; ++kk)

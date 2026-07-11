@@ -1,6 +1,4 @@
-// int_gemm.h - Register-tiled integer GEMM (no float-only simdgroup_matrix / tensor
-// unit): each thread owns a TM x TN micro-tile of plain integer MACs. Accumulate in
-// ACC_T (>= OUT_T), then truncate to OUT_T -> bit-exact vs torch's wrap-on-overflow.
+// Register-tiled integer GEMM with one TM x TN micro-tile per thread.
 #ifdef MB_BUILD_INT_GEMM
 #include <metal_stdlib>
 using namespace metal;
@@ -18,8 +16,6 @@ using namespace metal;
 
 #define TGP_SIZE (TX * TY)
 
-// BATCHED (bmm/baddbmm): grid z is the batch index; A/B/C (and bias) offset by their
-// per-matrix strides. Defaults to 0 so the 2-D build is byte-identical at runtime.
 #ifndef BATCHED
 #define BATCHED 0
 #endif
@@ -29,18 +25,17 @@ using namespace metal;
 #define MB_BATCH_BUF 4
 #endif
 #if BATCHED && EPILOGUE
-#define MB_BBAT _bbat                      // per-batch bias base (baddbmm)
+#define MB_BBAT _bbat
 #else
 #define MB_BBAT 0
 #endif
 
-constant constexpr int TM = BM / TY;   // rows each thread owns
-constant constexpr int TN = BN / TX;   // cols each thread owns
+constant constexpr int TM = BM / TY;
+constant constexpr int TN = BN / TX;
 
 static_assert(BM % TY == 0, "BM must be a multiple of TY");
 static_assert(BN % TX == 0, "BN must be a multiple of TX");
 
-// Dims + leading strides packed into one constant buffer (one setBytes).
 struct MBIntGemmDims { int M, N, K, lda, ldb, ldc; };
 
 kernel void int_gemm(
@@ -71,8 +66,7 @@ kernel void int_gemm(
     const int gM = gP.M, gN = gP.N, gK = gP.K;
     const int gLda = gP.lda, gLdb = gP.ldb, gLdc = gP.ldc;
 
-    // As transposed [BK][BM] (contiguous BM slab per k); Bs [BK][BN]. OOB loads
-    // zero-fill so the compute loop is branch-free over the full BK.
+    // A is transposed in threadgroup memory; out-of-bounds elements are zero.
     threadgroup IN_T As[BK * BM];
     threadgroup IN_T Bs[BK * BN];
 
@@ -95,7 +89,6 @@ kernel void int_gemm(
         const int k_base = kt * BK;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Cooperative load of the A tile into As[k*BM + m] (transposed).
         for (int pos = int(tid); pos < BM * BK; pos += TGP_SIZE) {
             int m = pos % BM;
             int k = pos / BM;
@@ -110,7 +103,6 @@ kernel void int_gemm(
 #endif
             As[k * BM + m] = v;
         }
-        // Cooperative load of the B tile into Bs[k*BN + n].
         for (int pos = int(tid); pos < BK * BN; pos += TGP_SIZE) {
             int n = pos % BN;
             int k = pos / BN;
