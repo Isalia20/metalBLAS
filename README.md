@@ -3,8 +3,6 @@
 </p>
 
 Metal matmul kernels for Apple Silicon, exposed as PyTorch operations on `mps`.
-Kernels are compiled on demand with `torch.mps.compile_shader`, so metalBLAS
-requires PyTorch 2.12 or newer and an MPS device.
 
 ## Usage
 
