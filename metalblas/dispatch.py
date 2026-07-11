@@ -1,6 +1,7 @@
 """PyTorch-facing dispatch for the Metal kernels."""
 from __future__ import annotations
 
+from math import prod
 import os
 import sys
 import time
@@ -252,12 +253,9 @@ def _is_splitk_regime(M, N, K, dtype):
 
 
 def _splitk_specs(M, N, K):
-    specs = []
-    for (BM, BN, NSG) in [(128, 32, 2), (64, 64, 2), (32, 64, 2)]:
-        for G in (2, 4):
-            if K % G == 0 and (K // G) % 16 == 0:
-                specs.append((BM, BN, NSG, G))
-    return specs
+    return [(BM, BN, NSG, G)
+            for BM, BN, NSG in ((128, 32, 2), (64, 64, 2), (32, 64, 2))
+            for G in (2, 4) if K % G == 0 and (K // G) % 16 == 0]
 
 
 class _LaunchPlan:
@@ -286,12 +284,8 @@ def _is_conv_regime(M, N, K, dtype):
 
 
 def _conv_specs(M, N, K):
-    specs = []
-    for BMW in (16, 32, 48, 64, 96, 128):
-        if M % BMW == 0:
-            for NSG in (2, 4):
-                specs.append((BMW, N, NSG))
-    return specs
+    return [(BMW, N, NSG) for BMW in (16, 32, 48, 64, 96, 128)
+            if M % BMW == 0 for NSG in (2, 4)]
 
 
 def _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK=0):
@@ -327,13 +321,8 @@ def _sgpipe_specs(M, N, K):
     else:   # N in (8, 16, 32)
         cands = [(16, N, 64, 1, 2), (32, N, 64, 1, 2),
                  (16, N, 64, 1, 4), (32, N, 64, 1, 1)]
-    specs = []
-    for s in cands:
-        if M % (s[4] * s[0]) == 0:
-            if K <= 8192:
-                specs.append(s + (K,))
-            specs.append(s + (0,))
-    return specs
+    return [spec + (gk,) for spec in cands if M % (spec[4] * spec[0]) == 0
+            for gk in ((K, 0) if K <= 8192 else (0,))]
 
 
 def _flipt_specs(M, N, K, a):
@@ -393,16 +382,9 @@ def _gemv_bt_specs(M, N, K, dtype, align, trans_b=False):
         v = 8 if K >= 2048 else (4 if K >= 512 else 2)
         while v > 1 and (align % v):
             v >>= 1
-        ncol_opts = [1]
-        if M >= 6:
-            for nc in (2, 4):
-                if M * nc <= 48:
-                    ncol_opts.append(nc)
-        specs = []
-        for nc in ncol_opts:
-            for nw in ((8, 4) if nc == 1 else (8,)):
-                specs.append((v, nw, nc))
-        return specs
+        ncol_opts = [1] + ([nc for nc in (2, 4) if M * nc <= 48] if M >= 6 else [])
+        return [(v, nw, nc) for nc in ncol_opts
+                for nw in ((8, 4) if nc == 1 else (8,))]
     nat = 4 if N >= 4096 else (2 if N >= 256 else 1)
     vecs = []
     for v0 in (nat, 1):
@@ -481,6 +463,24 @@ def _probe_params(M, N, K):
     return 2, 3, 3
 
 
+def _fastest(runs, warmup, iters, reps, margin):
+    """Return the fastest run, keeping the default unless a rival clears margin."""
+    for run in runs:
+        for _ in range(warmup):
+            run()
+    torch.mps.synchronize()
+    times = [float("inf")] * len(runs)
+    for _ in range(reps):
+        for i, run in enumerate(runs):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                run()
+            torch.mps.synchronize()
+            times[i] = min(times[i], (time.perf_counter() - t0) / iters)
+    best = min(range(len(times)), key=times.__getitem__)
+    return best if best and times[best] < times[0] * (1.0 - margin) else 0
+
+
 def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_specs=(),
                   conv_specs=(), bt_specs=(), flip_specs=(), sgp_specs=()):
     """Return the first candidate or one that beats it by ``margin``."""
@@ -512,40 +512,18 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
             if (o - ref).abs().max().item() <= 0.02 * scale:
                 candidates.append((plan, plan.run, label))
 
-        for (SGM, SGN, KC, NSGX, NSGY, GK) in sgp_specs:
-            plan = _build_sgpipe_plan(dtype, M, N, K, SGM, SGN, KC, NSGX, NSGY, GK)
-            accept(plan, (SGM, SGN, KC, NSGX, NSGY, GK, "sgp"))
-        for (BM, BN, NSG, KC, PFD) in flip_specs:
-            plan = _build_flipt_plan(dtype, M, N, K, BM, BN, NSG, KC, PFD)
-            accept(plan, (BM, BN, NSG, KC, PFD, "flip"))
-        for (vec, nwarps) in bt_specs:
-            plan = _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps)
-            accept(plan, (vec, nwarps, 0, "bt"))
-        for (BM, BN, NSG, G) in sk_specs:
-            plan = _build_splitk_plan(dtype, M, N, K, BM, BN, NSG, G)
-            accept(plan, (BM, BN, NSG, G))
-        for (BMW, BNO, NSG) in conv_specs:
-            plan = _build_conv_plan(dtype, M, N, K, BMW, BNO, NSG)
-            accept(plan, (BMW, BNO, NSG, "conv"))
+        families = ((sgp_specs, _build_sgpipe_plan, "sgp"),
+                    (flip_specs, _build_flipt_plan, "flip"),
+                    (bt_specs, _build_gemv_bt_plan, "bt"),
+                    (sk_specs, _build_splitk_plan, None),
+                    (conv_specs, _build_conv_plan, "conv"))
+        for specs, build, tag in families:
+            for spec in specs:
+                accept(build(dtype, M, N, K, *spec), (*spec, tag) if tag else spec)
 
-    for (_, run, _) in candidates:
-        for _ in range(warmup):
-            run(a, b, o)
-    torch.mps.synchronize()
-
-    times = [float("inf")] * len(candidates)
-    for _ in range(reps):
-        for j, (_, run, _) in enumerate(candidates):
-            t0 = time.perf_counter()
-            for _ in range(iters):
-                run(a, b, o)
-            torch.mps.synchronize()
-            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
-
-    i = min(range(len(times)), key=lambda j: times[j])
-    if i != 0 and times[i] < times[0] * (1.0 - margin):
-        return candidates[i][0], candidates[i][2]
-    return candidates[0][0], candidates[0][2]
+    i = _fastest([lambda run=run: run(a, b, o) for _, run, _ in candidates],
+                 warmup, iters, reps, margin)
+    return candidates[i][0], candidates[i][2]
 
 
 def _gemm_plan(dtype, M, N, K, a=None, b=None):
@@ -609,20 +587,9 @@ def _autotune_trans(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
         torch.mps.synchronize()
         if (o - ref).abs().max().item() <= 0.02 * scale:
             cand.append((plan, (vec, nwarps, ncols, "bt_tr")))
-    for (p, _) in cand:
-        for _ in range(warmup):
-            p.run(a, b, o)
-    torch.mps.synchronize()
-    times = [float("inf")] * len(cand)
-    for _ in range(reps):
-        for j, (p, _) in enumerate(cand):
-            t0 = time.perf_counter()
-            for _ in range(iters):
-                p.run(a, b, o)
-            torch.mps.synchronize()
-            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
-    i = min(range(len(times)), key=lambda j: times[j])
-    return cand[i] if (i != 0 and times[i] < times[0] * (1.0 - _AUTOTUNE_MARGIN)) else cand[0]
+    i = _fastest([lambda p=p: p.run(a, b, o) for p, _ in cand],
+                 warmup, iters, reps, _AUTOTUNE_MARGIN)
+    return cand[i]
 
 
 def _gemm_trans_plan(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
@@ -648,12 +615,17 @@ _GEMV_BT_TB_MAX_N_BMM = 16384
 
 def _unit_lead(t, d0, d1):
     """Return ``(is_column_major, leading_stride)`` for a simple 2-D view."""
-    s0, s1 = int(t.stride(0)), int(t.stride(1))
+    s0, s1 = int(t.stride(-2)), int(t.stride(-1))
     if s1 == 1 and s0 >= d1:
         return (False, s0)
     if s0 == 1 and s1 >= d0:
         return (True, s1)
     return None
+
+
+def _matrix_view(t, rows, cols):
+    layout = _unit_lead(t, rows, cols)
+    return (t, *layout) if layout else (t.contiguous(), False, cols)
 
 
 def _thin_trans_layout(a, b, M, N, K, dtype):
@@ -868,6 +840,11 @@ def _round_swizzle_log(tiles_m: int, tiles_n: int) -> int:
     return 2
 
 
+def _swizzled_grid(tiles_m, tiles_n, group, log):
+    factor = 1 << log
+    return (group * tiles_n * factor, (tiles_m + factor - 1) // factor, 1)
+
+
 def _resolve_inputs(a: torch.Tensor, b: torch.Tensor):
     """Return (A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b) describing
     how the kernel reads the original memory, avoiding materialized copies."""
@@ -876,68 +853,91 @@ def _resolve_inputs(a: torch.Tensor, b: torch.Tensor):
     K2, N = b.shape
     assert K == K2, f"shape mismatch: A is {a.shape}, B is {b.shape}"
 
-    sa = a.stride()
-    sb = b.stride()
+    sa, sb = a.stride(), b.stride()
     if sa[1] == 1 and sa[0] >= K:
-        trans_a = False
-        lda = sa[0]
-        A_view = a
+        A_view, trans_a, lda = a, False, sa[0]
     elif sa[0] == 1 and sa[1] >= M:
-        trans_a = True
-        lda = sa[1]
-        A_view = a
+        A_view, trans_a, lda = a, True, sa[1]
     else:
-        A_view = a.contiguous()
-        trans_a = False
-        lda = K
-
+        A_view, trans_a, lda = a.contiguous(), False, K
     if sb[1] == 1 and sb[0] >= N:
-        trans_b = False
-        ldb = sb[0]
-        B_view = b
+        B_view, trans_b, ldb = b, False, sb[0]
     elif sb[0] == 1 and sb[1] >= K:
-        trans_b = True
-        ldb = sb[1]
-        B_view = b
+        B_view, trans_b, ldb = b, True, sb[1]
     else:
-        B_view = b.contiguous()
-        trans_b = False
-        ldb = N
+        B_view, trans_b, ldb = b.contiguous(), False, N
     return A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b
 
 
-_CGEMV_HANDLES: dict = {}
 _CGEMV_T_NWARPS = 8
 _CGEMV_NT_NWARPS = 4
 
 
 # Complex and integer dispatch
 
-def _cgemv_handles(cdt):
-    h = _CGEMV_HANDLES.get(cdt)
-    if h is None:
-        c2, r = _COMPLEX[cdt]
-        t, _ = kernels.cgemv_t(c2, "float2", r, 32, _CGEMV_T_NWARPS)
-        nt, _ = kernels.cgemv_nt(c2, "float2", r, _CGEMV_NT_NWARPS)
-        split, combine = kernels.complex_pack(c2, r)
-        h = {"t": t, "nt": nt, "split": split, "combine": combine}
-        _CGEMV_HANDLES[cdt] = h
-    return h
+def _complex_inputs(a, b):
+    dtype = a.dtype if a.dtype in _COMPLEX else b.dtype
+    a = a.to(dtype) if a.dtype != dtype else a
+    b = b.to(dtype) if b.dtype != dtype else b
+    return (a.resolve_conj() if a.is_conj() else a,
+            b.resolve_conj() if b.is_conj() else b, dtype)
+
+
+def _run_complex_gemv(a, b, out=None, epilogue=None):
+    M, K = a.shape
+    N = b.shape[1]
+    t = (M == 1 and N >= 1 and a.is_contiguous()
+         and b.is_contiguous() and b.stride(0) == N)
+    nt = (N == 1 and M >= 1 and a.is_contiguous()
+          and b.is_contiguous() and a.stride(0) == K)
+    if not (t or nt):
+        return None
+    fused = epilogue is not None
+    c2, real_t = _COMPLEX[a.dtype]
+    if fused:
+        bias, br, bc, beta, alpha, bnz, anz = epilogue
+    if t:
+        fn = kernels.cgemv_t(c2, "float2", real_t, 32, _CGEMV_T_NWARPS,
+                             epilogue=fused, beta_nz=bnz if fused else True,
+                             alpha_nz=anz if fused else True)[0]
+        out = out if out is not None else a.new_empty(1, N)
+        args = (b, a.view(-1), out.view(-1), _pk(N, K, N, 1))
+        size, step, nw = N, bc if fused else 0, _CGEMV_T_NWARPS
+    else:
+        fn = kernels.cgemv_nt(c2, "float2", real_t, _CGEMV_NT_NWARPS,
+                              epilogue=fused, beta_nz=bnz if fused else True,
+                              alpha_nz=anz if fused else True)[0]
+        out = out if out is not None else a.new_empty(M, 1)
+        args = (a, b.view(-1), out.view(-1), _pk(M, K, K, 1))
+        size, step, nw = M, br if fused else 0, _CGEMV_NT_NWARPS
+    if fused:
+        args += (bias, int(step), float(beta.real), float(beta.imag),
+                 float(alpha.real), float(alpha.imag))
+    groups = (size + (31 if t else nw - 1)) // (32 if t else nw)
+    fn(*args, threads=(nw * 32 * groups, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
+
+
+def _complex_products(a, b, product):
+    """Split two complex tensors and form the four real matrix products."""
+    c2, real_t = _COMPLEX[a.dtype]
+    split, _ = kernels.complex_pack(c2, real_t)
+    parts = []
+    for z in (a, b):
+        real = torch.empty(z.shape, dtype=_COMPLEX_REAL[a.dtype], device=z.device)
+        imag = torch.empty_like(real)
+        n = z.numel()
+        split(z, real, imag, n, threads=(n, 1, 1), group_size=(256, 1, 1))
+        parts.extend((real, imag))
+    ar, ai, br, bi = parts
+    return (product(ar, br), product(ai, bi), product(ar, bi), product(ai, br)), c2, real_t
 
 
 def _complex_matmul(a: torch.Tensor, b: torch.Tensor,
                     out: torch.Tensor | None = None) -> torch.Tensor:
     """Complex C = A @ B: native interleaved-complex GEMV for M==1 / N==1, else
     four real products (ar@br - ai@bi) + i(ar@bi + ai@br) on the tuned backend."""
-    cdt = a.dtype if a.dtype in _COMPLEX else b.dtype
-    if a.dtype != cdt:
-        a = a.to(cdt)
-    if b.dtype != cdt:
-        b = b.to(cdt)
-    if a.is_conj():
-        a = a.resolve_conj()
-    if b.is_conj():
-        b = b.resolve_conj()
+    a, b, cdt = _complex_inputs(a, b)
     assert a.device.type == "mps" and b.device.type == "mps"
     assert a.dim() == 2 and b.dim() == 2, "complex matmul currently expects 2-D inputs"
     M, K = a.shape
@@ -946,43 +946,16 @@ def _complex_matmul(a: torch.Tensor, b: torch.Tensor,
     if out is not None:
         assert out.shape == (M, N) and out.dtype == cdt and out.device.type == "mps", \
             f"out must be ({M}, {N}) {cdt} on mps"
-    h = _cgemv_handles(cdt)
+    gemv = _run_complex_gemv(a, b, out)
+    if gemv is not None:
+        return gemv
 
-    if M == 1 and a.is_contiguous() and b.is_contiguous() and b.stride(0) == N and N >= 1:
-        if out is None:
-            out = torch.empty(1, N, dtype=cdt, device=a.device)
-        ng = (N + 31) // 32
-        h["t"](b, a.view(-1), out.view(-1), _pk(N, K, N, 1),
-               threads=(_CGEMV_T_NWARPS * 32 * ng, 1, 1),
-               group_size=(_CGEMV_T_NWARPS * 32, 1, 1))
-        return out
-    if N == 1 and a.is_contiguous() and b.is_contiguous() and a.stride(0) == K and M >= 1:
-        if out is None:
-            out = torch.empty(M, 1, dtype=cdt, device=a.device)
-        ng = (M + _CGEMV_NT_NWARPS - 1) // _CGEMV_NT_NWARPS
-        h["nt"](a, b.view(-1), out.view(-1), _pk(M, K, K, 1),
-                threads=(_CGEMV_NT_NWARPS * 32 * ng, 1, 1),
-                group_size=(_CGEMV_NT_NWARPS * 32, 1, 1))
-        return out
-
-    a = a.contiguous()
-    b = b.contiguous()
-    rdt = _COMPLEX_REAL[cdt]
-    ar = torch.empty(M, K, dtype=rdt, device=a.device)
-    ai = torch.empty(M, K, dtype=rdt, device=a.device)
-    br = torch.empty(K, N, dtype=rdt, device=b.device)
-    bi = torch.empty(K, N, dtype=rdt, device=b.device)
-    nA, nB = M * K, K * N
-    h["split"](a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
-    h["split"](b, br, bi, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
-    P = matmul(ar, br)
-    Q = matmul(ai, bi)
-    S = matmul(ar, bi)
-    T = matmul(ai, br)
+    products, _, _ = _complex_products(a.contiguous(), b.contiguous(), matmul)
     if out is None:
         out = torch.empty(M, N, dtype=cdt, device=a.device)
     nC = M * N
-    h["combine"](P, Q, S, T, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
+    combine = kernels.complex_pack(*_COMPLEX[cdt])[1]
+    combine(*products, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
     return out
 
 
@@ -1030,28 +1003,6 @@ def _pick_int_tile(M: int, N: int, K: int, dtype: torch.dtype) -> tuple[int, int
     return (64, 64, 16, 16, 16)
 
 
-def _int_gemv_t(dtype, matrix, x_vec, xs, out, cols, k, ld):
-    in_t, acc_t, out_t = _INT_PROFILE[dtype]
-    vec, nw = _IGEMV_T_CFG[dtype]
-    vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
-    fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec)
-    ng = (cols + 32 * vec - 1) // (32 * vec)
-    fn(matrix, x_vec, out.view(-1), _pk(cols, k, ld, int(xs)),
-       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
-    return out
-
-
-def _int_gemv_nt(dtype, matrix, x_vec, out, rows, k, ld):
-    in_t, acc_t, out_t = _INT_PROFILE[dtype]
-    vec, nw = _IGEMV_NT_CFG[dtype]
-    vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
-    fn, _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, nw, vec, red_tg=(dtype is torch.int64))
-    ng = (rows + nw - 1) // nw
-    fn(matrix, x_vec, out.view(-1), _pk(rows, k, ld),
-       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
-    return out
-
-
 def _int_matmul(a: torch.Tensor, b: torch.Tensor,
                 out: torch.Tensor | None = None) -> torch.Tensor:
     """Integer C = A @ B: native GEMV for rank-1 (M==1 / N==1), else a register-tiled
@@ -1069,15 +1020,15 @@ def _int_matmul(a: torch.Tensor, b: torch.Tensor,
     if M == 1 and N >= 16:
         if not trans_b:
             xv = A_view.reshape(-1)
-            return _int_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, ldb)
+            return _run_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, ldb)
         xv = A_view.reshape(-1).contiguous()
-        return _int_gemv_nt(dtype, B_view, xv, out, N, K, ldb)
+        return _run_gemv_nt(dtype, B_view, xv, out, N, K, ldb)
     elif N == 1 and M >= 16:
         if trans_a:
             xv = B_view.reshape(-1)
-            return _int_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, lda)
+            return _run_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, lda)
         xv = B_view.reshape(-1).contiguous()
-        return _int_gemv_nt(dtype, A_view, xv, out, M, K, lda)
+        return _run_gemv_nt(dtype, A_view, xv, out, M, K, lda)
 
     in_t, acc_t, out_t = _INT_PROFILE[dtype]
     BM, BN, BK, TX, TY = _pick_int_tile(int(M), int(N), int(K), dtype)
@@ -1093,37 +1044,28 @@ def _int_matmul(a: torch.Tensor, b: torch.Tensor,
 def _matmul_nd(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Full torch.matmul for non-2-D operands: 1-D dot/promotion and batched
     broadcasting, built on the 2-D `matmul` and 3-D `bmm` kernels."""
-    da, db = a.ndim, b.ndim
-    assert da >= 1 and db >= 1, "matmul operands must be at least 1-D"
-
-    if da == 1 and db == 1:
-        assert a.shape[0] == b.shape[0], f"size mismatch: {a.shape} @ {b.shape}"
-        r = matmul(a.reshape(1, -1), b.reshape(-1, 1)).reshape(())
-        return out.copy_(r) if out is not None else r
-
-    if da == 1:
-        r = _matmul_nd(a.unsqueeze(0), b)
-        r = r.squeeze(-2)
-        return out.copy_(r) if out is not None else r
-
-    if db == 1:
-        r = _matmul_nd(a, b.unsqueeze(-1))
-        r = r.squeeze(-1)
-        return out.copy_(r) if out is not None else r
+    assert a.ndim and b.ndim, "matmul operands must be at least 1-D"
+    a_vec, b_vec = a.ndim == 1, b.ndim == 1
+    if a_vec:
+        a = a.unsqueeze(0)
+    if b_vec:
+        b = b.unsqueeze(-1)
 
     M, K = a.shape[-2], a.shape[-1]
     K2, N = b.shape[-2], b.shape[-1]
     assert K == K2, f"shape mismatch: A is {a.shape}, B is {b.shape}"
     batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
-    if not batch:                        # no batch (incl. 1-D-promoted mv/vec): tuned 2-D path
+    if not batch:
         r = matmul(a, b)
-        return out.copy_(r) if out is not None else r
-    B = 1
-    for d in batch:
-        B *= d
-    a3 = a.expand(*batch, M, K).reshape(B, M, K)
-    b3 = b.expand(*batch, K, N).reshape(B, K, N)
-    r = bmm(a3, b3).reshape(*batch, M, N)
+    else:
+        B = prod(batch)
+        a3 = a.expand(*batch, M, K).reshape(B, M, K)
+        b3 = b.expand(*batch, K, N).reshape(B, K, N)
+        r = bmm(a3, b3).reshape(*batch, M, N)
+    if a_vec:
+        r = r.squeeze(-2)
+    if b_vec:
+        r = r.squeeze(-1)
     return out.copy_(r) if out is not None else r
 
 
@@ -1148,42 +1090,26 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
         return _int_matmul(a, b, out=out)
 
     fast_path = backend is None and out is None and swizzle_log is None and a.is_mps
-    sa = a.shape
-    if sa[0] == 1 and fast_path:
-        dtype = a.dtype
-        sb = b.shape
-        N = sb[1]
-        K = sa[1]
-        if (dtype in _PROFILE and N >= 16 and sb[0] == K
-                and a.is_contiguous() and b.is_contiguous()):
+    M, K = a.shape
+    K2, N = b.shape
+    dtype = a.dtype
+    if fast_path and dtype in _PROFILE and K == K2:
+        packed = a.is_contiguous() and b.is_contiguous()
+        if packed and M == 1 and N >= 16:
             gt, thr, grp, dims = _gemv_plan(dtype, N, K)
             o = _pooled_out(b, 1, N)
             gt(b, a, o, dims, threads=thr, group_size=grp)
             return o
-
-    if b.shape[1] == 1 and fast_path and sa[0] > 1:
-        dtype = a.dtype
-        M = sa[0]
-        K = sa[1]
-        if (dtype in _PROFILE and M >= 16 and b.shape[0] == K
-                and a.is_contiguous() and b.is_contiguous()):
+        if packed and N == 1 and M >= 16:
             fn, grp, k_hi, k_lda = _gemv_nt_plan(dtype, K)
             o = _pooled_out(a, M, 1)
             n_groups = (M + 3) // 4
             fn(a, b.view(-1), o.view(-1), [M | k_hi, k_lda],
                threads=(grp[0] * n_groups, 1, 1), group_size=grp)
             return o
-
-    if fast_path:
-        M = sa[0]
-        K = sa[1]
-        sb = b.shape
-        N = sb[1]
-        dtype = a.dtype
-        if (M >= 2 and K >= 64 and sb[0] == K and dtype in _PROFILE
-                and (N >= 32 or _is_sgpipe_regime(M, N, K, dtype))
-                and a.is_contiguous() and b.is_contiguous()
-                and kernels.has_metal4()):
+        m4 = kernels.has_metal4()
+        if (m4 and packed and M >= 2 and K >= 64
+                and (N >= 32 or _is_sgpipe_regime(M, N, K, dtype))):
             plan = _gemm_plan(dtype, M, N, K, a, b)
             o = _pooled_out(a, M, N)
             if type(plan) is tuple:
@@ -1192,13 +1118,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             else:
                 plan.run(a, b, o)
             return o
-
-    if fast_path:
-        M = sa[0]
-        K = sa[1]
-        N = b.shape[1]
-        dtype = a.dtype
-        if b.shape[0] == K and dtype in _PROFILE and kernels.has_metal4():
+        if m4:
             lay = _thin_trans_layout(a, b, M, N, K, dtype)
             if lay is not None:
                 trans_a, trans_b, lda, ldb = lay
@@ -1248,24 +1168,6 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
     if backend == "gemv":
         return _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, out)
 
-    if backend == "simd":
-        BM, BN, BK, WM, WN = tile if tile else _pick_simd_tile(M_, N_, K_, dtype)
-        mn_aligned = (M_ % BM == 0) and (N_ % BN == 0)
-        k_aligned = K_ % BK == 0
-        tiles_m = (M_ + BM - 1) // BM
-        tiles_n = (N_ + BN - 1) // BN
-        swz = swizzle_log if swizzle_log is not None else _round_swizzle_log(tiles_m, tiles_n)
-        fn, _ = kernels.simd_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
-                                  trans_a, trans_b, mn_aligned, k_aligned, swz)
-        group_size = (WM * WN * 32, 1, 1)
-        tile_factor = 1 << swz
-        tn_swz = tiles_n * tile_factor
-        tm_swz = (tiles_m + tile_factor - 1) // tile_factor
-        total = (group_size[0] * tn_swz, tm_swz, 1)
-        fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
-           threads=total, group_size=group_size)
-        return out
-
     if backend == "mpp_tensor":
         if tile is None:
             BM, BN, NSG = _pick_mpp_tensor_tile(M_, N_, K_, dtype)
@@ -1281,124 +1183,121 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *,
             relaxed=True, swizzle_log=swz, mn_aligned=mn_aligned,
         )
         group_size = (NSG * 32, 1, 1)
-        tile_factor = 1 << swz
-        tn_swz = tiles_n * tile_factor
-        tm_swz = (tiles_m + tile_factor - 1) // tile_factor
-        total = (group_size[0] * tn_swz, tm_swz, 1)
         fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
-           threads=total, group_size=group_size)
+           threads=_swizzled_grid(tiles_m, tiles_n, group_size[0], swz),
+           group_size=group_size)
         return out
 
-    if backend == "mpp":
+    if backend in ("simd", "mpp"):
         pad = None
-        if tile is None:
-            BM, BN, BK, WM, WN, dbuf = _pick_mpp_tile(M_, N_, K_, dtype)
-        elif len(tile) == 7:
-            BM, BN, BK, WM, WN, dbuf, pad = tile
-        elif len(tile) == 6:
-            BM, BN, BK, WM, WN, dbuf = tile
+        if backend == "simd":
+            BM, BN, BK, WM, WN = tile if tile else _pick_simd_tile(M_, N_, K_, dtype)
         else:
-            BM, BN, BK, WM, WN = tile
-            dbuf = False
+            if tile is None:
+                BM, BN, BK, WM, WN, dbuf = _pick_mpp_tile(M_, N_, K_, dtype)
+            elif len(tile) == 7:
+                BM, BN, BK, WM, WN, dbuf, pad = tile
+            elif len(tile) == 6:
+                BM, BN, BK, WM, WN, dbuf = tile
+            else:
+                BM, BN, BK, WM, WN = tile
+                dbuf = False
         mn_aligned = (M_ % BM == 0) and (N_ % BN == 0)
         k_aligned = K_ % BK == 0
         tiles_m = (M_ + BM - 1) // BM
         tiles_n = (N_ + BN - 1) // BN
         swz = swizzle_log if swizzle_log is not None else _round_swizzle_log(tiles_m, tiles_n)
-        fn, _ = kernels.mpp_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
-                                 trans_a, trans_b, mn_aligned, k_aligned,
-                                 relaxed=True, swizzle_log=swz, dbuf=dbuf, pad=pad)
+        if backend == "simd":
+            fn, _ = kernels.simd_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
+                                      trans_a, trans_b, mn_aligned, k_aligned, swz)
+        else:
+            fn, _ = kernels.mpp_gemm(in_t, acc_t, out_t, BM, BN, BK, WM, WN,
+                                     trans_a, trans_b, mn_aligned, k_aligned,
+                                     relaxed=True, swizzle_log=swz, dbuf=dbuf, pad=pad)
         group_size = (WM * WN * 32, 1, 1)
-        tile_factor = 1 << swz
-        tn_swz = tiles_n * tile_factor
-        tm_swz = (tiles_m + tile_factor - 1) // tile_factor
-        total = (group_size[0] * tn_swz, tm_swz, 1)
         fn(A_view, B_view, out, _pk(M_, N_, K_, lda_, ldb_, ldc_),
-           threads=total, group_size=group_size)
+           threads=_swizzled_grid(tiles_m, tiles_n, group_size[0], swz),
+           group_size=group_size)
         return out
 
     raise ValueError(f"unknown backend {backend}")
 
 
-def _gemv_nt(nt_dict, matrix, vec, out_v, rows, k, ld):
-    n_groups = (rows + 3) // 4
-    fn = _gemv_nt_pick(nt_dict, rows, k, ld, matrix.storage_offset())
-    fn(matrix, vec, out_v, _pk(rows, k, ld),
-       threads=(128 * n_groups, 1, 1), group_size=(128, 1, 1))
+def _run_gemv_t(dtype, matrix, x, xs, out, cols, k, ld, epilogue=None):
+    fused = epilogue is not None
+    if dtype in _INT_PROFILE:
+        profile = _INT_PROFILE[dtype]
+        vec, nw = _IGEMV_T_CFG[dtype]
+        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+        fn = None
+    else:
+        profile = _PROFILE[dtype]
+        fn, tg, vec = _gemv_pick(_gemv_handles(dtype), cols,
+                                 int(ld) | matrix.storage_offset(), dtype, k=int(k))
+        nw = tg // 32
+    if fused or fn is None:
+        bnz, anz = epilogue[-2:] if fused else (True, True)
+        fn = kernels.gemv_t(*profile, 32 * vec, nw, vec,
+                            epilogue=fused, beta_nz=bnz, alpha_nz=anz)[0]
+    dims = _pk(cols, k, ld, int(xs))
+    ng = (cols + 32 * vec - 1) // (32 * vec)
+    if fused:
+        bias, step, beta, alpha, _, _ = epilogue
+        fn(matrix, x, out.view(-1), dims, bias, int(step), beta, alpha,
+           threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    else:
+        fn(matrix, x, out.view(-1), dims,
+           threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
 
 
-def _gemv_t(gh, matrix, x_vec, xs, out_v, cols, k, ld, dtype):
-    align = int(ld) | int(matrix.storage_offset())
-    gt, tg, vec = _gemv_pick(gh, cols, align, dtype, vec_ok=True, k=int(k))
-    n_groups = (cols + 32 * vec - 1) // (32 * vec)
-    gt(matrix, x_vec, out_v, _pk(cols, k, ld, int(xs)),
-       threads=(tg * n_groups, 1, 1), group_size=(tg, 1, 1))
+def _run_gemv_nt(dtype, matrix, x, out, rows, k, ld, epilogue=None):
+    fused = epilogue is not None
+    if dtype in _INT_PROFILE:
+        profile = _INT_PROFILE[dtype]
+        vec, nw = _IGEMV_NT_CFG[dtype]
+        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
+        red_tg, fn = dtype is torch.int64, None
+    else:
+        profile, nw, red_tg = _PROFILE[dtype], 4, False
+        vec = _gemv_nt_width(dtype is not torch.float32, int(k), int(ld), matrix.storage_offset())
+        fn = None if fused else _gemv_nt_pick(
+            _gemv_handles(dtype)["nt"], rows, k, ld, matrix.storage_offset())
+    if fused or fn is None:
+        bnz, anz = epilogue[-2:] if fused else (True, True)
+        fn = kernels.gemv_nt(*profile, 1, nw, vec, red_tg=red_tg,
+                             epilogue=fused, beta_nz=bnz, alpha_nz=anz)[0]
+    dims = _pk(rows, k, ld)
+    ng = (rows + nw - 1) // nw
+    if fused:
+        bias, step, beta, alpha, _, _ = epilogue
+        fn(matrix, x, out.view(-1), dims, bias, int(step), beta, alpha,
+           threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    else:
+        fn(matrix, x, out.view(-1), dims,
+           threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
+    return out
 
 
 def _dispatch_gemv(A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, dtype, out):
-    gh = _gemv_handles(dtype)
     M, N, K = int(M), int(N), int(K)
-    nt = gh["nt"]
-    yv = out.view(-1)
     if M == 1:
         if trans_b:
-            _gemv_nt(nt, B_view, A_view.reshape(-1).contiguous(), yv, N, K, int(ldb))
+            return _run_gemv_nt(dtype, B_view, A_view.reshape(-1).contiguous(), out, N, K, int(ldb))
         else:
             xv = A_view.reshape(-1)
-            _gemv_t(gh, B_view, xv, xv.stride(0), yv, N, K, int(ldb), dtype)
-        return out
+            return _run_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, int(ldb))
     elif N == 1:
         if trans_a:
             xv = B_view.reshape(-1)
-            _gemv_t(gh, A_view, xv, xv.stride(0), yv, M, K, int(lda), dtype)
+            return _run_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, int(lda))
         else:
-            _gemv_nt(nt, A_view, B_view.reshape(-1).contiguous(), yv, M, K, int(lda))
-        return out
+            return _run_gemv_nt(dtype, A_view, B_view.reshape(-1).contiguous(), out, M, K, int(lda))
     else:
         raise ValueError("gemv backend requires M==1 or N==1")
 
 
 # Fused matmul
-
-def _addmm_gemv_t(dtype, matrix, xv, xs, out, cols, k, ld, bstep, bias, beta, alpha, bnz, anz):
-    if dtype in _INT_PROFILE:
-        in_t, acc_t, out_t = _INT_PROFILE[dtype]
-        vec, nw = _IGEMV_T_CFG[dtype]
-        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
-    else:
-        in_t, acc_t, out_t = _PROFILE[dtype]
-        _, tg, vec = _gemv_pick(_gemv_handles(dtype), cols,
-                                int(ld) | matrix.storage_offset(), dtype, k=int(k))
-        nw = tg // 32
-    fn, _ = kernels.gemv_t(in_t, acc_t, out_t, 32 * vec, nw, vec,
-                           epilogue=True, beta_nz=bnz, alpha_nz=anz)
-    ng = (cols + 32 * vec - 1) // (32 * vec)
-    fn(matrix, xv, out.view(-1), _pk(cols, k, ld, int(xs)), bias, int(bstep), beta, alpha,
-       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
-    return out
-
-
-def _addmm_gemv_nt(dtype, matrix, xv, out, rows, k, ld, bstep, bias, beta, alpha, bnz, anz):
-    if dtype in _INT_PROFILE:
-        in_t, acc_t, out_t = _INT_PROFILE[dtype]
-        vec, nw = _IGEMV_NT_CFG[dtype]
-        vec = _int_clamp_vec(vec, ld, matrix.storage_offset())
-        red_tg = dtype is torch.int64
-    else:
-        in_t, acc_t, out_t = _PROFILE[dtype]
-        nw, red_tg = 4, False
-        vec = _gemv_nt_vec(dtype, int(k), int(ld), matrix.storage_offset())
-    fn, _ = kernels.gemv_nt(in_t, acc_t, out_t, 1, nw, vec, red_tg=red_tg,
-                            epilogue=True, beta_nz=bnz, alpha_nz=anz)
-    ng = (rows + nw - 1) // nw
-    fn(matrix, xv, out.view(-1), _pk(rows, k, ld), bias, int(bstep), beta, alpha,
-       threads=(nw * 32 * ng, 1, 1), group_size=(nw * 32, 1, 1))
-    return out
-
-
-def _gemv_nt_vec(dtype, k, ld, off):
-    return _gemv_nt_width(dtype is not torch.float32, k, ld, off)
-
 
 def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
     dtype = mat1.dtype
@@ -1412,21 +1311,19 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
     if M == 1 and N >= 16:
         if not trans_b:
             xv = A_view.reshape(-1)
-            return _addmm_gemv_t(
-                dtype, B_view, xv, xv.stride(0), out, N, K, ldb,
-                bc, x, beta, alpha, bnz, anz,
-            )
+            return _run_gemv_t(dtype, B_view, xv, xv.stride(0), out, N, K, ldb,
+                               (x, bc, beta, alpha, bnz, anz))
         xv = A_view.reshape(-1).contiguous()
-        return _addmm_gemv_nt(dtype, B_view, xv, out, N, K, ldb, bc, x, beta, alpha, bnz, anz)
+        return _run_gemv_nt(dtype, B_view, xv, out, N, K, ldb,
+                            (x, bc, beta, alpha, bnz, anz))
     if N == 1 and M >= 16:
         if trans_a:
             xv = B_view.reshape(-1)
-            return _addmm_gemv_t(
-                dtype, A_view, xv, xv.stride(0), out, M, K, lda,
-                br, x, beta, alpha, bnz, anz,
-            )
+            return _run_gemv_t(dtype, A_view, xv, xv.stride(0), out, M, K, lda,
+                               (x, br, beta, alpha, bnz, anz))
         xv = B_view.reshape(-1).contiguous()
-        return _addmm_gemv_nt(dtype, A_view, xv, out, M, K, lda, br, x, beta, alpha, bnz, anz)
+        return _run_gemv_nt(dtype, A_view, xv, out, M, K, lda,
+                            (x, br, beta, alpha, bnz, anz))
 
     M_, N_, K_, lda_, ldb_, ldc_ = int(M), int(N), int(K), int(lda), int(ldb), int(ldc)
     dims6 = _pk(M_, N_, K_, lda_, ldb_, ldc_)
@@ -1447,7 +1344,7 @@ def _addmm_real(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
     if m4 and M_ >= 2 and N_ >= 32 and K_ >= 64 and not trans_a and not trans_b and packed_ab:
         _gemm_plan(dtype, M_, N_, K_, A_view, B_view)
         tile = _GEMM_TILE[(dtype, M_, N_, K_)]
-        if len(tile) == 4 and tile[3] == "bt":
+        if tile[-1] == "bt":
             vec, nwarps = tile[0], tile[1]
             fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M_, 32 * vec, nwarps, vec,
                                     epilogue=True, beta_nz=bnz, alpha_nz=anz)
@@ -1521,49 +1418,17 @@ def _addmm_complex(mat1, mat2, x, br, bc, beta, alpha, bnz, anz, out):
     b = mat2.resolve_conj().contiguous() if mat2.is_conj() else mat2.contiguous()
     M, K = a.shape
     _, N = b.shape
+    gemv = _run_complex_gemv(a, b, out, (x, br, bc, beta, alpha, bnz, anz))
+    if gemv is not None:
+        return gemv
+
     c2, r = _COMPLEX[cdt]
-    rdt = _COMPLEX_REAL[cdt]
-
-    bre, bim = float(beta.real), float(beta.imag)
-    are, aim = float(alpha.real), float(alpha.imag)
-    if M == 1 and N >= 1:
-        out = out if out is not None else torch.empty(1, N, dtype=cdt, device=a.device)
-        fn, _ = kernels.cgemv_t(c2, "float2", r, 32, _CGEMV_T_NWARPS,
-                                epilogue=True, beta_nz=bnz, alpha_nz=anz)
-        ng = (N + 31) // 32
-        fn(b, a.view(-1), out.view(-1), _pk(N, K, N, 1),
-           x, int(bc), bre, bim, are, aim,
-           threads=(_CGEMV_T_NWARPS * 32 * ng, 1, 1),
-           group_size=(_CGEMV_T_NWARPS * 32, 1, 1))
-        return out
-    if N == 1 and M >= 1:
-        out = out if out is not None else torch.empty(M, 1, dtype=cdt, device=a.device)
-        fn, _ = kernels.cgemv_nt(c2, "float2", r, _CGEMV_NT_NWARPS,
-                                 epilogue=True, beta_nz=bnz, alpha_nz=anz)
-        ng = (M + _CGEMV_NT_NWARPS - 1) // _CGEMV_NT_NWARPS
-        fn(a, b.view(-1), out.view(-1), _pk(M, K, K, 1),
-           x, int(br), bre, bim, are, aim,
-           threads=(_CGEMV_NT_NWARPS * 32 * ng, 1, 1),
-           group_size=(_CGEMV_NT_NWARPS * 32, 1, 1))
-        return out
-
-    ar = torch.empty(M, K, dtype=rdt, device=a.device)
-    ai = torch.empty(M, K, dtype=rdt, device=a.device)
-    bre = torch.empty(K, N, dtype=rdt, device=b.device)
-    bim = torch.empty(K, N, dtype=rdt, device=b.device)
-    split, _ = kernels.complex_pack(c2, r)
-    nA, nB = M * K, K * N
-    split(a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
-    split(b, bre, bim, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
-    P = matmul(ar, bre)
-    Q = matmul(ai, bim)
-    S = matmul(ar, bim)
-    T = matmul(ai, bre)
+    products, _, _ = _complex_products(a, b, matmul)
     if out is None:
         out = torch.empty(M, N, dtype=cdt, device=a.device)
     _, combine = kernels.complex_pack(c2, r, epilogue=True, beta_nz=bnz, alpha_nz=anz)
     nC = M * N
-    combine(P, Q, S, T, out, nC, x, _pk(int(N), int(br), int(bc), 0),
+    combine(*products, out, nC, x, _pk(int(N), int(br), int(bc), 0),
             float(beta.real), float(beta.imag), float(alpha.real), float(alpha.imag),
             threads=(nC, 1, 1), group_size=(256, 1, 1))
     return out
@@ -1620,11 +1485,8 @@ _BMM_PLAN: dict = {}
 
 def _bmm_candidates(M, N, K, dtype):
     primary = _pick_bmm_tile(M, N, K, dtype)
-    cands = [primary]
-    for t in _BMM_TILES:
-        if t not in cands and t[0] <= 2 * M and t[1] <= 2 * N:
-            cands.append(t)
-    return cands
+    return [primary] + [t for t in _BMM_TILES
+                        if t != primary and t[0] <= 2 * M and t[1] <= 2 * N]
 
 
 def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, cands, margin,
@@ -1671,20 +1533,7 @@ def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, 
             if (o - ref).abs().max().item() <= 0.02 * scale:
                 label = (kind, vec, nwarps, ncols) if trans_b else (kind, vec, nwarps)
                 cand.append((label, runbt))
-    for (_, run) in cand:
-        for _ in range(warmup):
-            run()
-    torch.mps.synchronize()
-    times = [float("inf")] * len(cand)
-    for _ in range(reps):
-        for j, (_, run) in enumerate(cand):
-            t0 = time.perf_counter()
-            for _ in range(iters):
-                run()
-            torch.mps.synchronize()
-            times[j] = min(times[j], (time.perf_counter() - t0) / iters)
-    i = min(range(len(times)), key=lambda j: times[j])
-    return cand[i][0] if (i != 0 and times[i] < times[0] * (1.0 - margin)) else cand[0][0]
+    return cand[_fastest([run for _, run in cand], warmup, iters, reps, margin)][0]
 
 
 def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA=0, sB=0):
@@ -1720,19 +1569,8 @@ def _resolve_bmm_inputs(a: torch.Tensor, b: torch.Tensor):
     """Resolve row- or column-major batched views, copying other layouts."""
     _, M, K = a.shape
     _, _, N = b.shape
-    sa, sb = a.stride(), b.stride()
-    if sa[2] == 1 and sa[1] >= K:
-        trans_a, lda, A_view = False, sa[1], a
-    elif sa[1] == 1 and sa[2] >= M:
-        trans_a, lda, A_view = True, sa[2], a
-    else:
-        A_view, trans_a, lda = a.contiguous(), False, K
-    if sb[2] == 1 and sb[1] >= N:
-        trans_b, ldb, B_view = False, sb[1], b
-    elif sb[1] == 1 and sb[2] >= K:
-        trans_b, ldb, B_view = True, sb[2], b
-    else:
-        B_view, trans_b, ldb = b.contiguous(), False, N
+    A_view, trans_a, lda = _matrix_view(a, M, K)
+    B_view, trans_b, ldb = _matrix_view(b, K, N)
     return (A_view, B_view, int(M), int(N), int(K), int(lda), int(ldb),
             trans_a, trans_b, int(A_view.stride(0)), int(B_view.stride(0)))
 
@@ -1758,50 +1596,36 @@ def _bmm_loop(a, b, out=None):
     return out
 
 
-def _int_bmm(a, b, dtype, out=None):
+def _int_bmm(a, b, dtype, out=None, epilogue=None):
     Bb = a.shape[0]
+    fused = epilogue is not None
+    if fused:
+        input, beta, alpha, bnz, anz = epilogue
     if a.shape[1] == 1 or b.shape[2] == 1:
-        return _bmm_loop(a, b, out)
+        return (_baddbmm_loop(input, a, b, beta, alpha, out) if fused
+                else _bmm_loop(a, b, out))
     in_t, acc_t, out_t = _INT_PROFILE[dtype]
-    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
-    oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
-    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
+    A, B, M, N, K, lda, ldb, ta, tb, sA, sB = _resolve_bmm_inputs(a, b)
+    o, copy_back = _bmm_out(a, out, Bb, M, N, dtype)
+    ldc, sC = int(o.stride(1)), int(o.stride(0))
     BM, BN, BK, TX, TY = _pick_int_tile(M, N, K, dtype)
-    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b,
-                             batched=True)
+    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, ta, tb,
+                             epilogue=fused, beta_nz=bnz if fused else True,
+                             alpha_nz=anz if fused else True, batched=True)
     grp = TX * TY
     threads = (grp * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
-       threads=threads, group_size=(grp, 1, 1))
-    if needs_copy:
-        out.copy_(oc)
+    args = (A, B, o, _pk(M, N, K, lda, ldb, ldc))
+    if fused:
+        x = input if input.dtype == dtype else input.to(dtype)
+        sBias, br, bc = map(int, x.expand(Bb, M, N).stride())
+        args += (x, _pk(br, bc), int(beta), int(alpha), _pk(sA, sB, sC, sBias))
+    else:
+        args += (_pk(sA, sB, sC, 0),)
+    fn(*args, threads=threads, group_size=(grp, 1, 1))
+    if copy_back:
+        out.copy_(o)
         return out
-    return oc
-
-
-def _int_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, dtype, out=None):
-    Bb = batch1.shape[0]
-    if batch1.shape[1] == 1 or batch2.shape[2] == 1:
-        return _baddbmm_loop(input, batch1, batch2, beta, alpha, out)
-    in_t, acc_t, out_t = _INT_PROFILE[dtype]
-    x = input if input.dtype == dtype else input.to(dtype)
-    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(batch1, batch2)
-    xe = x.expand(Bb, M, N)
-    sBias, br, bc = (int(s) for s in xe.stride())
-    oc, needs_copy = _bmm_out(batch1, out, Bb, M, N, dtype)
-    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
-    BM, BN, BK, TX, TY = _pick_int_tile(M, N, K, dtype)
-    fn, _ = kernels.int_gemm(in_t, acc_t, out_t, BM, BN, BK, TX, TY, trans_a, trans_b,
-                             epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
-    grp = TX * TY
-    threads = (grp * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-    fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
-       int(beta), int(alpha), _pk(sA, sB, sC, sBias),
-       threads=threads, group_size=(grp, 1, 1))
-    if needs_copy:
-        out.copy_(oc)
-        return out
-    return oc
+    return o
 
 
 def _complex_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out=None):
@@ -1823,56 +1647,67 @@ def _complex_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out=None):
 
 
 def _complex_bmm(a, b, out=None):
-    cdt = a.dtype if a.dtype in _COMPLEX else b.dtype
-    if a.dtype != cdt:
-        a = a.to(cdt)
-    if b.dtype != cdt:
-        b = b.to(cdt)
-    a = a.resolve_conj().contiguous() if a.is_conj() else a.contiguous()
-    b = b.resolve_conj().contiguous() if b.is_conj() else b.contiguous()
+    a, b, cdt = _complex_inputs(a, b)
+    a, b = a.contiguous(), b.contiguous()
     Bb, M, K = a.shape
     N = b.shape[2]
-    rdt = _COMPLEX_REAL[cdt]
-    c2, r = _COMPLEX[cdt]
-    ar = torch.empty(Bb, M, K, dtype=rdt, device=a.device)
-    ai = torch.empty(Bb, M, K, dtype=rdt, device=a.device)
-    br = torch.empty(Bb, K, N, dtype=rdt, device=b.device)
-    bi = torch.empty(Bb, K, N, dtype=rdt, device=b.device)
-    split, combine = kernels.complex_pack(c2, r)
-    nA, nB = Bb * M * K, Bb * K * N
-    split(a, ar, ai, nA, threads=(nA, 1, 1), group_size=(256, 1, 1))
-    split(b, br, bi, nB, threads=(nB, 1, 1), group_size=(256, 1, 1))
-    P, Q, S, T = bmm(ar, br), bmm(ai, bi), bmm(ar, bi), bmm(ai, br)
+    products, c2, r = _complex_products(a, b, bmm)
     if out is None:
         out = torch.empty(Bb, M, N, dtype=cdt, device=a.device)
     nC = Bb * M * N
-    combine(P, Q, S, T, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
+    combine = kernels.complex_pack(c2, r)[1]
+    combine(*products, out, nC, threads=(nC, 1, 1), group_size=(256, 1, 1))
     return out
 
 
-def _bmm_gemv_bt(dtype, vec, nwarps, M, N, K, a, b, oc, lda, ldb, ldc, sA, sB, sC, Bb,
-                 trans_b=False, ncols=1):
+def _real_bmm(a, b, out=None, epilogue=None):
+    """Launch the selected batched real kernel, optionally with a fused epilogue."""
+    dtype, Bb = a.dtype, a.shape[0]
+    A, B, M, N, K, lda, ldb, ta, tb, sA, sB = _resolve_bmm_inputs(a, b)
+    o, copy_back = _bmm_out(a, out, Bb, M, N, dtype)
+    ldc, sC = int(o.stride(1)), int(o.stride(0))
+    plan = _bmm_plan(dtype, M, N, K, lda, ldb, ta, tb, Bb, A, B, sA, sB)
     in_t, acc_t, out_t = _PROFILE[dtype]
-    fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
-                            batched=True, trans_b=trans_b, NCOLS=ncols)
-    ng = ((N + nwarps * ncols - 1) // (nwarps * ncols) if trans_b
-          else (N + 32 * vec - 1) // (32 * vec))
-    fn(b, a, oc, _pk(N, K, ldb, lda, ldc), _pk(sB, sA, sC, 0),
-       threads=(nwarps * 32 * ng, 1, Bb), group_size=(nwarps * 32, 1, 1))
+    fused = epilogue is not None
+    if fused:
+        bias, br, bc, sBias, beta, alpha, bnz, anz = epilogue
 
+    if plan[0] in ("bt", "bt_tb"):
+        tb = plan[0] == "bt_tb"
+        vec, nwarps = plan[1:3]
+        ncols = plan[3] if tb else 1
+        fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
+                                epilogue=fused, beta_nz=bnz if fused else True,
+                                alpha_nz=anz if fused else True, batched=True,
+                                trans_b=tb, NCOLS=ncols)
+        ng = ((N + nwarps * ncols - 1) // (nwarps * ncols) if tb
+              else (N + 32 * vec - 1) // (32 * vec))
+        rows = 1
+        args = (B, A, o, _pk(N, K, ldb, lda, ldc))
+        if fused:
+            args += (bias, _pk(br, bc), float(beta), float(alpha), _pk(sB, sA, sC, sBias))
+        else:
+            args += (_pk(sB, sA, sC, 0),)
+    else:
+        _, fn, BM, BN, NSG = plan
+        if fused:
+            fn, _ = kernels.mpp_tensor_gemm(
+                in_t, out_t, BM, BN, NSG, ta, tb, relaxed=True, swizzle_log=0,
+                mn_aligned=(M % BM == 0) and (N % BN == 0), epilogue=True,
+                beta_nz=bnz, alpha_nz=anz, batched=True,
+            )
+        ng, nwarps, rows = (N + BN - 1) // BN, NSG, (M + BM - 1) // BM
+        args = (A, B, o, _pk(M, N, K, lda, ldb, ldc))
+        if fused:
+            args += (bias, _pk(br, bc), float(beta), float(alpha), _pk(sA, sB, sC, sBias))
+        else:
+            args += (_pk(sA, sB, sC, 0),)
 
-def _baddbmm_gemv_bt(dtype, vec, nwarps, M, N, K, a, b, oc, lda, ldb, ldc,
-                     sA, sB, sC, sBias, bias, br, bc, beta, alpha, bnz, anz, Bb,
-                     trans_b=False, ncols=1):
-    in_t, acc_t, out_t = _PROFILE[dtype]
-    fn, _ = kernels.gemv_bt(in_t, acc_t, out_t, M, 32 * vec, nwarps, vec,
-                            epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True,
-                            trans_b=trans_b, NCOLS=ncols)
-    ng = ((N + nwarps * ncols - 1) // (nwarps * ncols) if trans_b
-          else (N + 32 * vec - 1) // (32 * vec))
-    fn(b, a, oc, _pk(N, K, ldb, lda, ldc), bias, _pk(br, bc),
-       float(beta), float(alpha), _pk(sB, sA, sC, sBias),
-       threads=(nwarps * 32 * ng, 1, Bb), group_size=(nwarps * 32, 1, 1))
+    fn(*args, threads=(nwarps * 32 * ng, rows, Bb), group_size=(nwarps * 32, 1, 1))
+    if copy_back:
+        out.copy_(o)
+        return out
+    return o
 
 
 def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -1898,25 +1733,7 @@ def bmm(a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor | None = None) ->
     if dtype not in _PROFILE or not kernels.has_metal4():
         return _bmm_loop(a, b, out)
 
-    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(a, b)
-    oc, needs_copy = _bmm_out(a, out, Bb, M, N, dtype)
-    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
-    plan = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
-                     A_view, B_view, sA, sB)
-    if plan[0] in ("bt", "bt_tb"):
-        is_tb = plan[0] == "bt_tb"
-        _bmm_gemv_bt(dtype, plan[1], plan[2], M, N, K, A_view, B_view, oc,
-                     lda, ldb, ldc, sA, sB, sC, Bb, trans_b=is_tb, ncols=(plan[3] if is_tb else 1))
-    else:
-        _, fn, BM, BN, NSG = plan
-        grp = (NSG * 32, 1, 1)
-        threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-        fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), _pk(sA, sB, sC, 0),
-           threads=threads, group_size=grp)
-    if needs_copy:
-        out.copy_(oc)
-        return out
-    return oc
+    return _real_bmm(a, b, out)
 
 
 def _baddbmm_loop(input, batch1, batch2, beta, alpha, out=None):
@@ -1951,7 +1768,8 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
     if dtype in _COMPLEX:
         return _complex_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out)
     if dtype in _INT_PROFILE:
-        return _int_baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, dtype, out)
+        return _int_bmm(batch1, batch2, dtype, out,
+                        (input, beta, alpha, bnz, anz))
     if not kernels.has_metal4():
         return _baddbmm_loop(input, batch1, batch2, beta, alpha, out)
 
@@ -1959,32 +1777,8 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
     xe = x.expand(Bb, M, N)
     sBias, br, bc = (int(s) for s in xe.stride())
 
-    A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b, sA, sB = _resolve_bmm_inputs(batch1, batch2)
-    oc, needs_copy = _bmm_out(batch1, out, Bb, M, N, dtype)
-    ldc, sC = int(oc.stride(1)), int(oc.stride(0))
-    in_t, _, out_t = _PROFILE[dtype]
-    plan = _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb,
-                     A_view, B_view, sA, sB)
-    if plan[0] in ("bt", "bt_tb"):
-        is_tb = plan[0] == "bt_tb"
-        _baddbmm_gemv_bt(dtype, plan[1], plan[2], M, N, K, A_view, B_view, oc,
-                         lda, ldb, ldc, sA, sB, sC, sBias, x, br, bc, beta, alpha, bnz, anz, Bb,
-                         trans_b=is_tb, ncols=(plan[3] if is_tb else 1))
-    else:
-        _, _fn0, BM, BN, NSG = plan
-        mn_aligned = (M % BM == 0) and (N % BN == 0)
-        fn, _ = kernels.mpp_tensor_gemm(in_t, out_t, BM, BN, NSG, trans_a, trans_b,
-                                        relaxed=True, swizzle_log=0, mn_aligned=mn_aligned,
-                                        epilogue=True, beta_nz=bnz, alpha_nz=anz, batched=True)
-        grp = (NSG * 32, 1, 1)
-        threads = (grp[0] * ((N + BN - 1) // BN), (M + BM - 1) // BM, Bb)
-        fn(A_view, B_view, oc, _pk(M, N, K, lda, ldb, ldc), x, _pk(br, bc),
-           float(beta), float(alpha), _pk(sA, sB, sC, sBias),
-           threads=threads, group_size=grp)
-    if needs_copy:
-        out.copy_(oc)
-        return out
-    return oc
+    return _real_bmm(batch1, batch2, out,
+                     (x, br, bc, sBias, beta, alpha, bnz, anz))
 
 
 def addbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,

@@ -1,7 +1,6 @@
 """Benchmark metalblas.bmm vs torch.bmm on MPS."""
 import os
 import sys
-import time
 import argparse
 import statistics
 from typing import List, Tuple
@@ -11,30 +10,14 @@ import torch
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 import metalblas
-
-
-def _rand(*shape, dtype):
-    if not (dtype.is_floating_point or dtype.is_complex):
-        lo = 0 if dtype == torch.uint8 else -4
-        return torch.randint(lo, 4, shape, device='mps', dtype=dtype)
-    return torch.randn(*shape, device='mps', dtype=dtype)
+from bench_matmul import _rand, _time_call
 
 
 def bench(B, M, N, K, dtype, fn, iters=50, trials=8, warmup=20):
     torch.manual_seed(0)
     a = _rand(B, M, K, dtype=dtype)
     b = _rand(B, K, N, dtype=dtype)
-    for _ in range(warmup):
-        c = fn(a, b)
-    torch.mps.synchronize()
-    best = float('inf')
-    for _ in range(trials):
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            c = fn(a, b)
-        torch.mps.synchronize()
-        sec = (time.perf_counter() - t0) / iters
-        best = min(best, sec)
+    best, _ = _time_call(fn, a, b, iters, trials, warmup)
     flops = 2.0 * B * M * N * K * (4.0 if dtype.is_complex else 1.0)
     return best, flops / best / 1e12
 

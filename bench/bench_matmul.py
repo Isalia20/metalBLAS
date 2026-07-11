@@ -16,11 +16,11 @@ sys.path.insert(0, REPO_ROOT)
 import metalblas
 
 
-def _rand(M, K, dtype):
+def _rand(*shape, dtype):
     if not (dtype.is_floating_point or dtype.is_complex):
         lo = 0 if dtype == torch.uint8 else -4
-        return torch.randint(lo, 4, (M, K), device='mps', dtype=dtype)
-    return torch.randn(M, K, device='mps', dtype=dtype)
+        return torch.randint(lo, 4, shape, device='mps', dtype=dtype)
+    return torch.randn(*shape, device='mps', dtype=dtype)
 
 
 def _time_call(fn, a, b, iters, trials, warmup):
@@ -47,8 +47,8 @@ def _cooldown(busy_s, cool):
 
 def bench(M, N, K, dtype, fn, iters=100, trials=10, warmup=50):
     torch.manual_seed(0)
-    a = _rand(M, K, dtype)
-    b = _rand(K, N, dtype)
+    a = _rand(M, K, dtype=dtype)
+    b = _rand(K, N, dtype=dtype)
     best, busy = _time_call(fn, a, b, iters, trials, warmup)
     # Complex MAC is ~4 real MACs (the four ar/ai x br/bi products), so count 4x.
     flops = 2.0 * M * N * K * (4.0 if dtype.is_complex else 1.0)
@@ -102,15 +102,15 @@ SHAPES = {
 
 
 def _rm(r, c, dt):     # row-major contiguous, stride (c, 1) -> packed mpp_tensor fast path
-    return _rand(r, c, dt)
+    return _rand(r, c, dtype=dt)
 def _cm(r, c, dt):     # col-major view, stride (1, r) -> trans flag, mpp/simd fallback
-    return _rand(c, r, dt).t()
+    return _rand(c, r, dtype=dt).t()
 def _rowsl(r, c, dt):  # [::2] over rows, stride (2c, 1) -> non-packed (lda=2c), read in place
-    return _rand(2 * r, c, dt)[::2]
+    return _rand(2 * r, c, dtype=dt)[::2]
 def _colsl(r, c, dt):  # [:, ::2], stride (2c, 2) -> unit stride on neither dim, contiguified
-    return _rand(r, 2 * c, dt)[:, ::2]
+    return _rand(r, 2 * c, dtype=dt)[:, ::2]
 def _off(r, c, dt):    # [1:, 1:] sub-view, stride (c+1, 1) -> nonzero storage offset, lda=c+1
-    return _rand(r + 1, c + 1, dt)[1:, 1:]
+    return _rand(r + 1, c + 1, dtype=dt)[1:, 1:]
 
 # name -> (build_A, build_B); A is (M,K), B is (K,N). rm_rm is the layout-tax baseline.
 LAYOUTS = {

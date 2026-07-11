@@ -45,15 +45,21 @@ def _build(build_flag: str, *, defines=None, **params) -> str:
     return _subst(prelude + _binder_source(), **params)
 
 
-def _epi_defines(epilogue: bool, beta_nz: bool, alpha_nz: bool):
-    if not epilogue:
-        return None
-    return {"EPILOGUE": 1, "BETA_NZ": int(beta_nz), "ALPHA_NZ": int(alpha_nz)}
+def _defines(epilogue=False, beta_nz=True, alpha_nz=True, **flags):
+    defines = ({"EPILOGUE": 1, "BETA_NZ": int(beta_nz), "ALPHA_NZ": int(alpha_nz)}
+               if epilogue else {})
+    defines.update({name: 1 for name, enabled in flags.items() if enabled})
+    return defines or None
 
 
 @lru_cache(maxsize=None)
 def _compile(src: str):
     return torch.mps.compile_shader(src)
+
+
+def _kernel(name, build_flag, *, defines=None, **params):
+    src = _build(build_flag, defines=defines, **params)
+    return getattr(_compile(src), name), src
 
 
 @lru_cache(maxsize=1)
@@ -74,9 +80,9 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
               mn_aligned: bool, k_aligned: bool,
               swizzle_log: int = 0,
               epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    src = _build(
-        "MB_BUILD_SIMD_GEMM",
-        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+    return _kernel(
+        "simd_gemm", "MB_BUILD_SIMD_GEMM",
+        defines=_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
         BM=BM, BN=BN, BK=BK, WM=WM, WN=WN,
         TRANS_A=int(trans_a), TRANS_B=int(trans_b),
@@ -84,8 +90,6 @@ def simd_gemm(in_t: str, acc_t: str, out_t: str,
         OUT_IS_ACC=int(out_t == acc_t),
         SWIZZLE_LOG=swizzle_log,
     )
-    lib = _compile(src)
-    return lib.simd_gemm, src
 
 
 @lru_cache(maxsize=None)
@@ -101,9 +105,9 @@ def mpp_gemm(in_t: str, acc_t: str, out_t: str,
     if pad is None:
         in_bytes = 4 if in_t == "float" else 2
         pad = 16 // in_bytes
-    src = _build(
-        "MB_BUILD_MPP_GEMM",
-        defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+    return _kernel(
+        "mpp_gemm", "MB_BUILD_MPP_GEMM",
+        defines=_defines(epilogue, beta_nz, alpha_nz),
         IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
         BM=BM, BN=BN, BK=BK, WM=WM, WN=WN,
         TRANS_A=int(trans_a), TRANS_B=int(trans_b),
@@ -113,8 +117,6 @@ def mpp_gemm(in_t: str, acc_t: str, out_t: str,
         DBUF=int(dbuf),
         PAD=int(pad),
     )
-    lib = _compile(src)
-    return lib.mpp_gemm, src
 
 
 @lru_cache(maxsize=None)
@@ -127,11 +129,9 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
                    epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
                    batched: bool = False):
     static_slice = (not trans_a) and (not trans_b)
-    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
-    if batched:
-        defines = {**(defines or {}), "BATCHED": 1}
-    src = _build(
-        "MB_BUILD_MPP_TENSOR",
+    defines = _defines(epilogue, beta_nz, alpha_nz, BATCHED=batched)
+    return _kernel(
+        "mpp_tensor_gemm", "MB_BUILD_MPP_TENSOR",
         defines=defines,
         IN_T=in_t, OUT_T=out_t,
         BM=BM, BN=BN, NSG=NSG,
@@ -142,8 +142,6 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
         MN_ALIGNED=int(mn_aligned),
         STATIC_SLICE=int(static_slice),
     )
-    lib = _compile(src)
-    return lib.mpp_tensor_gemm, src
 
 
 @lru_cache(maxsize=None)
@@ -161,44 +159,40 @@ def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
 
 @lru_cache(maxsize=None)
 def conv1x1_gemm(in_t: str, out_t: str, BMW: int, BNO: int, NSG: int, K: int):
-    src = _build(
-        "MB_BUILD_CONV1X1",
+    return _kernel(
+        "conv1x1_gemm", "MB_BUILD_CONV1X1",
         IN_T=in_t, OUT_T=out_t,
         BMW=BMW, BNO=BNO, NSG=NSG, KCONST=K,
     )
-    return _compile(src).conv1x1_gemm, src
 
 
 @lru_cache(maxsize=None)
 def sgpipe_gemm(in_t: str, out_t: str, SGM: int, SGN: int, KC: int,
                 NSGX: int, NSGY: int, GK: int = 0, GM: int = 0, GN: int = 0):
-    src = _build(
-        "MB_BUILD_MPP_SGPIPE",
+    return _kernel(
+        "sgpipe_gemm", "MB_BUILD_MPP_SGPIPE",
         IN_T=in_t, OUT_T=out_t,
         SGM=SGM, SGN=SGN, KC=KC, NSGX=NSGX, NSGY=NSGY, GK=GK, GM=GM, GN=GN,
     )
-    return _compile(src).sgpipe_gemm, src
 
 
 @lru_cache(maxsize=None)
 def flipt_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int,
                KC: int = 0, PFD: int = 0):
-    src = _build(
-        "MB_BUILD_FLIPT",
+    return _kernel(
+        "flipt_gemm", "MB_BUILD_FLIPT",
         IN_T=in_t, OUT_T=out_t,
         BM=BM, BN=BN, NSG=NSG, KC=KC, PFD=PFD,
     )
-    return _compile(src).flipt_gemm, src
 
 
 @lru_cache(maxsize=None)
 def gemv_nt(in_t: str, acc_t: str, out_t: str, ROWS_PER_SG: int = 1, NWARPS: int = 4,
             VEC: int = 1, red_tg: bool = False,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    src = _build("MB_BUILD_GEMV_NT", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
-                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC, RED_TG=int(red_tg))
-    return _compile(src).gemv_nt, src
+    return _kernel("gemv_nt", "MB_BUILD_GEMV_NT", defines=_defines(epilogue, beta_nz, alpha_nz),
+                   IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                   ROWS_PER_SG=ROWS_PER_SG, NWARPS=NWARPS, VEC=VEC, RED_TG=int(red_tg))
 
 
 @lru_cache(maxsize=None)
@@ -206,10 +200,9 @@ def gemv_t(in_t: str, acc_t: str, out_t: str, BLOCK_N: int = 32, NWARPS: int = 4
            VEC: int = 1,
            epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
     assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
-    src = _build("MB_BUILD_GEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
-                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC)
-    return _compile(src).gemv_t, src
+    return _kernel("gemv_t", "MB_BUILD_GEMV_T", defines=_defines(epilogue, beta_nz, alpha_nz),
+                   IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                   BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC)
 
 
 @lru_cache(maxsize=None)
@@ -218,39 +211,31 @@ def gemv_bt(in_t: str, acc_t: str, out_t: str, MROWS: int,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
             batched: bool = False, trans_b: bool = False, NCOLS: int = 1, trans_a: bool = False):
     assert BLOCK_N == 32 * VEC, f"BLOCK_N ({BLOCK_N}) must equal 32*VEC ({32*VEC})"
-    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
-    if batched:
-        defines = {**(defines or {}), "BATCHED": 1}
-    if trans_b:
-        defines = {**(defines or {}), "TRANS_B": 1}
-    if trans_a:
-        defines = {**(defines or {}), "TRANS_A": 1}
-    src = _build("MB_BUILD_GEMV_BT", defines=defines,
-                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 MROWS=MROWS, BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC, NCOLS=NCOLS)
-    return _compile(src).gemv_bt, src
+    defines = _defines(epilogue, beta_nz, alpha_nz,
+                       BATCHED=batched, TRANS_B=trans_b, TRANS_A=trans_a)
+    return _kernel("gemv_bt", "MB_BUILD_GEMV_BT", defines=defines,
+                   IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                   MROWS=MROWS, BLOCK_N=BLOCK_N, NWARPS=NWARPS, VEC=VEC, NCOLS=NCOLS)
 
 
 @lru_cache(maxsize=None)
 def cgemv_t(c2_t: str, acc2_t: str, r_t: str, BLOCK_N: int = 32, NWARPS: int = 8,
             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    src = _build("MB_BUILD_CGEMV_T", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
-                 C2=c2_t, ACC2=acc2_t, R=r_t, BLOCK_N=BLOCK_N, NWARPS=NWARPS)
-    return _compile(src).cgemv_t, src
+    return _kernel("cgemv_t", "MB_BUILD_CGEMV_T", defines=_defines(epilogue, beta_nz, alpha_nz),
+                   C2=c2_t, ACC2=acc2_t, R=r_t, BLOCK_N=BLOCK_N, NWARPS=NWARPS)
 
 
 @lru_cache(maxsize=None)
 def cgemv_nt(c2_t: str, acc2_t: str, r_t: str, NWARPS: int = 4,
              epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    src = _build("MB_BUILD_CGEMV_NT", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
-                 C2=c2_t, ACC2=acc2_t, R=r_t, NWARPS=NWARPS)
-    return _compile(src).cgemv_nt, src
+    return _kernel("cgemv_nt", "MB_BUILD_CGEMV_NT", defines=_defines(epilogue, beta_nz, alpha_nz),
+                   C2=c2_t, ACC2=acc2_t, R=r_t, NWARPS=NWARPS)
 
 
 @lru_cache(maxsize=None)
 def complex_pack(c2_t: str, r_t: str,
                  epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True):
-    src = _build("MB_BUILD_COMPLEX_PACK", defines=_epi_defines(epilogue, beta_nz, alpha_nz),
+    src = _build("MB_BUILD_COMPLEX_PACK", defines=_defines(epilogue, beta_nz, alpha_nz),
                  C2=c2_t, R=r_t)
     lib = _compile(src)
     return lib.complex_split, lib.complex_combine
@@ -261,11 +246,8 @@ def int_gemm(in_t: str, acc_t: str, out_t: str, BM: int, BN: int, BK: int,
              TX: int, TY: int, trans_a: bool, trans_b: bool,
              epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
              batched: bool = False):
-    defines = _epi_defines(epilogue, beta_nz, alpha_nz)
-    if batched:
-        defines = {**(defines or {}), "BATCHED": 1}
-    src = _build("MB_BUILD_INT_GEMM", defines=defines,
-                 IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
-                 BM=BM, BN=BN, BK=BK, TX=TX, TY=TY,
-                 TRANS_A=int(trans_a), TRANS_B=int(trans_b))
-    return _compile(src).int_gemm, src
+    defines = _defines(epilogue, beta_nz, alpha_nz, BATCHED=batched)
+    return _kernel("int_gemm", "MB_BUILD_INT_GEMM", defines=defines,
+                   IN_T=in_t, ACC_T=acc_t, OUT_T=out_t,
+                   BM=BM, BN=BN, BK=BK, TX=TX, TY=TY,
+                   TRANS_A=int(trans_a), TRANS_B=int(trans_b))
