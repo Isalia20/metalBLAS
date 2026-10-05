@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 import re
+import struct
 
 import torch
 
@@ -52,9 +53,26 @@ def _defines(epilogue=False, beta_nz=True, alpha_nz=True, **flags):
     return defines or None
 
 
+def _mps_epilogue_defines(in_t, epilogue):
+    if epilogue is None:
+        return None
+    beta, alpha = epilogue
+    dtype = {"float": torch.float32, "half": torch.float16, "bfloat": torch.bfloat16}[in_t]
+
+    def bits(value):
+        # MPSGraph's constant nodes round to the input dtype before the
+        # MPSCore multiplication_f callback consumes the value as float.
+        value = torch.tensor(value, dtype=dtype, device="cpu").item()
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+
+    return {"MB_MPS_EPILOGUE": 1, "MB_MPS_ALPHA_BITS": bits(alpha),
+            "MB_MPS_BETA_BITS": bits(beta), "MB_MPS_BETA_NZ": beta != 0}
+
+
 @lru_cache(maxsize=None)
 def _compile(src: str):
-    return torch.mps.compile_shader(src)
+    from .mps_submission import Library
+    return Library(torch.mps.compile_shader(src))
 
 
 def _kernel(name, build_flag, *, defines=None, **params):
@@ -142,6 +160,117 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
         MN_ALIGNED=int(mn_aligned),
         STATIC_SLICE=int(static_slice),
     )
+
+
+@lru_cache(maxsize=None)
+def a18_gemm(in_t: str, out_t: str,
+             UM: int, UN: int, SM: int, SN: int, KS: int, KC: int,
+             BIT: int, PACE: int, RW: int, LIN: int,
+             trans_a: bool, trans_b: bool,
+             mn_aligned: bool, k_aligned: bool,
+             epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True,
+             batched: bool = False, source_epilogue=None,
+             global_splits: int = 1, global_atomic: bool = False):
+    """GEMM with the structure of MPSNDArray's gemm_a18 (see shaders/a18_gemm.h)."""
+    defines = _defines(epilogue, beta_nz, alpha_nz, BATCHED=batched) or {}
+    defines.update(_mps_epilogue_defines(in_t, source_epilogue) or {})
+    defines.update(GLOBAL_SPLITS=global_splits, GLOBAL_ATOMIC=int(global_atomic))
+    return _kernel(
+        "a18_gemm", "MB_BUILD_A18",
+        defines=defines,
+        IN_T=in_t, OUT_T=out_t,
+        UM=UM, UN=UN, SM=SM, SN=SN, KS=KS, KC=KC, BIT=BIT, PACE=PACE, RW=RW, LIN=LIN,
+        TRANS_A=int(trans_a), TRANS_B=int(trans_b),
+        MN_ALIGNED=int(mn_aligned), K_ALIGNED=int(k_aligned),
+    )
+
+
+@lru_cache(maxsize=None)
+def a18_global_helpers(out_t, splits, epilogue=None):
+    source = _build("MB_BUILD_A18_GLOBAL", defines=_mps_epilogue_defines(out_t, epilogue),
+                    OUT_T=out_t, GLOBAL_SPLITS=splits)
+    library = _compile(source)
+    return library.a18_global_initialize, library.a18_global_reduce
+
+
+@lru_cache(maxsize=None)
+def a16_gemm(in_t: str, out_t: str, BM: int, BN: int, BK: int, SM: int, SN: int,
+             stage_a: bool, trans_a: bool, trans_b: bool,
+             mn_aligned: bool, k_aligned: bool, splits: int, kchunk: int,
+             dim16: bool, reduce_vec: int, edge_tm: int, edge_tn: int,
+             wide_index: bool = False, epilogue=None):
+    """A16 fragment/staging schedule selected by MPSNDArray's A14 encoder."""
+    src = _build(
+        "MB_BUILD_A16", defines=_mps_epilogue_defines(in_t, epilogue),
+        IN_T=in_t, OUT_T="float" if splits > 1 else out_t,
+        FINAL_T=out_t, BM=BM, BN=BN, BK=BK, SM=SM, SN=SN,
+        STAGE_A=int(stage_a), TRANS_A=int(trans_a), TRANS_B=int(trans_b),
+        MN_ALIGNED=int(mn_aligned), K_ALIGNED=int(k_aligned),
+        SPLITS=splits, KCHUNK=kchunk, DIM16=int(dim16),
+        REDUCE_VEC=reduce_vec, EDGE_TM=edge_tm, EDGE_TN=edge_tn,
+        INDEX_T="ulong" if wide_index else "uint",
+    )
+    lib = _compile(src)
+    return lib.a16_gemm, lib.a16_reduce
+
+
+@lru_cache(maxsize=None)
+def nna14_gemm(in_t: str, out_t: str, BM: int, BN: int, BK: int, SM: int, SN: int,
+               trans_a: bool, trans_b: bool, mn_aligned: bool,
+               splits: int, kchunk: int, linear: bool, reduce_vec: int, dim16: bool,
+               edge_tm: int, edge_tn: int, k_tail: bool, wide_index: bool, epilogue=None):
+    """NNA14 async-copy/fragment schedule selected by MPSNDArray's A14 encoder."""
+    src = _build(
+        "MB_BUILD_NNA14", defines=_mps_epilogue_defines(in_t, epilogue),
+        IN_T=in_t, OUT_T="float" if splits > 1 else out_t,
+        FINAL_T=out_t, BM=BM, BN=BN, BK=BK, SM=SM, SN=SN,
+        TRANS_A=int(trans_a), TRANS_B=int(trans_b), MN_ALIGNED=int(mn_aligned),
+        SPLITS=splits, KCHUNK=kchunk, LINEAR=int(linear), REDUCE_VEC=reduce_vec,
+        DIM16=int(dim16), EDGE_TM=edge_tm, EDGE_TN=edge_tn, K_TAIL=int(k_tail),
+        INDEX_T="ulong" if wide_index else "uint",
+    )
+    lib = _compile(src)
+    return lib.nna14_gemm, lib.nna14_reduce
+
+
+@lru_cache(maxsize=None)
+def mps_lora(rows: int, row_tile: int, unroll_k: int, nsimd: int, vec_b: bool,
+             k_mod4: int, k_loops: int, tiled_tail: bool, tg_tail: bool, epilogue=None):
+    """LoRA row-prefetch and K-reduction schedule from Apple's vector encoder."""
+    return _kernel(
+        "mps_lora", "MB_BUILD_MPS_LORA", defines=_mps_epilogue_defines("half", epilogue),
+        ROWS=rows, ROW_TILE=row_tile,
+        UNROLL_K=unroll_k, NSIMD=nsimd, VEC_B=int(vec_b), K_MOD4=k_mod4,
+        K_LOOPS=k_loops, TILED_TAIL=int(tiled_tail), TG_TAIL=int(tg_tail),
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def mps_vector(in_t, r, gx, gy, flat, trans_b, trans_out, rows, unroll_k,
+                groups, full_groups, partial, k_mod4, epilogue=None):
+    """Ordinary MPS vector schedules, including the TransA and 16x16 paths."""
+    return _kernel(
+        "mps_vector", "MB_BUILD_MPS_VECTOR", defines=_mps_epilogue_defines(in_t, epilogue),
+        IN_T=in_t,
+        LOAD4_T={"float": "float4", "half": "packed_half4", "bfloat": "bfloat4"}[in_t],
+        R=r, GX=gx, GY=gy, FLAT=int(flat), TRANS_B=int(trans_b), TRANS_OUT=int(trans_out),
+        ROWS=rows, UNROLL_K=unroll_k, GROUPS=groups, FULL_GROUPS=full_groups,
+        PARTIAL=int(partial), K_MOD4=k_mod4,
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def mps_batch_reduce(in_t, out_t, gx, gy, gz, epilogue=None):
+    return _kernel("mps_batch_reduce", "MB_BUILD_MPS_REDUCTION",
+                   defines=_mps_epilogue_defines(out_t, epilogue),
+                   IN_T=in_t, OUT_T=out_t, GX=gx, GY=gy, GZ=gz)[0]
+
+
+@lru_cache(maxsize=None)
+def mps_identity(in_t, x_map, transpose, results, gx):
+    return _kernel("mps_identity", "MB_BUILD_MPS_IDENTITY", IN_T=in_t,
+                   X_MAP=x_map, TRANSPOSE_COPY=int(transpose),
+                   COPY_NR=results, COPY_GX=gx)[0]
 
 
 @lru_cache(maxsize=None)

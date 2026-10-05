@@ -1,0 +1,1269 @@
+{
+  "description": "Binary sources for the floating-point M1\u2013M5 dispatch models. Absolute virtual addresses are unslid Mach-O addresses. Timings are not inputs to the selection. The 26 and 27 model profiles refer to these captured builds, not all future builds with that major version.",
+  "library": "MPSNDArray.framework/Versions/A/MPSNDArray",
+  "snapshots": [
+    {
+      "macos": "26.3",
+      "build": "25D125",
+      "uuid": "b3d5a27e-7131-3748-a1b3-7f30448339e0",
+      "sha256": "60f01f4d5701537aa78b986c0393c01c76bb6926e724b55e785f3dfce1897b34",
+      "functions": {
+        "EncodeMatrixMultiplyLinkingA14": "0x18f726a38",
+        "MPSNDArrayVectorCompatibleWithDims": "0x18f720104",
+        "EncodeMatrixVectorMultiply": "0x18f733b04",
+        "MPSNDArrayReductionAA10BehaviorsCtor": "0x18f7ba3d0",
+        "EncodeReduction": "0x18f7ba760",
+        "MPSNDArrayReductionDefaultBehaviorsCtor": "0x18f7ba370",
+        "A14EncodeArrayMultiply": "0x18f725b88",
+        "EncodeArrayIdentity": "0x18f7c18a4",
+        "MPSNDArrayIdentityAppleBehaviorsCtor": "0x18f7c1754",
+        "MPSNDArrayIdentityBehaviors::getNXResultsPerThread": "0x18f7bf004",
+        "MPSNDArrayIdentityAppleBehaviors::getLaunchOrder": "0x18f7bf900"
+      },
+      "tables": {
+        "LORA_SIMDS": {
+          "address": "0x18f829478",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_ROWS": {
+          "address": "0x18f8294e8",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_UNROLL": {
+          "address": "0x18f829558",
+          "count": 14,
+          "format": "I",
+          "index": "narrow dimension minus 2 (2..15)"
+        }
+      },
+      "MPSCore": {
+        "uuid": "20da4812-306d-3414-9503-e5d1f1dd68d4",
+        "sha256": "53dda947e76231459dd93322499df4c167e34d38d02bd2b5dd6b0cd8179bd769",
+        "functions": {
+          "MPSDevice::GetTemporaryResourceStorageMode": "0x18dc1de2c",
+          "MPSDevice::GetDefaultCPUCacheMode": "0x18dc1de34",
+          "MPSDevice::GetHeapResourceHazardTrackingMode": "0x18dc1de3c",
+          "MPSGetTemporaryBufferFromCommandBufferCache": "0x18dc09d9c",
+          "MPSReturnTemporaryBufferToCommandBufferCache": "0x18dc09f04",
+          "MPSAutoCache::GetTempBuffer": "0x18dc09478",
+          "MPSAutoCache::ReleaseTempResource": "0x18dc08554",
+          "MPSAutoBuffer::AllocateResource": "0x18dc0abdc",
+          "MPSAutoBuffer::InitDeferredUsingTextureCache": "0x18dc0afb0",
+          "MPSAutoBuffer::ReleaseTemporaryBuffer": "0x18dc0b1f0"
+        },
+        "temporary_buffer_policy": {
+          "storage_mode": 2,
+          "cpu_cache_mode": 0,
+          "heap_resource_hazard_tracking_mode": 2,
+          "evidence": "All three getters are immediate-value mov/ret bodies in each captured MPSCore binary. Native encoder workspaces capture resourceOptions=544 (private, tracked, default CPU cache).",
+          "lifetime": "MPSAutoBuffer defers allocation through MPSAutoCache::GetTempBuffer and returns temporary resources through ReleaseTempResource after the final encoded use. Distinct objects may reuse a GPU virtual address.",
+          "runtime": "metalblas/native/submission.mm uses the private exported Get/Return command-buffer-cache wrappers for encoder workspaces. The native heap allocator is reused, not independently reimplemented. The cache owns these objects; the caller does not objc_release them.",
+          "scope": "Encoder workspaces use the private cache. Graph intermediates now follow the separately recovered MPSGraph policy recorded in graph_intermediate_policy.",
+          "validation_archive": "perf_benchs/mps_dispatch/temporary_buffers_2026-10-05.tar.gz"
+        }
+      },
+      "identity_behavior_parameters": {
+        "library_info": "0x1eeb26e40",
+        "apple_records": [
+          {
+            "record": 1,
+            "constructor": "0x18f7c1754",
+            "address": "0x1eeb26e80",
+            "value": 18
+          },
+          {
+            "record": 14,
+            "constructor": "0x18f7c1754",
+            "address": "0x1eeb26fb8",
+            "value": 18
+          }
+        ],
+        "format": "Q",
+        "description": "Apple constructor stores packed NX parameters at behavior+8. Low three bits apply at Y<=4096, upper bits at Y>4096; either extent<128 forces one result."
+      },
+      "MPSGraph": {
+        "library": "MetalPerformanceShadersGraph.framework/Versions/A/MetalPerformanceShadersGraph",
+        "uuid": "14ac3421-4e02-3df2-b7a6-cc7df4d04a8b",
+        "sha256": "25007a965d7f5e43baa5a06e89fe35e683d04023fc4a984d1f0e3b5b5f4ea09e",
+        "functions": {
+          "GPURegionRuntime::evaluateOps": "0x22bc4624c",
+          "GPURegionRuntime::evaluateOps::encodeCallback": "0x22bc5c06c",
+          "GPURegionRuntime::evaluateOps::statisticsCallback": "0x22bc79da4",
+          "computeProducedValues": "0x22bc4920c",
+          "GPU::EncodeDescriptor::commitAndContinue": "0x22bc5b798",
+          "MPSGraphExecutable::runInternalWithDevice": "0x22bf965fc",
+          "MPSGraphExecutable::scheduledEncodeCountHandler": "0x22bf980b8",
+          "MPSGraphExecutable::completedEncodeCountHandler": "0x22bf9831c",
+          "MPSGraphCompilationDescriptor::init": "0x22be0384c",
+          "MPSGraphCompilationDescriptor::setOptimizationLevel": "0x22be06b28",
+          "MPSGraphExecutable::applyOptimizationPassesWithDevice": "0x22bf844a4",
+          "mlir::mps::createGPURegionFormationPass": "0x228bf7c08",
+          "GPU::EncodeDescriptor::commitAndContinueDynamicallyChanges": "0x22bc5b84c",
+          "GPURegionRuntime::allocateTensorDataForValue": "0x22bc4acf4"
+        },
+        "scope": "Command-buffer reference model in tools/mps_submission_model.py. The ordinary public-operation subset is integrated in metalblas/mps_submission.py and metalblas/native/submission.mm; general graph splitting and the global GPU-region override remain unsupported.",
+        "encode_count_lifecycle": {
+          "scheduled_handler_registration": "0x22bf973d0",
+          "completed_handler_registration": "0x22bf976f8",
+          "scheduled_update": "+1 under _encodeCountLock",
+          "completed_update": "-1 under _encodeCountLock",
+          "registration_order": "Scheduled before MPSRuntime::evaluateOps; completed after it. A region submission can place the handlers on different root command buffers."
+        },
+        "compiler_regions": {
+          "constructor_options": "0x10058f",
+          "optimization_level_0_options": "0x10050f",
+          "gpu_region_bit": "0x800",
+          "gpu_region_bit_set": false,
+          "condition": "A non-null Metal GPU device and either compiler-options bit 11 or the separate global override. Level 0 clears bit 7 only.",
+          "validation": "51 native public calls with matching compiled masks and topology; this is a captured OS/compiler default, not a GPU-core threshold."
+        },
+        "statistics_accounting": "Recursive walk excludes children of StitchedOp. Ordinary eligible operations contribute output elements. MemrefBackedOp itself is excluded; its nested operations are still visited.",
+        "disabled_commit_and_continue": {
+          "base_dynamic_changes": false,
+          "evidence": "The base virtual method consists of mov w0, #0; ret. The encoding callback advances counters only when enableCommitAndContinue or dynamic changes is true.",
+          "scope": "Ordinary serial EncodeDescriptor. Parallel BlockingEncodeDescriptor has a separate dynamic policy and is not modeled by the disabled-mode helper.",
+          "validation": "M2/macOS 26.3, M3 Ultra/macOS 26.5.2 and M5 Pro/macOS 27.2: 45 native/source pairs each across normal, early/late Signpost tracing, capture-enabled and active-capture modes. All descriptor writes and commit counts match in the default-runtime integration."
+        },
+        "graph_intermediate_policy": {
+          "scope": "The single static dense intermediate in public addbmm with batch > 1; no arbitrary MLIR graph bufferization is implemented.",
+          "compiler_options_captured": "0x10050f",
+          "memref_option_bit": "0x4000",
+          "memref_bufferization_available": false,
+          "selection": "Use the actual execution descriptor compilerOptions bit 14, with selector availability as a compatibility guard. No device-generation, OS-version, shape-timing or latency threshold selects storage.",
+          "legacy_path": "GPURegionRuntime::allocateTensorDataForValue creates MPSTemporaryNDArray for this ephemeral graph result; the port uses MPSCore Get/Return cache wrappers for its backing buffer.",
+          "legacy_allocation_return_address": "0x22bc4ba84",
+          "runtime": "The native program marks graph-result storage separately from encoder workspaces. Shared placement buffers are retained per executable and Metal command queue; scheduled/completed handlers preserve their owner through GPU completion.",
+          "validation_archive": "perf_benchs/mps_dispatch/graph_allocator_2026-10-05.tar.gz"
+        }
+      }
+    },
+    {
+      "macos": "26.5.2",
+      "build": "25F84",
+      "uuid": "1cbc037e-8038-32f6-880a-6f3825544713",
+      "sha256": "8f329c212dd538b8adcec62bf15cb04a7b8cc3cc0d29afdf6e3fe82ce4417b78",
+      "functions": {
+        "EncodeMatrixMultiplyLinkingA14": "0x18faaebfc",
+        "MPSNDArrayVectorCompatibleWithDims": "0x18faa7e54",
+        "EncodeMatrixVectorMultiply": "0x18fabba7c",
+        "EncodeReduction": "0x18fb495f4",
+        "MPSNDArrayReductionDefaultBehaviorsCtor": "0x18fb49204",
+        "MPSNDArrayReductionAA10BehaviorsCtor": "0x18fb49264",
+        "A14EncodeArrayMultiply": "0x18faadd6c",
+        "MPSNDArrayIdentityAppleBehaviorsCtor": "0x18fb503c8",
+        "MPSNDArrayIdentityBehaviors::getNXResultsPerThread": "0x18fb4df5c",
+        "MPSNDArrayIdentityAppleBehaviors::getLaunchOrder": "0x18fb4e7c4",
+        "EncodeArrayIdentity": "0x18fb50518"
+      },
+      "tables": {
+        "LORA_SIMDS": {
+          "address": "0x18fbb9f48",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_ROWS": {
+          "address": "0x18fbb9fb8",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_UNROLL": {
+          "address": "0x18fbba028",
+          "count": 14,
+          "format": "I",
+          "index": "narrow dimension minus 2 (2..15)"
+        }
+      },
+      "MPSCore": {
+        "uuid": "5ecfea4e-d0ed-3809-ae36-f6a226913ec1",
+        "sha256": "35a0d431778201746780fe383f12da8b81f175642ccfb81ec99d38dabce18e21",
+        "functions": {
+          "MPSDevice::GetTemporaryResourceStorageMode": "0x18dee0ef8",
+          "MPSDevice::GetDefaultCPUCacheMode": "0x18dee0f00",
+          "MPSDevice::GetHeapResourceHazardTrackingMode": "0x18dee0f08",
+          "MPSGetTemporaryBufferFromCommandBufferCache": "0x18deccb54",
+          "MPSReturnTemporaryBufferToCommandBufferCache": "0x18decccbc",
+          "MPSAutoCache::GetTempBuffer": "0x18decc260",
+          "MPSAutoCache::ReleaseTempResource": "0x18decb3a4",
+          "MPSAutoBuffer::AllocateResource": "0x18decd990",
+          "MPSAutoBuffer::InitDeferredUsingTextureCache": "0x18decdd34",
+          "MPSAutoBuffer::ReleaseTemporaryBuffer": "0x18decdf74"
+        },
+        "temporary_buffer_policy": {
+          "storage_mode": 2,
+          "cpu_cache_mode": 0,
+          "heap_resource_hazard_tracking_mode": 2,
+          "evidence": "All three getters are immediate-value mov/ret bodies in each captured MPSCore binary. Native encoder workspaces capture resourceOptions=544 (private, tracked, default CPU cache).",
+          "lifetime": "MPSAutoBuffer defers allocation through MPSAutoCache::GetTempBuffer and returns temporary resources through ReleaseTempResource after the final encoded use. Distinct objects may reuse a GPU virtual address.",
+          "runtime": "metalblas/native/submission.mm uses the private exported Get/Return command-buffer-cache wrappers for encoder workspaces. The native heap allocator is reused, not independently reimplemented. The cache owns these objects; the caller does not objc_release them.",
+          "scope": "Encoder workspaces use the private cache. Graph intermediates now follow the separately recovered MPSGraph policy recorded in graph_intermediate_policy.",
+          "validation_archive": "perf_benchs/mps_dispatch/temporary_buffers_2026-10-05.tar.gz"
+        }
+      },
+      "identity_behavior_parameters": {
+        "library_info": "0x1eeb70dc0",
+        "apple_records": [
+          {
+            "record": 1,
+            "constructor": "0x18fb503c8",
+            "address": "0x1eeb70e00",
+            "value": 18
+          },
+          {
+            "record": 14,
+            "constructor": "0x18fb503c8",
+            "address": "0x1eeb70f38",
+            "value": 18
+          }
+        ],
+        "format": "Q",
+        "description": "Apple constructor stores packed NX parameters at behavior+8. Low three bits apply at Y<=4096, upper bits at Y>4096; either extent<128 forces one result."
+      },
+      "MPSGraph": {
+        "library": "MetalPerformanceShadersGraph.framework/Versions/A/MetalPerformanceShadersGraph",
+        "uuid": "2b46e751-d7e4-3728-aa48-1c621e58e7d1",
+        "sha256": "6cbb213ad4835d50cd304db844148d724b4f4de9793631a26f7f69883b8d5f2f",
+        "functions": {
+          "GPURegionRuntime::evaluateOps": "0x22aaf5710",
+          "GPURegionRuntime::evaluateOps::encodeCallback": "0x22ab0b984",
+          "GPURegionRuntime::evaluateOps::statisticsCallback": "0x22ab29218",
+          "computeProducedValues": "0x22aaf8678",
+          "GPU::EncodeDescriptor::commitAndContinue": "0x22ab0b0d8",
+          "MPSGraphExecutable::runInternalWithDevice": "0x22ae562d4",
+          "MPSGraphExecutable::scheduledEncodeCountHandler": "0x22ae57d9c",
+          "MPSGraphExecutable::completedEncodeCountHandler": "0x22ae58000",
+          "MPSGraphCompilationDescriptor::init": "0x22acbd714",
+          "MPSGraphCompilationDescriptor::setOptimizationLevel": "0x22acc08e4",
+          "MPSGraphExecutable::applyOptimizationPassesWithDevice": "0x22ae44d80",
+          "mlir::mps::createGPURegionFormationPass": "0x22a097040",
+          "GPU::EncodeDescriptor::commitAndContinueDynamicallyChanges": "0x22ab0b18c",
+          "GPURegionRuntime::allocateTensorDataForValue": "0x22aafa15c"
+        },
+        "scope": "Command-buffer reference model in tools/mps_submission_model.py. The ordinary public-operation subset is integrated in metalblas/mps_submission.py and metalblas/native/submission.mm; general graph splitting and the global GPU-region override remain unsupported.",
+        "encode_count_lifecycle": {
+          "scheduled_handler_registration": "0x22ae570c0",
+          "completed_handler_registration": "0x22ae573d8",
+          "scheduled_update": "+1 under _encodeCountLock",
+          "completed_update": "-1 under _encodeCountLock",
+          "registration_order": "Scheduled before MPSRuntime::evaluateOps; completed after it. A region submission can place the handlers on different root command buffers."
+        },
+        "compiler_regions": {
+          "constructor_options": "0x58f",
+          "optimization_level_0_options": "0x50f",
+          "gpu_region_bit": "0x800",
+          "gpu_region_bit_set": false,
+          "condition": "A non-null Metal GPU device and either compiler-options bit 11 or the separate global override. Level 0 clears bit 7 only.",
+          "validation": "51 native public calls with matching compiled masks and topology; this is a captured OS/compiler default, not a GPU-core threshold."
+        },
+        "statistics_accounting": "Recursive walk excludes children of StitchedOp. Ordinary eligible operations contribute output elements. MemrefBackedOp itself is excluded; its nested operations are still visited.",
+        "disabled_commit_and_continue": {
+          "base_dynamic_changes": false,
+          "evidence": "The base virtual method consists of mov w0, #0; ret. The encoding callback advances counters only when enableCommitAndContinue or dynamic changes is true.",
+          "scope": "Ordinary serial EncodeDescriptor. Parallel BlockingEncodeDescriptor has a separate dynamic policy and is not modeled by the disabled-mode helper.",
+          "validation": "M2/macOS 26.3, M3 Ultra/macOS 26.5.2 and M5 Pro/macOS 27.2: 45 native/source pairs each across normal, early/late Signpost tracing, capture-enabled and active-capture modes. All descriptor writes and commit counts match in the default-runtime integration."
+        },
+        "graph_intermediate_policy": {
+          "scope": "The single static dense intermediate in public addbmm with batch > 1; no arbitrary MLIR graph bufferization is implemented.",
+          "compiler_options_captured": "0x50f",
+          "memref_option_bit": "0x4000",
+          "memref_bufferization_available": false,
+          "selection": "Use the actual execution descriptor compilerOptions bit 14, with selector availability as a compatibility guard. No device-generation, OS-version, shape-timing or latency threshold selects storage.",
+          "legacy_path": "GPURegionRuntime::allocateTensorDataForValue creates MPSTemporaryNDArray for this ephemeral graph result; the port uses MPSCore Get/Return cache wrappers for its backing buffer.",
+          "legacy_allocation_return_address": "0x22aafaf34",
+          "runtime": "The native program marks graph-result storage separately from encoder workspaces. Shared placement buffers are retained per executable and Metal command queue; scheduled/completed handlers preserve their owner through GPU completion.",
+          "validation_archive": "perf_benchs/mps_dispatch/graph_allocator_2026-10-05.tar.gz"
+        }
+      }
+    },
+    {
+      "macos": "26.6",
+      "build": "25G5028f",
+      "uuid": "0ad27d05-08b7-392d-8a99-7c9ded35b4cc",
+      "sha256": "c734fadc11f4161059f10c55d4ffaca8c3ed1a3e1352d13fe3c454e9df214324",
+      "functions": {
+        "EncodeMatrixMultiplyLinkingA14": "0x18fb88bfc",
+        "MPSNDArrayVectorCompatibleWithDims": "0x18fb81e54",
+        "EncodeMatrixVectorMultiply": "0x18fb95a7c",
+        "EncodeReduction": "0x18fc235f4",
+        "MPSNDArrayReductionDefaultBehaviorsCtor": "0x18fc23204",
+        "MPSNDArrayReductionAA10BehaviorsCtor": "0x18fc23264",
+        "A14EncodeArrayMultiply": "0x18fb87d6c",
+        "MPSNDArrayIdentityAppleBehaviorsCtor": "0x18fc2a3c8",
+        "MPSNDArrayIdentityBehaviors::getNXResultsPerThread": "0x18fc27f5c",
+        "MPSNDArrayIdentityAppleBehaviors::getLaunchOrder": "0x18fc287c4",
+        "EncodeArrayIdentity": "0x18fc2a518"
+      },
+      "tables": {
+        "LORA_SIMDS": {
+          "address": "0x18fc93f48",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_ROWS": {
+          "address": "0x18fc93fb8",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_UNROLL": {
+          "address": "0x18fc94028",
+          "count": 14,
+          "format": "I",
+          "index": "narrow dimension minus 2 (2..15)"
+        }
+      },
+      "MPSCore": {
+        "uuid": "42450b44-1c47-34c8-9dbc-7233795687f6",
+        "sha256": "ee340f103b10c811524dc591db5036ff269a3d7ec8ab02960089f4734564e4f5",
+        "functions": {
+          "MPSDevice::GetTemporaryResourceStorageMode": "0x18dfd8ef8",
+          "MPSDevice::GetDefaultCPUCacheMode": "0x18dfd8f00",
+          "MPSDevice::GetHeapResourceHazardTrackingMode": "0x18dfd8f08",
+          "MPSGetTemporaryBufferFromCommandBufferCache": "0x18dfc4b54",
+          "MPSReturnTemporaryBufferToCommandBufferCache": "0x18dfc4cbc",
+          "MPSAutoCache::GetTempBuffer": "0x18dfc4260",
+          "MPSAutoCache::ReleaseTempResource": "0x18dfc33a4",
+          "MPSAutoBuffer::AllocateResource": "0x18dfc5990",
+          "MPSAutoBuffer::InitDeferredUsingTextureCache": "0x18dfc5d34",
+          "MPSAutoBuffer::ReleaseTemporaryBuffer": "0x18dfc5f74"
+        },
+        "temporary_buffer_policy": {
+          "storage_mode": 2,
+          "cpu_cache_mode": 0,
+          "heap_resource_hazard_tracking_mode": 2,
+          "evidence": "All three getters are immediate-value mov/ret bodies in each captured MPSCore binary. Native encoder workspaces capture resourceOptions=544 (private, tracked, default CPU cache).",
+          "lifetime": "MPSAutoBuffer defers allocation through MPSAutoCache::GetTempBuffer and returns temporary resources through ReleaseTempResource after the final encoded use. Distinct objects may reuse a GPU virtual address.",
+          "runtime": "metalblas/native/submission.mm uses the private exported Get/Return command-buffer-cache wrappers for encoder workspaces. The native heap allocator is reused, not independently reimplemented. The cache owns these objects; the caller does not objc_release them.",
+          "scope": "Encoder workspaces use the private cache. Graph intermediates now follow the separately recovered MPSGraph policy recorded in graph_intermediate_policy."
+        }
+      },
+      "identity_behavior_parameters": {
+        "library_info": "0x1ef44d9c0",
+        "apple_records": [
+          {
+            "record": 1,
+            "constructor": "0x18fc2a3c8",
+            "address": "0x1ef44da00",
+            "value": 18
+          },
+          {
+            "record": 14,
+            "constructor": "0x18fc2a3c8",
+            "address": "0x1ef44db38",
+            "value": 18
+          }
+        ],
+        "format": "Q",
+        "description": "Apple constructor stores packed NX parameters at behavior+8. Low three bits apply at Y<=4096, upper bits at Y>4096; either extent<128 forces one result."
+      },
+      "MPSGraph": {
+        "library": "MetalPerformanceShadersGraph.framework/Versions/A/MetalPerformanceShadersGraph",
+        "uuid": "ecff3a92-88f5-3780-94ce-f4c637e24bf5",
+        "sha256": "fb98574ea930092c88334f35363cf25ba0824c4b06720550389073ac25911f82",
+        "functions": {
+          "GPURegionRuntime::evaluateOps": "0x22b6b3710",
+          "GPURegionRuntime::evaluateOps::encodeCallback": "0x22b6c9984",
+          "GPURegionRuntime::evaluateOps::statisticsCallback": "0x22b6e7218",
+          "computeProducedValues": "0x22b6b6678",
+          "GPU::EncodeDescriptor::commitAndContinue": "0x22b6c90d8",
+          "MPSGraphExecutable::runInternalWithDevice": "0x22ba142d4",
+          "MPSGraphExecutable::scheduledEncodeCountHandler": "0x22ba15d9c",
+          "MPSGraphExecutable::completedEncodeCountHandler": "0x22ba16000",
+          "MPSGraphCompilationDescriptor::init": "0x22b87b714",
+          "MPSGraphCompilationDescriptor::setOptimizationLevel": "0x22b87e8e4",
+          "MPSGraphExecutable::applyOptimizationPassesWithDevice": "0x22ba02d80",
+          "mlir::mps::createGPURegionFormationPass": "0x22ac55040",
+          "GPU::EncodeDescriptor::commitAndContinueDynamicallyChanges": "0x22b6c918c",
+          "GPURegionRuntime::allocateTensorDataForValue": "0x22b6b815c"
+        },
+        "scope": "Command-buffer reference model in tools/mps_submission_model.py. The ordinary public-operation subset is integrated in metalblas/mps_submission.py and metalblas/native/submission.mm; general graph splitting and the global GPU-region override remain unsupported.",
+        "encode_count_lifecycle": {
+          "scheduled_handler_registration": "0x22ba150c0",
+          "completed_handler_registration": "0x22ba153d8",
+          "scheduled_update": "+1 under _encodeCountLock",
+          "completed_update": "-1 under _encodeCountLock",
+          "registration_order": "Scheduled before MPSRuntime::evaluateOps; completed after it. A region submission can place the handlers on different root command buffers."
+        },
+        "compiler_regions": {
+          "constructor_options": "0x58f",
+          "optimization_level_0_options": "0x50f",
+          "gpu_region_bit": "0x800",
+          "gpu_region_bit_set": false,
+          "condition": "A non-null Metal GPU device and either compiler-options bit 11 or the separate global override. Level 0 clears bit 7 only."
+        },
+        "statistics_accounting": "Recursive walk excludes children of StitchedOp. Ordinary eligible operations contribute output elements. MemrefBackedOp itself is excluded; its nested operations are still visited.",
+        "disabled_commit_and_continue": {
+          "base_dynamic_changes": false,
+          "evidence": "The base virtual method consists of mov w0, #0; ret. The encoding callback advances counters only when enableCommitAndContinue or dynamic changes is true.",
+          "scope": "Ordinary serial EncodeDescriptor. Parallel BlockingEncodeDescriptor has a separate dynamic policy and is not modeled by the disabled-mode helper."
+        },
+        "graph_intermediate_policy": {
+          "scope": "The single static dense intermediate in public addbmm with batch > 1; no arbitrary MLIR graph bufferization is implemented.",
+          "compiler_options_captured": "0x50f",
+          "memref_option_bit": "0x4000",
+          "memref_bufferization_available": false,
+          "selection": "Use the actual execution descriptor compilerOptions bit 14, with selector availability as a compatibility guard. No device-generation, OS-version, shape-timing or latency threshold selects storage.",
+          "legacy_path": "GPURegionRuntime::allocateTensorDataForValue creates MPSTemporaryNDArray for this ephemeral graph result; the port uses MPSCore Get/Return cache wrappers for its backing buffer.",
+          "legacy_allocation_return_address": "0x22b6b8f34",
+          "runtime": "The native program marks graph-result storage separately from encoder workspaces. Shared placement buffers are retained per executable and Metal command queue; scheduled/completed handlers preserve their owner through GPU completion."
+        }
+      },
+      "captured_on": "M4, 10 GPU cores, MPS generation 20",
+      "code_identity": {
+        "reference_build": "25F84",
+        "method": "objdump --macho -d of each dyld-extracted binary; per-symbol instruction streams compared after removing load addresses, adrp page numbers and page-relative immediates (scratch tools normdis.py/classify.py).",
+        "MPSNDArray": "All 2,350 common functions identical, including all 336 matmul/vector/identity/reduction/LoRA functions.",
+        "MPSCore": "All common functions identical.",
+        "MPSGraph": "All 85,232 common functions identical (submission, region formation, executable, compilation descriptor and MatMulOpHandler paths included).",
+        "tables": "LORA_SIMDS/ROWS/UNROLL and identity Apple records re-read at the mapped addresses; values equal the 26.5.2 snapshot.",
+        "shaders": "mmul_kernel_a16_{float,half,bfloat}, NDArrayVectorMatrixMultiply_{1_4,5_8,9_12,13_16}, LORADOWN_gemv_kernel, ndArrayIdentity[Transpose], NDArrayMatrixMultiplyReduction and reduce_multiple_passes_axes_add AIR are identical after metal-opt -S and metadata/type-suffix normalization."
+      }
+    },
+    {
+      "macos": "27.2",
+      "build": "26B5086k",
+      "uuid": "260335b6-18aa-3173-b44d-d9ee2cf0048a",
+      "sha256": "0305c65ae662a1d7bec597011c3bad490c01cf9647631b0c57097855237e9822",
+      "functions": {
+        "EncodeMatrixMultiplyLinkingA14": "0x190c778a4",
+        "MPSNDArrayIsVectorKernelPreferred": "0x190c6f378",
+        "EncodeMatrixVectorMultiply": "0x190c84d58",
+        "MPSNDArrayMatMulA18DeviceBehavior::_A18GEMMHeuristicForLowCoreCountGPU": "0x190c75d24",
+        "MPSNDArrayMatMulA18DeviceBehavior::GetKernelDispatchParametersForKey": "0x190c76638",
+        "MPSNDArrayMatMulDeviceBehavior::MPSNDArrayMatMulDeviceBehavior": "0x190c84858",
+        "MPSNDArrayMatMulA18DeviceBehavior::_A18GEMMHeuristicForHighCoreCountGPU": "0x190c75f30",
+        "MPSNDArrayMatMulA18DeviceBehavior::MPSNDArrayMatMulA18DeviceBehavior": "0x190c83abc",
+        "EncodeReduction": "0x190d0bf60",
+        "MPSNDArrayReductionDefaultBehaviorsCtor": "0x190d0bb54",
+        "MPSNDArrayReductionAA10BehaviorsCtor": "0x190d0bbb4",
+        "A18EncodeArrayMultiply": "0x190c70408",
+        "A14EncodeArrayMultiply": "0x190c7697c",
+        "readSrcTempNDArray": "0x190c7d314",
+        "MPSNDArrayIdentityBehaviors::getNXResultsPerThread": "0x190d10b8c",
+        "MPSNDArrayIdentityAppleBehaviors::getLaunchOrder": "0x190d111fc",
+        "EncodeArrayIdentity": "0x190d129fc",
+        "MPSNDArrayIdentityAppleBehaviorsCtor": "0x190d128a4"
+      },
+      "tables": {
+        "LORA_SIMDS": {
+          "address": "0x190dd1d70",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_ROWS": {
+          "address": "0x190dd1de0",
+          "count": 14,
+          "format": "Q",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "LORA_UNROLL": {
+          "address": "0x190dd1e50",
+          "count": 14,
+          "format": "I",
+          "index": "narrow dimension minus 2 (2..15)"
+        },
+        "A18G": {
+          "address": "0x190d74210",
+          "count": 118,
+          "format": "38I",
+          "index": "ordered exact-key matches; first duplicate wins"
+        },
+        "A18S": {
+          "address": "0x190d78824",
+          "count": 164,
+          "format": "38I",
+          "index": "ordered exact-key matches; first duplicate wins"
+        },
+        "A18C": {
+          "address": "0x190d7e984",
+          "count": 118,
+          "format": "38I",
+          "index": "ordered exact-key matches; first duplicate wins"
+        },
+        "A20P": {
+          "address": "0x190d82f98",
+          "count": 127,
+          "format": "38I",
+          "index": "ordered exact-key matches; first duplicate wins"
+        }
+      },
+      "MPSCore": {
+        "uuid": "3303c2fd-2805-3e46-a94b-55ed023c6c12",
+        "sha256": "9f4d99515ef17e31e9e147473c8f2a1a6e98c9a36a70a1ec38f14470e888fcd4",
+        "functions": {
+          "MPSDevice::GetTemporaryResourceStorageMode": "0x18ebb40cc",
+          "MPSDevice::GetDefaultCPUCacheMode": "0x18ebb40d4",
+          "MPSDevice::GetHeapResourceHazardTrackingMode": "0x18ebb40dc",
+          "MPSGetTemporaryBufferFromCommandBufferCache": "0x18eb9f584",
+          "MPSReturnTemporaryBufferToCommandBufferCache": "0x18eb9f6ec",
+          "MPSAutoCache::GetTempBuffer": "0x18eb9ec94",
+          "MPSAutoCache::ReleaseTempResource": "0x18eb9dfb0",
+          "MPSAutoBuffer::AllocateResource": "0x18eba03c0",
+          "MPSAutoBuffer::InitDeferredUsingTextureCache": "0x18eba0760",
+          "MPSAutoBuffer::ReleaseTemporaryBuffer": "0x18eba09a0",
+          "MPSDevice::GetResourceStorageMode": "0x18ebb40bc",
+          "MPSTemporaryNDArray::temporaryNDArrayWithCommandBuffer:descriptor:": "0x18eb930ec",
+          "MPSTemporaryNDArray::initWithCommandBuffer:descriptor:": "0x18eb92e90"
+        },
+        "temporary_buffer_policy": {
+          "storage_mode": 2,
+          "cpu_cache_mode": 0,
+          "heap_resource_hazard_tracking_mode": 2,
+          "evidence": "All three getters are immediate-value mov/ret bodies in each captured MPSCore binary. Native encoder workspaces capture resourceOptions=544 (private, tracked, default CPU cache).",
+          "lifetime": "MPSAutoBuffer defers allocation through MPSAutoCache::GetTempBuffer and returns temporary resources through ReleaseTempResource after the final encoded use. Distinct objects may reuse a GPU virtual address.",
+          "runtime": "metalblas/native/submission.mm uses the private exported Get/Return command-buffer-cache wrappers for encoder workspaces. The native heap allocator is reused, not independently reimplemented. The cache owns these objects; the caller does not objc_release them.",
+          "scope": "Encoder workspaces use the private cache. Graph intermediates now follow the separately recovered MPSGraph policy recorded in graph_intermediate_policy.",
+          "validation_archive": "perf_benchs/mps_dispatch/temporary_buffers_2026-10-05.tar.gz"
+        }
+      },
+      "identity_behavior_parameters": {
+        "library_info": "0x1e330ea40",
+        "apple_records": [
+          {
+            "record": 1,
+            "constructor": "0x190d128a4",
+            "address": "0x1e330ea80",
+            "value": 18
+          },
+          {
+            "record": 14,
+            "constructor": "0x190d128a4",
+            "address": "0x1e330ebb8",
+            "value": 18
+          }
+        ],
+        "format": "Q",
+        "description": "Apple constructor stores packed NX parameters at behavior+8. Low three bits apply at Y<=4096, upper bits at Y>4096; either extent<128 forces one result."
+      },
+      "MPSGraph": {
+        "library": "MetalPerformanceShadersGraph.framework/Versions/A/MetalPerformanceShadersGraph",
+        "uuid": "3c78feed-700c-356e-9d2c-26c95f0c81d8",
+        "sha256": "a01e5058f0dd29c2f3056e49599da760c07041760c353e82a49aded9640052b6",
+        "functions": {
+          "GPURegionRuntime::evaluateOps": "0x220f7f6bc",
+          "GPURegionRuntime::evaluateOps::encodeCallback": "0x220f95cac",
+          "GPURegionRuntime::evaluateOps::statisticsCallback": "0x220fac0c8",
+          "computeProducedValues": "0x220f83b9c",
+          "GPU::EncodeDescriptor::commitAndContinue": "0x220f94c30",
+          "MPSGraphExecutable::runInternalWithDevice": "0x22130eca4",
+          "MPSGraphExecutable::scheduledEncodeCountHandler": "0x221310a84",
+          "MPSGraphExecutable::completedEncodeCountHandler": "0x221310cd8",
+          "MPSGraphCompilationDescriptor::init": "0x221144a58",
+          "MPSGraphCompilationDescriptor::setOptimizationLevel": "0x221147ad4",
+          "MPSGraphExecutable::applyOptimizationPassesWithDevice": "0x2212f7f60",
+          "mlir::mps::createGPURegionFormationPass": "0x2216ee514",
+          "GPU::GPURegionCallOpHandler::evaluate": "0x2211bb31c",
+          "GPU::encodeRegion": "0x2211bd2a4",
+          "mlir::mpsx::GPURegionParallelEncodePass::runOnOperation": "0x221742064",
+          "GPU::EncodeDescriptor::commitAndContinueDynamicallyChanges": "0x220f94d44",
+          "GPURegionRuntime::allocateTensorDataForValue": "0x220f84ae8",
+          "MPSGraphCompilationDescriptor::setEnableMemrefBufferization": "0x221147b60",
+          "MPSGraphCompilationDescriptor::enableMemrefBufferization": "0x2211482f4",
+          "mlir::mps::isRegionMemrefRegionPassCompatible": "0x2216b2560",
+          "mlir::mps::isRegionMemrefRegionPassCompatible::typePredicate": "0x2216b279c",
+          "GPU::MemrefBufferizer::createMemrefHeap": "0x22113998c",
+          "GPU::MemrefBufferizer::allocateMTLBufferFromMTLHeap": "0x22113c218",
+          "GPU::MemrefBufferizer::freeBufferForValue": "0x22113d698",
+          "GPU::ViewMemrefOpHandler::constructor": "0x221254398",
+          "GPU::ViewMemrefOpHandler::encodeOp": "0x221254cc8"
+        },
+        "scope": "Command-buffer reference model in tools/mps_submission_model.py. The ordinary public-operation subset is integrated in metalblas/mps_submission.py and metalblas/native/submission.mm; general graph splitting and the global GPU-region override remain unsupported.",
+        "encode_count_lifecycle": {
+          "scheduled_handler_registration": "0x22130fc4c",
+          "completed_handler_registration": "0x22130fffc",
+          "scheduled_update": "+1 under _encodeCountLock",
+          "completed_update": "-1 under _encodeCountLock",
+          "registration_order": "Scheduled before MPSRuntime::evaluateOps; completed after it. A region submission can place the handlers on different root command buffers.",
+          "entry_point_note": "The runInternalWithDevice overload with the trailing error: parameter.",
+          "shared_cache_selector_stubs": {
+            "0x22801bc30": "addScheduledHandler:",
+            "0x22801bb60": "addCompletedHandler:"
+          }
+        },
+        "compiler_regions": {
+          "constructor_options": "0x31cd8f",
+          "optimization_level_0_options": "0x31cd0f",
+          "gpu_region_bit": "0x800",
+          "gpu_region_bit_set": true,
+          "condition": "A non-null Metal GPU device and either compiler-options bit 11 or the separate global override. Level 0 clears bit 7 only.",
+          "validation": "51 native public calls with matching compiled masks and topology; this is a captured OS/compiler default, not a GPU-core threshold.",
+          "parallel_descriptor_defaults": {
+            "enabled": true,
+            "minimum_operations": 100,
+            "maximum_regions": 1,
+            "maximum_field_condition": "Used by the pass only when the separate global override is enabled; otherwise the pipeline takes its maximum from global configuration."
+          }
+        },
+        "statistics_accounting": "Recursive walk excludes children of StitchedOp. Ordinary eligible operations contribute output elements. MemrefBackedOp contributes the recursive byte-weighted sum, and its nested operations are also visited. Encoding counters use the unweighted path.",
+        "parallel_submission_calls": {
+          "before_child_group": "0x2211bb790",
+          "child_exit": "0x2211be120",
+          "scope": "Call sites verified by disassembly and native stacks for the three captured two-child chain graphs. General splitting/scheduling is not modeled."
+        },
+        "disabled_commit_and_continue": {
+          "base_dynamic_changes": false,
+          "evidence": "The base virtual method consists of mov w0, #0; ret. The encoding callback advances counters only when enableCommitAndContinue or dynamic changes is true.",
+          "scope": "Ordinary serial EncodeDescriptor. Parallel BlockingEncodeDescriptor has a separate dynamic policy and is not modeled by the disabled-mode helper.",
+          "validation": "M2/macOS 26.3, M3 Ultra/macOS 26.5.2 and M5 Pro/macOS 27.2: 45 native/source pairs each across normal, early/late Signpost tracing, capture-enabled and active-capture modes. All descriptor writes and commit counts match in the default-runtime integration."
+        },
+        "graph_intermediate_policy": {
+          "scope": "The single static dense intermediate in public addbmm with batch > 1; no arbitrary MLIR graph bufferization is implemented.",
+          "compiler_options_captured": "0x31cd0f",
+          "memref_option_bit": "0x4000",
+          "memref_bufferization_available": true,
+          "selection": "Use the actual execution descriptor compilerOptions bit 14, with selector availability as a compatibility guard. No device-generation, OS-version, shape-timing or latency threshold selects storage.",
+          "legacy_path": "GPURegionRuntime::allocateTensorDataForValue creates MPSTemporaryNDArray for this ephemeral graph result; the port uses MPSCore Get/Return cache wrappers for its backing buffer.",
+          "legacy_allocation_return_address": "0x220f8571c",
+          "runtime": "The native program marks graph-result storage separately from encoder workspaces. Shared placement buffers are retained per executable and Metal command queue; scheduled/completed handlers preserve their owner through GPU completion.",
+          "validation_archive": "perf_benchs/mps_dispatch/graph_allocator_2026-10-05.tar.gz",
+          "source_gate": "applyOptimizationPassesWithDevice checks a Metal device and compilerOptions bit 14 at 0x2212fb978, then walks isModuleMemrefRegionCompatible before creating the memref region pass. The type predicate rejects list types and unsupported dynamic shapes; the fixed public addbmm plan is static and dense.",
+          "view_rounding": "ViewMemrefOpHandler constructor 0x2212547d4..0x221254824 obtains getMemrefSizeInBytes, calls heapBufferSizeAndAlignWithLength:options: with options 0, and computes ceil(size / align) * align for the view length. The heap creation repeats the device alignment query. No alignment size is hard-coded.",
+          "heap": {
+            "storage_mode": 0,
+            "cpu_cache_mode": 0,
+            "hazard_tracking_mode": 2,
+            "type": 1,
+            "buffer_options_argument": 0
+          },
+          "causal_validation": "Calling setEnableMemrefBufferization:false before Torch initialization clears bit 0x4000 (0x31cd0f -> 0x318d0f). Native MPS and the source port switch from persistent shared placement storage to private temporary storage and retain correct outputs.",
+          "limitations": "The full fused-allocation planner, residency sets and cloned-heap idle reclamation are not ported. Recovered native cloned-queue idle interval is 5000000000 ns; this value is evidence only and is not an implementation parameter."
+        }
+      }
+    }
+  ],
+  "shader_libraries": [
+    {
+      "macos": "26.3",
+      "build": "25D125",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib",
+      "sha256": "0bc179df66066a6f040231b9dfd6a863c23bbec9768d1c98210a306fc1df8d85",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "NDArrayMatrixMultiplyNNA14_EdgeCase": {
+          "offset": "0x392383c",
+          "size": 98864,
+          "sha256": "80e4b0abe4fdf2558d67220eb89535f1853acb8ea4121747a8d4577139416d56"
+        },
+        "NDArrayMatrixMultiplyNNA14": {
+          "offset": "0x393ba6c",
+          "size": 32368,
+          "sha256": "f0f01a02ffb295715024ec6dc44722528153e668a4b1d80c89b5dfa7a3c30f4b"
+        },
+        "NDArrayMatrixMultiplyReduction": {
+          "offset": "0x39438dc",
+          "size": 11456,
+          "sha256": "735c083a490a534550a6673bb3a8724147761435b36aae5f6fc56b1153e1a98a"
+        },
+        "NDArrayVectorMatrixMultiply_1_4": {
+          "offset": "0xc9c3bc",
+          "size": 1634512,
+          "sha256": "266e3086092d18dda0df496efdda9cd833174dc44e9f8dd7c86567de60f44df1"
+        },
+        "NDArrayVectorMatrixMultiply_5_8": {
+          "offset": "0xe2b48c",
+          "size": 1180624,
+          "sha256": "71b43f187d8e7bac94fd36b13452b8487ca9308ebb8632d761932ac56c3e9320"
+        },
+        "NDArrayVectorMatrixMultiply_9_12": {
+          "offset": "0xf4b85c",
+          "size": 870864,
+          "sha256": "825ff6d4f2dfbc39f2e00463a1b33164ee3cdad66ff501937cc690ef3018c710"
+        },
+        "NDArrayVectorMatrixMultiply_13_16": {
+          "offset": "0x102022c",
+          "size": 870960,
+          "sha256": "627d40bbd4a74154f828f83bc82008c8efa759fc68da2053303874515e03b7f6"
+        },
+        "LORADOWN_gemv_kernel": {
+          "offset": "0x3cb8d9c",
+          "size": 18080,
+          "sha256": "2cb52839d6f90cf242d8ed4bcab8bab6b49f6e2891f21329d6fe42fbe0fed341"
+        },
+        "reduce_multiple_passes_axes_add": {
+          "offset": "0x38446fc",
+          "size": 54736,
+          "sha256": "04a07ca4f0322219fe5731b624bacf31bb623f12f0393dffa6b9010e54c34959"
+        },
+        "ndArrayIdentity": {
+          "offset": "0x379312c",
+          "size": 9888,
+          "sha256": "290f28a102191b713a443d386d988c41ada50f7c15f6336aad75623049fea460"
+        },
+        "ndArrayIdentityTranspose": {
+          "offset": "0x37b25bc",
+          "size": 11184,
+          "sha256": "aa79ca5256d7f2aef9a75d06c87047c04b55af978616663bb6ec79a562097cff"
+        }
+      }
+    },
+    {
+      "macos": "26.5.2",
+      "build": "25F84",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib",
+      "sha256": "06f0abb21012ea99cc8cc83e2ea578e415bf05d87208ef5d6d4dd61485a20019",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "mmul_kernel_a16_float_float_float": {
+          "offset": "0x41e9b46",
+          "size": 43552,
+          "sha256": "ddcf6de9eb87b348e9d66b5c508a1d439dbf0a8bcaaf9718bf05595f2a813ee4"
+        },
+        "mmul_kernel_a16_half_half_float": {
+          "offset": "0x4209ee6",
+          "size": 43696,
+          "sha256": "8c05f7cdfdff1da844c418c56664c5cc1422f02ec88c5b6d64919c7021d1c56f"
+        },
+        "mmul_kernel_a16_bfloat_bfloat_float": {
+          "offset": "0x4214996",
+          "size": 43424,
+          "sha256": "e47a69158a9d2977df0645bb4388b374f20191081533a5c647fa1e6e451b11aa"
+        },
+        "reduce_multiple_passes_axes_add": {
+          "offset": "0x426b5e6",
+          "size": 54736,
+          "sha256": "b225740afaa91e88fe420957b3d12082336bb49b84d38f8cb7c2aeb98b6a3759"
+        },
+        "ndArrayIdentity": {
+          "offset": "0x41b1366",
+          "size": 9888,
+          "sha256": "80164f4c8a67aacf70ddf99ea3adc3150ef3add30060c5a998344faf4c79cdb2"
+        },
+        "ndArrayIdentityTranspose": {
+          "offset": "0x41d07f6",
+          "size": 11184,
+          "sha256": "5f4d4931453a2a17185f2deb8197b47db961c4d579d8e0fb3a4869f97707f4ae"
+        }
+      }
+    },
+    {
+      "macos": "26.6",
+      "build": "25G5028f",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib",
+      "sha256": "09f873e19c5fe03eb12a6d65d8803a403de2bb4680b135449501595211ffb92d",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "NDArrayVectorMatrixMultiply_1_4": {
+          "offset": "0x1740026",
+          "size": 1706272,
+          "sha256": "12978a81557ae91e490e6eeee8939a810f301f1b4e1b7492975db4b38424c98d"
+        },
+        "NDArrayVectorMatrixMultiply_5_8": {
+          "offset": "0x18f79d6",
+          "size": 1228208,
+          "sha256": "64a2731c364133e5cbdf57b9ed22c96df82c579ee7f56d6c3de1337d23489fca"
+        },
+        "NDArrayVectorMatrixMultiply_9_12": {
+          "offset": "0x1a23786",
+          "size": 899136,
+          "sha256": "23cc0a7b1b7f6a3b0ec4c5d71db5de037debca03fba9443410c3c9008f6ae735"
+        },
+        "NDArrayVectorMatrixMultiply_13_16": {
+          "offset": "0x1afefc6",
+          "size": 899232,
+          "sha256": "dc8f53adcc39717d2dc23430eb9d9d5cb9aed67480fdfce52495fc542b966012"
+        },
+        "ndArrayIdentity": {
+          "offset": "0x41b4886",
+          "size": 9888,
+          "sha256": "b95aa01a9c00d0fb821ab8bcd5f0e32e8d7763704821e309db871ca6c76cd9a1"
+        },
+        "ndArrayIdentityTranspose": {
+          "offset": "0x41d3d16",
+          "size": 11184,
+          "sha256": "69fc5bce5e1bad345e0e62144b83aeefaa178065911228188f39abf6fe4f924c"
+        },
+        "mmul_kernel_a16_float_float_float": {
+          "offset": "0x41ed066",
+          "size": 43552,
+          "sha256": "2b7c1df444f0756ba4df7c6738daee81d79b4cd883eeed1ac628d5aa758261c5"
+        },
+        "mmul_kernel_a16_half_half_float": {
+          "offset": "0x420d426",
+          "size": 43712,
+          "sha256": "de7dfdf9323db294776e97a9f518b7199c41df341aed6aff43c5c4c04b41d85c"
+        },
+        "mmul_kernel_a16_bfloat_bfloat_float": {
+          "offset": "0x4217ee6",
+          "size": 43424,
+          "sha256": "f397bb1ba351658b23ca62e9602193d301f8297f15a1a2656b320083bc5e075b"
+        },
+        "reduce_multiple_passes_axes_add": {
+          "offset": "0x426eb36",
+          "size": 54736,
+          "sha256": "530cd2f46ed64d037dc430bcf1234a62664246847586b7bc93f5aab6396a6576"
+        },
+        "NDArrayMatrixMultiplyReduction": {
+          "offset": "0x438ac16",
+          "size": 11456,
+          "sha256": "3bb41b47bdaca95cdbefa436cd650010d1a6ca9a664aa81e5898195c98ca07fc"
+        },
+        "LORADOWN_gemv_kernel": {
+          "offset": "0x470fa76",
+          "size": 18160,
+          "sha256": "81ab32be6a07de67f0d601234214c3ac358c4a8ae035812f74fd5a8430511bf0"
+        }
+      },
+      "air_identical_to": {
+        "build": "25F84",
+        "note": "Module bytes differ only in embedded build metadata; normalized AIR is identical."
+      }
+    },
+    {
+      "macos": "27.2",
+      "build": "26B5086k",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib",
+      "sha256": "48af48e1559c967830fb0346421442652c73b0a35688fb9ed6540889143ed0b2",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "mmul_kernel_a16_float_float_float": {
+          "offset": "0x4c9c434",
+          "size": 43584,
+          "sha256": "45631aec17735ea49471625391a7fec7cba2f5a43807cc31cc3cf7e59a4b08b4"
+        },
+        "mmul_kernel_a16_half_half_float": {
+          "offset": "0x4cbc7f4",
+          "size": 43680,
+          "sha256": "ea8a5c98e6cc301a39563e49009da529bc7f8a4159173c7ae4dce11fdecdfca8"
+        },
+        "mmul_kernel_a16_bfloat_bfloat_float": {
+          "offset": "0x4cc7294",
+          "size": 43424,
+          "sha256": "0ef168bc9f5602c0be8073864a92e9d86bd3c7a89ab98078f1b8190061b526a2"
+        },
+        "NDArrayMatrixMultiplyNNA14_EdgeCase": {
+          "offset": "0x4d960c4",
+          "size": 101504,
+          "sha256": "3d39f65b4f4a5f261515a68d34150d040b522ebe7472e89c8071d5df28623dce"
+        },
+        "NDArrayMatrixMultiplyNNA14": {
+          "offset": "0x4daed44",
+          "size": 33808,
+          "sha256": "af075ebc07b7a775719796ae748d4c3d8869a3acf613263d7d56e642e1b2c8f4"
+        },
+        "NDArrayMatrixMultiplyReduction": {
+          "offset": "0x4db7154",
+          "size": 11504,
+          "sha256": "97423d5cc845b5a65f95a474b84270d99d0e888707e5c685cd8bad039856802a"
+        },
+        "NDArrayVectorMatrixMultiply_1_4": {
+          "offset": "0x1cce654",
+          "size": 2161744,
+          "sha256": "ca05941e3af5d250886a619bb0c31e724f1c89f92f448cde38863dfa4563e176"
+        },
+        "NDArrayVectorMatrixMultiply_5_8": {
+          "offset": "0x1ef54f4",
+          "size": 1563968,
+          "sha256": "d7859fdea0ce310177c8bc2a8bfd9aea127a0da1f3b6fa757e836dd0a66751f4"
+        },
+        "NDArrayVectorMatrixMultiply_9_12": {
+          "offset": "0x2073234",
+          "size": 1050512,
+          "sha256": "01ebe895387bdb553a80e834ed0513bf137c29487c6c9bd12390990902f64efb"
+        },
+        "NDArrayVectorMatrixMultiply_13_16": {
+          "offset": "0x21739c4",
+          "size": 1050640,
+          "sha256": "7c292e565ff5066cb7246bdf046e67284481670a6333f02ea6a044d25597e2bc"
+        },
+        "LORADOWN_gemv_kernel": {
+          "offset": "0x51390d4",
+          "size": 18240,
+          "sha256": "549123a985af0d9e82e6356dc3f2e6066aefae0513bb5cc2e4feb55ff3e5ffa3"
+        },
+        "reduce_multiple_passes_axes_add": {
+          "offset": "0x2f78d84",
+          "size": 55152,
+          "sha256": "d10e1667380ffc1b884f86183c07d1dea358941a994b909c5b142d9beab4621f"
+        },
+        "gemm_a18": {
+          "offset": "0x3072664",
+          "size": 1297072,
+          "sha256": "9590ccb129960d7a2e45e583a23d44610fed5711ad21a575e650c00d9264ca2f"
+        },
+        "GEMMGlobalKSplits_Initializer::gemmA18InitializeAtomicCounterToZero": {
+          "offset": "0x31af114",
+          "size": 3936,
+          "sha256": "33fcf13bc177005865d594d5c9e115d0938d0f8e35104a306851fe743f6e7224"
+        },
+        "GEMMGlobalReduction::gemmA18GlobalReduction": {
+          "offset": "0x31b0074",
+          "size": 11184,
+          "sha256": "b32527d4022a45edf5d5e2a189347a3f7900d19363880a494a74cb8b2f455c5a"
+        },
+        "ndArrayIdentity": {
+          "offset": "0x4c6c6e4",
+          "size": 9936,
+          "sha256": "fe1d50da11c3f3f1a49b8e2db84a9e47835c4e82b999ed84b43a4c1c5bd4c11b"
+        },
+        "ndArrayIdentityTranspose": {
+          "offset": "0x4c8bcd4",
+          "size": 11216,
+          "sha256": "1d7fdc97a5f12e2d65c265f109065759b1f4205f5d9c69dea90bd7f341eebdd8"
+        }
+      }
+    },
+    {
+      "macos": "26.3",
+      "build": "25D125",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib",
+      "sha256": "4bfdb1c370a8172ee8cd913b9939b4ab6591214194661a81fcf39ae8ec0f05e2",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "addition_f": {
+          "offset": "0x1f1981",
+          "size": 4752,
+          "sha256": "315906cee459406bf578eb360fc51c80323d9e6b3e88e4ce791c09f5d76de6b9"
+        },
+        "addition_4xf": {
+          "offset": "0x210df1",
+          "size": 4736,
+          "sha256": "c872c6683b4cd10b2db0bc36468912243eb7ae489bd80222a561c24b3eb4b639"
+        },
+        "multiplication_f": {
+          "offset": "0x24a741",
+          "size": 4752,
+          "sha256": "3f6c8de86a7de5ab3359ea9c08e77efab59fdd0c22696459ca43f0c3ab43c361"
+        },
+        "multiplication_4xf": {
+          "offset": "0x269c81",
+          "size": 4752,
+          "sha256": "80c44d349889633db2bf161cdc93f92d28e85d5a3847b7e3cf7c6f0ec828ebec"
+        },
+        "read_f": {
+          "offset": "0xfd3ca1",
+          "size": 24400,
+          "sha256": "1016414aca20152183a67030e10868161e02ddeaade70962829423e9ac5db9b1"
+        },
+        "read_4xf": {
+          "offset": "0x10963b1",
+          "size": 31088,
+          "sha256": "12b822d8876bd460ec3f2e8953dab8d510af303b383bd1a65b1313f3fdb143d9"
+        },
+        "constant_f": {
+          "offset": "0x12072a1",
+          "size": 6384,
+          "sha256": "2354a07e100a0f227c8732951bb64c7df0664d2180437ec42e77aaef39e1a342"
+        },
+        "constant_4xf": {
+          "offset": "0x120bdb1",
+          "size": 6400,
+          "sha256": "911ff2b124159fd32d8a00bcdb6ea195e8fd77db70762c61f54bee8ed609fa93"
+        },
+        "write_f": {
+          "offset": "0x155ebd1",
+          "size": 20464,
+          "sha256": "bc5ef19cc2e758b25003585219a0a87a8a9c03fbc24f5635e0823fd606e76af4"
+        },
+        "write_4xf": {
+          "offset": "0x161da81",
+          "size": 34032,
+          "sha256": "32a3dd6282b23d6566c2c7fa753b57c4d0fa74788932d8464e3529e97b8c717f"
+        },
+        "accum_f": {
+          "offset": "0x16754e1",
+          "size": 20192,
+          "sha256": "6e2c5bda6611f55c05ac4dc0c6c407ecd2bdf1cee7dbb184b09d3e5c9f2c7afb"
+        },
+        "accum_4xf": {
+          "offset": "0x1708f41",
+          "size": 25552,
+          "sha256": "dd3ab0f0c8284403ec89a1dd4c7056f2f3c8eb0cd6dc8238c22487788bb00aa4"
+        },
+        "postfixPrimary_f_to_f": {
+          "offset": "0x19ef3c1",
+          "size": 8304,
+          "sha256": "61edd83dfefd53fb4e91eabc410a0fa8a02a5386b8a07e75f25af7e4d2b9f8d7"
+        },
+        "postfixPrimaryAccumulate_f_to_f": {
+          "offset": "0x19f1431",
+          "size": 3632,
+          "sha256": "33a9a16ce977f4f3cfcc2775d98cbcbdb8f7078fd86e452eebb6166b84dff616"
+        },
+        "postfixPrimary_4xf_to_4xf": {
+          "offset": "0x1a0a001",
+          "size": 8336,
+          "sha256": "a06b90d57c1607a9d518325f7752dfa7b4a1da1c5147e9e48a9013d86c3abb74"
+        },
+        "postfixPrimaryAccumulate_4xf_to_4xf": {
+          "offset": "0x1a0c091",
+          "size": 3648,
+          "sha256": "a3ce0be4c0cde09b8417f3e3b8b8749fc13b53a4a0ecbf1823f77edeb485da20"
+        }
+      }
+    },
+    {
+      "macos": "26.5.2",
+      "build": "25F84",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib",
+      "sha256": "0765dc8341ffeca80dfad6efee60d64fce663fa923ccfa800d5e491396efb8ce",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "addition_f": {
+          "offset": "0x1f1981",
+          "size": 4752,
+          "sha256": "49b6d4dc03921267f609572eac60bebf1efbe68ec7f694dea29dc1edd33cd273"
+        },
+        "addition_4xf": {
+          "offset": "0x210df1",
+          "size": 4736,
+          "sha256": "43143c3587cb0742b7e157faeb7845a6e923bf97dc2427e6ac4403a19c77e9ff"
+        },
+        "multiplication_f": {
+          "offset": "0x24a741",
+          "size": 4752,
+          "sha256": "12395f8a82d994439ba184a56f83b56771186e10e50dab837fc3e4c2880176f3"
+        },
+        "multiplication_4xf": {
+          "offset": "0x269c81",
+          "size": 4752,
+          "sha256": "169e566224900a4603cef3177e73a4608060e7733fdf30e3ce7e8149bc3e9c95"
+        },
+        "read_f": {
+          "offset": "0xfd3ca1",
+          "size": 24400,
+          "sha256": "b65b38526951158493fb29f6ad912ae343fd5266355cfbaadd165e77c34cecc8"
+        },
+        "read_4xf": {
+          "offset": "0x1095131",
+          "size": 30832,
+          "sha256": "e9b5226f31aee389728249b80ce59960a49ffffd0abb23117bc309f54ed933e7"
+        },
+        "constant_f": {
+          "offset": "0x1205621",
+          "size": 6384,
+          "sha256": "9b4f63b6857284f1d4819fda2f31e600dc3099d57cba0960a65f9b39f8ace575"
+        },
+        "constant_4xf": {
+          "offset": "0x120a131",
+          "size": 6400,
+          "sha256": "e2b04a204353e2c87f435a4e0ef56b72c5ba2e78f33c9c09d912afe525aa24b8"
+        },
+        "write_f": {
+          "offset": "0x155cf51",
+          "size": 20464,
+          "sha256": "2cd8bab2c1e9debfe83aa03bfaa3ec3547a149367585be82abdf812489ec6226"
+        },
+        "write_4xf": {
+          "offset": "0x161be01",
+          "size": 34032,
+          "sha256": "951002031710392149e21f037eefe378686928c065603e214785ead4ce092c04"
+        },
+        "accum_f": {
+          "offset": "0x1673861",
+          "size": 20192,
+          "sha256": "7f853812a58583ad2c9594e6cf73fac32f366ae1b0a6f397b6608030c633db18"
+        },
+        "accum_4xf": {
+          "offset": "0x17072c1",
+          "size": 25552,
+          "sha256": "ebfe44a4e2793aaa15abcce9761732be77c487b326b02d5bff0650c6ddd846a1"
+        },
+        "postfixPrimary_f_to_f": {
+          "offset": "0x19ed741",
+          "size": 8304,
+          "sha256": "7516d6a0ad273804b1992b35b6c001fd15ab3bafbb848559b58ba1c09e4d8871"
+        },
+        "postfixPrimaryAccumulate_f_to_f": {
+          "offset": "0x19ef7b1",
+          "size": 3632,
+          "sha256": "22d26d74a1d9f79f593fb3ed93d6d6b85a3ddea111a61483140974c6b35e7d72"
+        },
+        "postfixPrimary_4xf_to_4xf": {
+          "offset": "0x1a08381",
+          "size": 8336,
+          "sha256": "96900292a955d04a6a1d9406d718c6f2b357a65bc3af77e585c0250aea09eb87"
+        },
+        "postfixPrimaryAccumulate_4xf_to_4xf": {
+          "offset": "0x1a0a411",
+          "size": 3648,
+          "sha256": "c7f842d6573521d2b314cd8273f900e378a6421c1012bce9bc0be065e25e33bf"
+        }
+      }
+    },
+    {
+      "macos": "26.6",
+      "build": "25G5028f",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib",
+      "sha256": "7cb4b2aa4e4c2f8ff10b525d8e788de4233b6adbf023d57c29f939582584150d",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "addition_f": {
+          "offset": "0x1f1981",
+          "size": 4752,
+          "sha256": "2a405400fc604ebac44a3caccc10d06deda2ebdfa91a3a49c69eb0809ac61555"
+        },
+        "addition_4xf": {
+          "offset": "0x210df1",
+          "size": 4736,
+          "sha256": "808da7420e95a4cc2edbaf184bb27f3f377b49ba6c76ef30811826f554ef4509"
+        },
+        "multiplication_f": {
+          "offset": "0x24a741",
+          "size": 4752,
+          "sha256": "c3a2f15cfc8577820666393e218eaf788d3dde39db0037eae948b990204cccc8"
+        },
+        "multiplication_4xf": {
+          "offset": "0x269c81",
+          "size": 4752,
+          "sha256": "8bf17aa9fd44e0103077b117fbf46062f4a299951dd7d67b3ca552ff1fa17792"
+        },
+        "read_f": {
+          "offset": "0xfd3ca1",
+          "size": 24400,
+          "sha256": "0ae9716eee343ac3fb80c8840d3ced7e610843380d20ea8f84af3d42624af716"
+        },
+        "read_4xf": {
+          "offset": "0x1095131",
+          "size": 30832,
+          "sha256": "e0856663498847ef8ebd62cbda24613ad1521b8e378d5df237de7cd4035df784"
+        },
+        "constant_f": {
+          "offset": "0x1205621",
+          "size": 6384,
+          "sha256": "534ba320191959dc7e50ddaa1bd20f164bbe47b6f3075e7fa24ba70812c52806"
+        },
+        "constant_4xf": {
+          "offset": "0x120a131",
+          "size": 6400,
+          "sha256": "0e7513828fe43fb5feb3264d03fc05f4c85ff0abec1b3235795c37cbeaadbc55"
+        },
+        "write_f": {
+          "offset": "0x155cf51",
+          "size": 20464,
+          "sha256": "64d75b521dcf67e88daeae264b4e783ba943bd71c67989f1899dc74acaf42cb8"
+        },
+        "write_4xf": {
+          "offset": "0x161be01",
+          "size": 34032,
+          "sha256": "353437fb9b1cc7652b8bbd771d69d0c31bd376d5a48ac4d4f144254006786eb5"
+        },
+        "accum_f": {
+          "offset": "0x1673861",
+          "size": 20192,
+          "sha256": "7ebde9374760bf25847b42ac36bd68958e1226cb70f7aad99162ab3609a54087"
+        },
+        "accum_4xf": {
+          "offset": "0x17072c1",
+          "size": 25552,
+          "sha256": "240741890f5a2aa0b0131c8b7097b486c0ff694c48f4b4470616a9e1db392a33"
+        },
+        "postfixPrimary_f_to_f": {
+          "offset": "0x19ed741",
+          "size": 8304,
+          "sha256": "e315e7eae606a30dc209c369ffd5d3611af35f1182817c73603aaa3a0aba5f1e"
+        },
+        "postfixPrimaryAccumulate_f_to_f": {
+          "offset": "0x19ef7b1",
+          "size": 3632,
+          "sha256": "6bf75e44ba8cbaf9667e69f80c54f1d15dbb161c76e28bd80ddbabf0fd848cd1"
+        },
+        "postfixPrimary_4xf_to_4xf": {
+          "offset": "0x1a08381",
+          "size": 8336,
+          "sha256": "135013478d00c1b6faf60ca7070e9f0ed4af9436a8f3e3519e879e4302b9b89c"
+        },
+        "postfixPrimaryAccumulate_4xf_to_4xf": {
+          "offset": "0x1a0a411",
+          "size": 3648,
+          "sha256": "9c09832bd3ec602cebda25a8addc360ce6364b460e2befd712915e3cc5f49d9a"
+        }
+      }
+    },
+    {
+      "macos": "27.2",
+      "build": "26B5086k",
+      "path": "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib",
+      "sha256": "91978320a31e5be040923b95bbc25261ddfe9e0248f79f2d9be9a0da4d3cc815",
+      "offset_basis": "Absolute file byte offsets of AIR bitcode wrappers; module size and SHA include the wrapper.",
+      "modules": {
+        "addition_f": {
+          "offset": "0x1f4c0c",
+          "size": 4784,
+          "sha256": "c632905a5c5d5476ce0a84fc673d81486ad326e835e27c23a9eb721378b3b55a"
+        },
+        "addition_4xf": {
+          "offset": "0x21457c",
+          "size": 4800,
+          "sha256": "589be4e72819b0a73529f3a9ed217aea2fd906bdf63ced91005fb0ca6b078af1"
+        },
+        "multiplication_f": {
+          "offset": "0x24e85c",
+          "size": 4800,
+          "sha256": "53d2ea422db486f619d9d2682f9337964a41a8dd473663210b4f49e0dfbf48c4"
+        },
+        "multiplication_4xf": {
+          "offset": "0x26e2ec",
+          "size": 4800,
+          "sha256": "077732749cfa28697988a43bcaed4cf9ea9174de72aadedc7c3bcc2fd4bab104"
+        },
+        "read_f": {
+          "offset": "0x1002abc",
+          "size": 23616,
+          "sha256": "d802abd799685cb22a25b19dbb90d4feb1718f44ac74a011e27ef27e626eb873"
+        },
+        "read_4xf": {
+          "offset": "0x10ae9dc",
+          "size": 27232,
+          "sha256": "d76e775cc9c006afd8963c6e4279463903878fffa193b934b13a8f9538671d0a"
+        },
+        "constant_f": {
+          "offset": "0x1219e4c",
+          "size": 6480,
+          "sha256": "b77e30b9bd3b4b60d6c44d39822b51721023c675505471e462d241bc0d1ad81c"
+        },
+        "constant_4xf": {
+          "offset": "0x121ea8c",
+          "size": 6512,
+          "sha256": "1c3718a9a3998b67059d095080a896cb59b5713016aa9ca287b1bc5c7f0e1dd2"
+        },
+        "write_f": {
+          "offset": "0x157826c",
+          "size": 20352,
+          "sha256": "c75c754b8ac2d7e9bc0bd64b8f370450c89530587e129948a43dc2390a99df18"
+        },
+        "write_4xf": {
+          "offset": "0x162bb2c",
+          "size": 33328,
+          "sha256": "f798426d5d8f87957255df3dd9435d1269b6e8af4858a1578e52a0522bc97d38"
+        },
+        "accum_f": {
+          "offset": "0x167d5cc",
+          "size": 20400,
+          "sha256": "b0093412051f2585383a4650311834b07a45f6f0e6ff71cc40448af377abcffd"
+        },
+        "accum_4xf": {
+          "offset": "0x171271c",
+          "size": 25760,
+          "sha256": "5af4a992b69561e7130ba5a1a6cdccc56313463141e249966552c3b1b856ef5e"
+        },
+        "postfixPrimary_f_to_f": {
+          "offset": "0x1a1090c",
+          "size": 8592,
+          "sha256": "714ebbb101f6eb88d779797c51d35f8be51d1568a93cd2b672ab5659b1f71447"
+        },
+        "postfixPrimaryAccumulate_f_to_f": {
+          "offset": "0x1a12a9c",
+          "size": 3648,
+          "sha256": "92c60485b2c2bdb9991124291bf1fbde2946e1bde516945bb99cacae76aa9ed3"
+        },
+        "postfixPrimary_4xf_to_4xf": {
+          "offset": "0x1a2c03c",
+          "size": 8640,
+          "sha256": "c96c99eb4f0239a9d8d3ef0240868c8755994d5d4109147671bd939292dded88"
+        },
+        "postfixPrimaryAccumulate_4xf_to_4xf": {
+          "offset": "0x1a2e1fc",
+          "size": 3664,
+          "sha256": "91df79b21a7fde0981b8fc7ad215324171217d43e3e3f3abb814352d51c7214d"
+        }
+      }
+    }
+  ]
+}

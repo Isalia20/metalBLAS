@@ -9,6 +9,8 @@ import time
 import torch
 
 from . import kernels
+from . import mps_heuristics as _mps
+from . import mps_dispatch as _mps_dispatch
 from .dispatch import (
     _bmm_out,
     _ceildiv,
@@ -153,7 +155,13 @@ def _gemv_plan(dtype, N, K):
 
 _GEMM_PLAN: dict = {}
 
-_AUTOTUNE = os.environ.get("METALBLAS_AUTOTUNE", "1") != "0"
+# Both MPS policies use the recovered decisions. "legacy" keeps the original
+# static picker for explicit comparisons; no policy measures candidates.
+_TILE_POLICY = os.environ.get("METALBLAS_TILE_POLICY", "mps")
+_MPS_POLICIES = ("mps", "mps-strict")
+
+
+_AUTOTUNE = False
 _AUTOTUNE_MARGIN = 0.03
 _TALL_NARROW_MARGIN = 0.01
 
@@ -481,6 +489,112 @@ def _autotune_mppt(dtype, M, N, K, cands, a, b, margin=_AUTOTUNE_MARGIN, sk_spec
     return candidates[i][0], candidates[i][2]
 
 
+def _bt_vec(M, N, align):
+    """Natural vector width for the thin-M kernel, limited by alignment and rows."""
+    v = 4 if N >= 4096 else (2 if N >= 256 else 1)
+    while v > 1 and (align % v or M * v > 32):
+        v >>= 1
+    return v
+
+
+# Pace simdgroups using gemm_a18's barrierInside/isElasticBarrier fields.
+def _a18_launch(dtype, M, N, K, params, trans_a=False, trans_b=False, *,
+                lda=None, ldb=None, ldc=None, batch=None, epilogue=None, source_epilogue=None):
+    """Kernel and launch geometry for Apple's A18 matmul parameters.
+
+    ``params`` are the 17 ``MPSMatMulAutoTuningParametersA18`` words MPSNDArray
+    dispatches ``gemm_a18`` with (see mps_heuristics.py).  shaders/a18_gemm.h
+    takes them as compile-time constants and reproduces that kernel's work
+    decomposition: per-simdgroup output blocks, local K splits, uber-tile
+    rasterization, the linearized grid and the pacing of simdgroups every
+    ``barrierIterations`` K steps. Barrier mode and enablement come from
+    the recovered elasticBarrier and barrierInside fields.
+    """
+    unroll_k, UM, UN, SM, SN, KS = params[:6]
+    uber_m, uber_n, barrier_it = params[8], params[9], params[10]
+    linearize, raster_m, barrier_inside = params[13], params[14], params[16]
+    GS = KS if params[6] else 1
+    if params[6]:
+        KS = 1
+    if GS > 1 and not linearize:
+        raise ValueError("MPS global K splits require a linearized grid")
+    KC = unroll_k * 16
+    TM, TN = UM * 16 * SM, UN * 16 * SN
+    tiles_m, tiles_n = _ceildiv(M, TM), _ceildiv(N, TN)
+    # EncodeArrayMultiply retains the full uber tile, including inactive tiles.
+    sub_m, sub_n = uber_m, uber_n
+    ubers_m, ubers_n = _ceildiv(tiles_m, sub_m), _ceildiv(tiles_n, sub_n)
+    k_iters = _ceildiv(K // GS, KC * KS)
+    nb = batch if batch is not None else 1
+    n_groups = sub_m * sub_n * ubers_m * ubers_n * nb * GS
+    pace = (2 if params[12] else 1) if barrier_inside else 0
+    in_t, _, out_t = PROFILE[dtype]
+    fused = epilogue is not None
+    bnz, anz = epilogue if fused else (True, True)
+    fn, _ = kernels.a18_gemm(
+        in_t, out_t, UM, UN, SM, SN, KS, KC,
+        barrier_it if pace else 0, pace, raster_m, linearize,
+        trans_a, trans_b, M % TM == 0 and N % TN == 0,
+        (K // GS) % KC == 0 and (K // GS + K % GS) % KC == 0,
+        epilogue=fused, beta_nz=bnz, alpha_nz=anz, batched=batch is not None,
+        source_epilogue=source_epilogue, global_splits=GS, global_atomic=bool(params[7]))
+    group = (SM * SN * KS * 32, 1, 1)
+    if linearize:
+        threads = (group[0] * n_groups, 1, 1)
+    else:
+        threads = (group[0] * sub_m * sub_n, ubers_m * ubers_n, nb)
+    lda = lda if lda is not None else (M if trans_a else K)
+    ldb = ldb if ldb is not None else (K if trans_b else N)
+    ldc = ldc if ldc is not None else N
+    dims = _pk(M, N, K, lda, ldb, ldc, sub_n, sub_m, ubers_n, ubers_m, k_iters, nb)
+    return fn, threads, group, dims
+
+
+def _mps_static_choice(dtype, M, N, K, trans_a=False, trans_b=False, batch=1):
+    """Apple's MPSNDArray matmul decision for ``A[MxK] @ B[KxN]`` on this GPU.
+
+    Returns ``("vector", None)`` where MPSGraph runs its vector-matrix kernels,
+    ``("a18", params)`` with the parameters it hands ``gemm_a18`` (built-in
+    table, then the per-GPU heuristic; see docs/mps_matmul_heuristics.md), or
+    ``None`` when the ported selection does not apply: fp32, GPUs older than
+    the A18 kernel, global K splits, or ``METALBLAS_TILE_POLICY=legacy``.
+    """
+    if _TILE_POLICY not in _MPS_POLICIES or dtype not in _mps.DTYPE_CODE or dtype is torch.float32:
+        return None
+    try:
+        if not _mps.device_info().uses_a18_kernel:
+            return None
+        plan = _mps.plan(M, N, K, trans_a, trans_b, dtype, batch)
+    except Exception:
+        return None
+    if plan.source == "vector":
+        return "vector", None
+    if plan.params[6] or plan.params[7] or plan.params[15]:
+        return None         # global K split (Ultra) or Morton walk: not ported
+    return "a18", tuple(plan.params)
+
+
+def _bt_spec(M, N, K, align, trans_b=False):
+    """Launch spec ``(vec, nwarps, ncols)`` of the thin-M kernel."""
+    if trans_b:
+        v = 8 if K >= 2048 else (4 if K >= 512 else 2)
+        while v > 1 and align % v:
+            v >>= 1
+        return v, 8, (2 if M * 2 <= 48 else 1)
+    return _bt_vec(M, N, align), (16 if N <= 1024 else 8), 1
+
+
+def _vector_plan(dtype, M, N, K, align):
+    """metalBLAS's vector-style kernels for shapes MPS gives its vector-matrix kernels."""
+    if 2 <= M <= _GEMV_BT_MAX_M and 16 <= N <= _GEMV_BT_TB_MAX_N and K >= 64:
+        vec, nwarps, _ = _bt_spec(M, N, K, align)
+        return _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps), (vec, nwarps, "bt")
+    if _is_sgpipe_regime(M, N, K, dtype) and N <= 32 and M % 32 == 0:
+        spec = (16, N, 64, 1, 2, 0)
+        return _build_sgpipe_plan(dtype, M, N, K, *spec), (*spec, "sgp")
+    return None
+
+
 def _gemm_plan(dtype, M, N, K, a=None, b=None):
     key = (dtype, M, N, K)
     cached = _GEMM_PLAN.get(key)
@@ -499,8 +613,17 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
             plan, tile = _autotune_mppt(dtype, M, N, K, cands, a, b, margin,
                                         sk_specs, conv_specs, bt_specs, flip_specs, sgp_specs)
         else:
-            tile = cands[0]
-            plan = _build_mppt_plan(dtype, M, N, *tile)
+            align = (int(b.stride(0)) | int(b.storage_offset())) if b is not None else N
+            choice = _mps_static_choice(dtype, M, N, K)
+            built = None
+            if choice is not None and choice[0] == "vector":
+                built = _vector_plan(dtype, M, N, K, align)
+            elif choice is not None:
+                built = (_launch(*_a18_launch(dtype, M, N, K, choice[1])),
+                         ("a18", *choice[1]))
+            if built is None:
+                built = _build_mppt_plan(dtype, M, N, *cands[0]), cands[0]
+            plan, tile = built
         cached = _GEMM_PLAN[key] = plan, tile
     return cached
 
@@ -549,9 +672,21 @@ def _gemm_trans_plan(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
         if _AUTOTUNE:
             plan, tile = _autotune_trans(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb)
         else:
-            BM, BN, NSG = _pick_mpp_tensor_tile(M, N, K, dtype)
-            plan = _build_mpp_trans_plan(dtype, M, N, K, BM, BN, NSG, trans_a, trans_b, lda, ldb)
-            tile = ("mpp_tr", BM, BN, NSG)
+            align = lda | ldb | int(a.storage_offset()) | int(b.storage_offset())
+            choice = _mps_static_choice(dtype, M, N, K, trans_a, trans_b)
+            if choice is not None and choice[0] == "vector" and 2 <= M <= _GEMV_BT_MAX_M:
+                vec, nwarps, ncols = _bt_spec(M, N, K, align, trans_b)
+                plan = _build_gemv_bt_plan(dtype, M, N, K, vec, nwarps, trans_b=trans_b,
+                                           ldb=ldb, ldx=lda, ldy=N, ncols=ncols, trans_a=trans_a)
+                tile = (vec, nwarps, ncols, "bt_tr")
+            elif choice is not None and choice[0] == "a18":
+                plan = _launch(*_a18_launch(dtype, M, N, K, choice[1], trans_a, trans_b,
+                                            lda=lda, ldb=ldb, ldc=N))
+                tile = ("a18", *choice[1])
+            else:
+                BM, BN, NSG = _pick_mpp_tensor_tile(M, N, K, dtype)
+                plan = _build_mpp_trans_plan(dtype, M, N, K, BM, BN, NSG, trans_a, trans_b, lda, ldb)
+                tile = ("mpp_tr", BM, BN, NSG)
         cached = _GEMM_TRANS_PLAN[key] = plan, tile
     return cached
 
@@ -744,7 +879,10 @@ def _classic_plan(backend, dtype, M, N, K, tile, trans_a, trans_b, swizzle,
 
 def matmul(a, b, *, backend=None, tile=None, swizzle_log=None, out=None):
     """Compute a 2-D floating-point matrix product."""
-    fast_path = backend is None and out is None and swizzle_log is None and a.is_mps
+    if (_TILE_POLICY in _MPS_POLICIES and backend in (None, "auto")
+            and tile is None and swizzle_log is None):
+        return _mps_dispatch.matmul(a, b, out)
+    fast_path = backend is None and tile is None and out is None and swizzle_log is None and a.is_mps
     M, K = a.shape
     K2, N = b.shape
     dtype = a.dtype
@@ -824,6 +962,13 @@ def matmul(a, b, *, backend=None, tile=None, swizzle_log=None, out=None):
                               M, N, K, lda, ldb, trans_a, trans_b, dtype, out)
 
     if backend == "mpp_tensor":
+        if tile is None and swizzle_log is None:
+            sel = _mps_static_choice(dtype, M_, N_, K_, trans_a, trans_b)
+            if sel is not None and sel[0] == "a18":
+                fn, threads, group, dims = _a18_launch(
+                    dtype, M_, N_, K_, sel[1], trans_a, trans_b, lda=lda_, ldb=ldb_, ldc=ldc_)
+                fn(A_view, B_view, out, dims, threads=threads, group_size=group)
+                return out
         if tile is not None:
             assert len(tile) >= 3
         chosen = _pick_mpp_tensor_tile(M_, N_, K_, dtype) if tile is None else tile[:3]
@@ -896,6 +1041,8 @@ def _run_gemv_nt(dtype, matrix, x, out, rows, k, ld, epilogue=None):
 
 def addmm(mat1, mat2, out, epilogue):
     x, br, bc, beta, alpha, bnz, anz = epilogue
+    if _TILE_POLICY in _MPS_POLICIES:
+        return _mps_dispatch.matmul(mat1, mat2, out, (x, br, bc, 0, beta, alpha))
     dtype = mat1.dtype
     A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b = _resolve_inputs(mat1, mat2)
     if out is None:
@@ -918,6 +1065,8 @@ def addmm(mat1, mat2, out, epilogue):
         _, tile = _gemm_plan(dtype, M_, N_, K_, A_view, B_view)
         if tile[-1] == "bt":
             choice = "bt", tile[:2]
+        elif tile[0] == "a18":
+            choice = "a18", tile[1:]
         else:
             choice = "mpp", (tile if len(tile) == 3 else
                               _pick_mpp_tensor_tile(M_, N_, K_, dtype))
@@ -927,8 +1076,14 @@ def addmm(mat1, mat2, out, epilogue):
                                    trans_a, trans_b, lda_, ldb_)
         if len(tile) == 4 and tile[3] == "bt_tr":
             choice = "bt", tile[:3]
+        elif tile[0] == "a18":
+            choice = "a18", tile[1:]
         else:
             choice = "mpp", tile[1:]
+    elif m4 and dtype is not torch.float32:
+        sel = _mps_static_choice(dtype, M_, N_, K_, trans_a, trans_b)
+        if sel is not None and sel[0] == "a18":
+            choice = "a18", sel[1]
 
     if choice is not None:
         kind, spec = choice
@@ -938,6 +1093,11 @@ def addmm(mat1, mat2, out, epilogue):
                 ldc=ldc_, epilogue=(bnz, anz),
             )
             args = (B_view, A_view, out, dims)
+        elif kind == "a18":
+            fn, threads, group, dims = _a18_launch(
+                dtype, M_, N_, K_, spec, trans_a, trans_b, lda=lda_, ldb=ldb_, ldc=ldc_,
+                epilogue=(bnz, anz))
+            args = (A_view, B_view, out, dims)
         else:
             fn, threads, group = _mpp_tensor_plan(
                 dtype, M_, N_, spec, trans_a, trans_b, epilogue=(bnz, anz))
@@ -1038,16 +1198,31 @@ def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA
             plan = _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb,
                                  trans_a, trans_b, sA, sB, cands, _AUTOTUNE_MARGIN, bt_specs)
         else:
-            BM, BN, NSG = cands[0]
-            fn = _mpp_tensor_plan(dtype, M, N, (BM, BN, NSG), trans_a, trans_b,
-                                  batch=Bb)[0]
-            plan = ("mpp", fn, BM, BN, NSG)
+            align = int(ldb) | int(lda) | int(sB) | int(sA)
+            if b is not None:
+                align |= int(a.storage_offset()) | int(b.storage_offset())
+            choice = _mps_static_choice(dtype, M, N, K, trans_a, trans_b, batch=Bb)
+            bt_ok = (choice is not None and choice[0] == "vector" and not trans_a
+                     and dtype is not torch.float32 and 2 <= M <= _GEMV_BT_MAX_M
+                     and 16 <= N <= (_GEMV_BT_TB_MAX_N_BMM if trans_b else 8192) and K >= 64)
+            if bt_ok:
+                vec, nwarps, ncols = _bt_spec(M, N, K, align, trans_b)
+                plan = ("bt_tb", vec, nwarps, ncols) if trans_b else ("bt", vec, nwarps)
+            elif choice is not None and choice[0] == "a18":
+                plan = ("a18", choice[1])
+            else:
+                BM, BN, NSG = cands[0]
+                fn = _mpp_tensor_plan(dtype, M, N, (BM, BN, NSG), trans_a, trans_b,
+                                      batch=Bb)[0]
+                plan = ("mpp", fn, BM, BN, NSG)
         _BMM_PLAN[key] = plan
     return plan
 
 
 def bmm(a, b, out=None, epilogue=None):
     """Launch the selected batched real kernel, optionally with a fused epilogue."""
+    if _TILE_POLICY in _MPS_POLICIES:
+        return _mps_dispatch.matmul(a, b, out, None if epilogue is None else epilogue[:-2])
     dtype, Bb = a.dtype, a.shape[0]
     A, B, M, N, K, lda, ldb, ta, tb, sA, sB = _resolve_bmm_inputs(a, b)
     o, copy_back = _bmm_out(a, out, Bb, M, N, dtype)
@@ -1068,6 +1243,15 @@ def bmm(a, b, out=None, epilogue=None):
             args += (bias, _pk(br, bc), float(beta), float(alpha), _pk(sB, sA, sC, sBias))
         else:
             args += (_pk(sB, sA, sC, 0),)
+    elif plan[0] == "a18":
+        fn, threads, group, dims = _a18_launch(
+            dtype, M, N, K, plan[1], ta, tb, lda=lda, ldb=ldb, ldc=ldc, batch=Bb,
+            epilogue=(bnz, anz) if fused else None)
+        args = (A, B, o, dims)
+        if fused:
+            args += (bias, _pk(br, bc), float(beta), float(alpha), _pk(sA, sB, sC, sBias))
+        else:
+            args += (_pk(sA, sB, sC, 0),)
     else:
         _, fn, BM, BN, NSG = plan
         if fused:

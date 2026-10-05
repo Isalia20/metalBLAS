@@ -22,4 +22,4 @@ Repository = "https://github.com/Isalia20/metalBLAS.git"
 packages = ["metalblas"]
 
 [tool.setuptools.package-data]
-metalblas = ["shaders/*.h", "shaders/*.metal"]
+metalblas = ["shaders/*.h", "shaders/*.metal", "native/*.mm", "mps_matmul_tables.json"]

@@ -1,0 +1,54 @@
+{
+  "static": {
+    "max_absolute_error_vs_cpu": 0.0625,
+    "failures_vs_cpu": 0,
+    "max_tolerance_ratio_vs_cpu": 0.7776049971580505,
+    "unequal_vs_cpu": 11
+  },
+  "torch_mps": {
+    "max_absolute_error_vs_cpu": 0.125,
+    "failures_vs_cpu": 431,
+    "max_tolerance_ratio_vs_cpu": 20.827213287353516,
+    "unequal_vs_cpu": 1705
+  },
+  "comparison": {
+    "max_error": 0.125,
+    "failures": 432
+  },
+  "worst_relative": [
+    {
+      "index": 4059,
+      "cpu": -0.0777587890625,
+      "static": -0.0777587890625,
+      "torch_mps": -0.12103271484375
+    },
+    {
+      "index": 168,
+      "cpu": -0.21484375,
+      "static": -0.21484375,
+      "torch_mps": -0.257568359375
+    },
+    {
+      "index": 1955,
+      "cpu": 0.64501953125,
+      "static": 0.64501953125,
+      "torch_mps": 0.66845703125
+    },
+    {
+      "index": 332,
+      "cpu": 1.001953125,
+      "static": 1.001953125,
+      "torch_mps": 1.0283203125
+    },
+    {
+      "index": 3708,
+      "cpu": -0.1016845703125,
+      "static": -0.1016845703125,
+      "torch_mps": -0.119384765625
+    }
+  ],
+  "method": "Replay all f16 benchmark input allocations from seed 7742 through (4096,1,4096); CPU float64 matmul rounded once to f16; atol=0.002, rtol=0.001.",
+  "source_capture": "M5_Pro_original_shapes_2026-10-05.json.gz",
+  "trace_capture": "M5_Pro_rank1_trace_2026-10-05.json.gz",
+  "reproduction_script_sha256": "d8e40a0d39933cab9d81e93cf651fdadad3a0225b3f140639ec8f5491c6c7427"
+}

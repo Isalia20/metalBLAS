@@ -220,7 +220,8 @@ def bmm(a: torch.Tensor, b: torch.Tensor, *,
         return _complex.bmm(a, b, out)
     if dtype in _integer.DTYPES:
         return _integer.bmm(a, b, out)
-    if dtype not in _float.PROFILE or not kernels.has_metal4():
+    if (dtype not in _float.PROFILE or
+            (_float._TILE_POLICY not in _float._MPS_POLICIES and not kernels.has_metal4())):
         return _bmm_loop(a, b, out)
     return _float.bmm(a, b, out)
 
@@ -234,7 +235,7 @@ def baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
         return _complex.baddbmm(input, batch1, batch2, beta, alpha, bnz, anz, out)
     if dtype in _integer.DTYPES:
         return _integer.bmm(batch1, batch2, out, (input, beta, alpha, bnz, anz))
-    if not kernels.has_metal4():
+    if _float._TILE_POLICY not in _float._MPS_POLICIES and not kernels.has_metal4():
         return _bmm_loop(batch1, batch2, out, (input, beta, alpha))
     bias = input if input.dtype == dtype else input.to(dtype)
     sBias, br, bc = map(int, bias.expand(Bb, M, N).stride())
@@ -246,6 +247,12 @@ def addbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, *,
            beta=1, alpha=1, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``beta * input + alpha * sum(batch1 @ batch2)``."""
     Bb, M, N, K, dtype = _bmm_shape(batch1, batch2, "addbmm")
+    if dtype in _float.PROFILE and _float._TILE_POLICY in _float._MPS_POLICIES:
+        from . import mps_dispatch
+        beta, alpha, _, _ = _scalars(dtype, beta, alpha)
+        bias = input if input.dtype == dtype else input.to(dtype)
+        br, bc = map(int, bias.expand(M, N).stride())
+        return mps_dispatch.addbmm(batch1, batch2, out, (bias, br, bc, 0, beta, alpha))
     if Bb == 0 or K == 0:
         bias = input if input.dtype == dtype else input.to(dtype)
         beta = int(beta) if dtype in _integer.DTYPES else beta

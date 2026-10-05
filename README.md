@@ -15,7 +15,7 @@ b = torch.randn(4096, 2048, device="mps", dtype=torch.bfloat16)
 c = matmul(a, b)
 ```
 
-The same API supports `bfloat16`, `float16`, `complex64`, `complex32`, and the
+The same API supports `float32`, `bfloat16`, `float16`, `complex64`, `complex32`, and the
 integer types available in PyTorch on MPS: `int8`, `uint8`, `int16`, `int32`,
 and `int64`. Transposed, conjugated, batched, and broadcast operands are handled
 without changing the call site.
@@ -43,17 +43,46 @@ c = matmul(a, b, backend="gemv")
 
 ## Dispatch
 
-The main paths are:
+Floating-point `matmul`, `bmm`, `addmm`, `baddbmm` and `addbmm` use the dispatch rules recovered from
+Apple's MPSNDArray binaries, including vector/GEMM routing, tiles, split K
+and launch schedules:
 
-- `mpp_tensor` for Metal 4 cooperative-tensor GEMM.
-- `gemv_t`, `gemv_nt`, and `gemv_bt` for rank-1 and thin-matrix products.
-- `mpp_gemm` and `simd_gemm` for smaller shapes and systems without Metal 4.
-- Native complex GEMV plus four real products for complex GEMM.
-- Register-tiled kernels for integer GEMM and GEMV.
+- NNA14 GEMM on M1/M2.
+- A16 GEMM on M3/M4 and for `float32` on M5.
+- A18 GEMM for `float16`/`bfloat16` on M5.
+- The recovered ordinary-vector and LoRA schedules where MPS selects them.
 
-For ambiguous reduced-precision shapes, a small runtime autotuner measures a
-curated set of candidates once and caches the winner. Set
-`METALBLAS_AUTOTUNE=0` to use the static tile heuristics.
+No benchmark selects these parameters. Runtime autotuning is disabled, and
+the earlier measured M5 engine overrides have been removed. The default
+`METALBLAS_TILE_POLICY=mps` and `mps-strict` use the same source-derived rules;
+`legacy` retains the previous hand-written static picker for explicit
+comparisons. `METALBLAS_AUTOTUNE` does not enable tuning.
+
+The floating-point path also uses the recovered MPSGraph submission
+thresholds. Its small native stream bridge is compiled against the installed
+PyTorch on first use and cached locally; an Xcode C++ toolchain is required.
+Encoder workspaces use MPSCore's private command-buffer cache. The `addbmm`
+graph intermediate follows the recovered compiler-descriptor flag: private
+temporary storage or a shared placement heap. The bridge depends on the
+recorded OS and PyTorch interfaces.
+
+The recovered profiles cover macOS 26/27 for A14/A16 and macOS 27 for A18.
+Captured MPS dispatches match these rules on an M2 (macOS 26.3), M3 Ultra
+(26.5.2), M4 (26.6) and M5 Pro (27.2); the M4's 26.6 frameworks are
+code-identical to 26.5.2. M1 and other core counts use the same binary
+branches with their own core count; [`docs/mps_dispatch_numbers.md`](docs/mps_dispatch_numbers.md)
+tabulates the resulting numbers for every M1–M5 GPU
+(`python tools/mps_dispatch_numbers.py`). Performance parity is close but
+not complete on every shape; see the inventory below. A18
+global K splits are ported; natural selection on 60+ core A18 devices remains
+unvalidated. Morton rasterization raises `NotImplementedError` in the default
+path. Bias epilogues follow MPSGraph's linked float arithmetic and
+input-dtype scalar constants. `addbmm` follows the recovered batched matmul
+and batch-reduction passes, including intermediate dtype rounding. Complex
+and integer products retain their existing kernels.
+See the [M1–M5 source and validation inventory](docs/mps_matmuls.md) and the
+[A18 details](docs/mps_matmul_heuristics.md) for provenance, coverage and
+measured limitations.
 
 ## Benchmarks
 
@@ -86,9 +115,11 @@ python bench/bench_matmul.py --report --layout all
 ## Repository layout
 
 ```text
-metalblas/   Python dispatch and Metal shaders
+metalblas/   Python dispatch, MPS-derived tile heuristics, and Metal shaders
 bench/       matmul and bmm benchmarks
 tests/       correctness checks against PyTorch
+tools/       MPS probing and Metal dispatch tracing helpers
+docs/        reverse-engineering notes on Apple's matmul heuristics
 perf_benchs/ per-machine benchmark reports
 ```
 
