@@ -175,8 +175,19 @@ def matmul(a: torch.Tensor, b: torch.Tensor, *, backend: str | None = None,
            tile: tuple | None = None, swizzle_log: int | None = None,
            out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute ``a @ b`` on MPS."""
+    vector = _float.MPS_VECTOR_DTYPES
+    if vector is None:
+        vector = _float.mps_vector_dtypes()
+    if (a.dtype in vector and a.ndim == 2 == b.ndim and (a.shape[0] <= 16 or b.shape[1] <= 16)
+            and backend is tile is swizzle_log is None and a.is_mps):
+        # The product stays on MPS's matrix-vector kernels: hand it over before any other work.
+        out = torch.matmul(a, b) if out is None else torch.matmul(a, b, out=out)
+        _float._launched(True)
+        return out
     if a.ndim != 2 or b.ndim != 2:
         return _matmul_nd(a, b, out)
+    if a.dtype in _float.PROFILE and b.dtype == a.dtype:
+        return _float.matmul(a, b, backend=backend, tile=tile, swizzle_log=swizzle_log, out=out)
     if a.is_mps and (a.dtype in _complex.DTYPES or b.dtype in _complex.DTYPES):
         return _complex.matmul(a, b, out)
     if a.is_mps and a.dtype in _integer.DTYPES:

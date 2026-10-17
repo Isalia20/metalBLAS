@@ -145,6 +145,27 @@ def mpp_tensor_gemm(in_t: str, out_t: str,
 
 
 @lru_cache(maxsize=None)
+def apple_gemm(in_t: str, out_t: str, TM: int, TN: int, SM: int, SN: int, KS: int, KC: int, stage: int, pace: int,
+               rw: bool, lin: bool, sub_m: int | None, sub_n: int | None, whole_k: bool, coop: bool, trans_a: bool,
+               trans_b: bool, mn_aligned: bool, k_aligned: bool, *, splitk: bool = False, batched: bool = False,
+               epilogue: bool = False, beta_nz: bool = True, alpha_nz: bool = True, store_tg: bool = False,
+               barrier_iterations: int = 0, batch_rows: bool = False):
+    """Return the GEMM kernel and, with ``splitk``, the kernel that sums its K splits (see shaders/apple_gemm.h).
+    ``sub_m``/``sub_n`` are the tiles per uber tile, or None to read them from the dimensions."""
+    src = _build(
+        "MB_BUILD_APPLE_GEMM",
+        defines=_defines(epilogue, beta_nz, alpha_nz, BATCHED=batched, SPLITK=splitk, BATCH_ROWS=batch_rows),
+        IN_T=in_t, OUT_T=out_t, TM=TM, TN=TN, SM=SM, SN=SN, KS=KS, KC=KC, STAGE=stage, PACE=int(pace),
+        BIT=barrier_iterations,
+        RW=int(rw), LIN=int(lin), SUB_M="d.sub_m" if sub_m is None else sub_m,
+        SUB_N="d.sub_n" if sub_n is None else sub_n, WHOLE_K=int(whole_k), COOP=int(coop), TRANS_A=int(trans_a),
+        TRANS_B=int(trans_b), MN_ALIGNED=int(mn_aligned), K_ALIGNED=int(k_aligned), STORE_TG=int(store_tg),
+    )
+    lib = _compile(src)
+    return lib.apple_gemm, (lib.apple_gemm_reduce if splitk else None)
+
+
+@lru_cache(maxsize=None)
 def splitk_gemm(in_t: str, out_t: str, BM: int, BN: int, NSG: int, KCHUNK: int,
                 relaxed: bool = True):
     src = _build(

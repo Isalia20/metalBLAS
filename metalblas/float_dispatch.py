@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from . import kernels
+from . import apple_heuristics, kernels
 from .dispatch import (
     _bmm_out,
     _ceildiv,
@@ -192,6 +192,219 @@ def _splitk_partial(ref, planes, M, N):
     return buf
 
 
+# MPS's GEMM selection (apple_heuristics) for float16/bfloat16, run on an MPP kernel (shaders/apple_gemm.h)
+
+_APPLE = os.environ.get("METALBLAS_APPLE_TILES", "1") != "0"
+_LOCKSTEP_ROWS = 128   # rows of C per element of B (FLOP per byte) below which B's bandwidth bounds the product
+
+
+@cache
+def _apple_generation():
+    """MPS's generation code for this GPU when the MPP kernel can run on it, else None."""
+    dev = apple_heuristics.device() if _APPLE and kernels.has_metal4() else None
+    return dev and dev.generation
+
+
+MPS_VECTOR_DTYPES = None   # set on first use: dtypes whose products with M or N <= 16 stay on MPS here (M1-M4)
+
+
+def mps_vector_dtypes():
+    global MPS_VECTOR_DTYPES
+    gen = _apple_generation()
+    MPS_VECTOR_DTYPES = frozenset((torch.float16, torch.bfloat16) if gen and gen < 22 else ())
+    return MPS_VECTOR_DTYPES
+
+
+def _apple_route(dtype, M, N, K):
+    """Where a float16/bfloat16 product runs: "mpp" on the MPP kernel with MPS's selection (all of them on M5, the
+    GEMMs on M1-M4), "mps" on MPS's matrix-vector kernels (the rest on M1-M4), else None."""
+    gen = _apple_generation() if K > 0 and dtype in (torch.float16, torch.bfloat16) else None
+    if not gen:
+        return None
+    return "mpp" if gen >= 22 or (M > 16 and N > 16) else "mps"
+
+
+def _ceil8(x):
+    return -(-x // 8) * 8
+
+
+def _mpp_block(tm, tn):
+    """Whether MPP's matmul2d takes a tm x tn block per simdgroup: sides of 8s, one of them of 16s."""
+    return tm >= 8 and tn >= 8 and not (tm | tn) % 8 and not (tm % 16 and tn % 16)
+
+
+def _apple_stage(tm, tn, sm, sn, kc, aligned):
+    """Operand loaded into registers before the multiply (1 A, 2 B, 0 none): the one more simdgroups share. MPP
+    needs 16-byte aligned rows for both operands, and A blocks of at most 32 rows."""
+    if aligned & 3 != 3:
+        return 0
+    if (sn > sm or sm == sn == 1) and tm <= 32 and kc >= 32:
+        return 1
+    return 2 if sm >= sn and sm > 1 and tn <= 64 else 0
+
+
+def _div_magic(d):
+    """Multiplier and shift with (mulhi(n, mul) + n) >> shift == n // d for 0 <= n < 2**31."""
+    shift = (d - 1).bit_length()
+    return (2**32 * (2**shift - d)) // d + 1, shift
+
+
+def _plane_rows(batch, sA, sB, lda, ldb):
+    """Whether every batch plane of A and B starts on a whole row, so the kernel reaches it through row coordinates."""
+    return batch is not None and sA % lda == 0 and sB % ldb == 0 and batch * max(sA, sB) < 2**31
+
+
+@cache
+def _apple_plan(dtype, M, N, K, trans_a, trans_b, batch, epilogue, aligned, plane_rows=False):
+    """Kernels, launch geometry and the tail of the dimensions for MPS's choice for this GEMM. ``aligned`` has bits 0,
+    1 and 2 set when the rows of A, B and C are 16-byte aligned."""
+    dev = apple_heuristics.device()
+    whole_k = coop = grid2d = False
+    pace, barrier_it, stage = 0, 0, None
+    if dev.generation >= 22:
+        p = apple_heuristics.a18_params(M, N, K, dtype, dev.cores, batch=batch or 1, trans_a=trans_a,
+                                        trans_b=trans_b)
+        tm, tn, sm, sn = 16 * p.unroll_m, 16 * p.unroll_n, p.simd_m, p.simd_n
+        ks, splits = (1, p.k_splits) if p.global_split else (p.k_splits, 1)
+        chunk = K // splits
+        uber_m, uber_n, lin, rw = p.uber_m, p.uber_n, p.linearize, p.raster_m_bias
+        small = _ceildiv(M, tm * sm) * _ceildiv(N, tn * sn) * splits * (batch or 1) < 4 * dev.cores
+        # A single row (column) of simdgroups takes blocks no taller (wider) than the matrix; a grid below Apple's 4
+        # tiles per core takes 16-row blocks, the last shifted inside, rather than bounds-check rows ending mid-block.
+        if sm == 1 and 16 < tm and M < tm and _mpp_block(_ceil8(M), tn):
+            tm = _ceil8(M)
+        if sm == 1 and 16 <= M < tm and M % 8 and small and _mpp_block(16, tn):
+            tm = 16
+        if sn == 1 and 16 < tn and N < tn and _mpp_block(tm, _ceil8(N)):
+            tn = _ceil8(N)
+        tiles = _ceildiv(M, tm * sm) * _ceildiv(N, tn * sn) * splits * (batch or 1)
+        if p.barrier_iterations and p.barrier_inside and sm * sn * ks > 1 and tiles >= 4 * dev.cores:
+            # Apple's barrier every few steps: as is when few rows stream B and simdgroups split its rows (each fetches
+            # half of every line), else a wait for those over LEAD steps behind; below 4 tiles per core, none (latency).
+            lockstep = not p.elastic_barrier and not trans_b and sn > 1 and M <= _LOCKSTEP_ROWS
+            pace, barrier_it = 2 if lockstep else 1, p.barrier_iterations
+        kc = 64 if p.unroll_k == 4 else (32 if K > 16 else 16)
+    else:
+        bm, bn, _, sm, sn, splits, chunk = apple_heuristics.a14_params(M, N, K, dtype, dev, batch=batch or 1)
+        ks, uber_m, uber_n, lin, rw, nsg = 1, 1, 1, 1, 0, sm * sn
+        kc = 64 if K > 32 else (32 if K > 16 else 16)
+        tm, tn, stream = bm // sm, bn // sn, None
+        if bm * bn <= 32 * 32 and (not _mpp_block(tm, tn)
+                                   or chunk * (tm + tn - (bm + bn) // nsg) > 2 * (nsg - 1) * bm * bn):
+            # One simdgroup's accumulators hold the whole tile: the simdgroups split K when that saves each one more
+            # operand bytes than the fp32 partial tiles one of them then reads back.
+            sm, sn, tm, tn, ks = 1, 1, bm, bn, nsg
+        elif aligned & 3 == 3 and M <= 32 and N >= 512 and _mpp_block(min(bm, _ceil8(M)), bn // nsg):
+            # MPS's thin-M branch streams B: the simdgroups split its columns (blocks no taller than M), and the M
+            # tiles reading the same columns run together.
+            sm, sn, tm, tn, rw, stream = 1, nsg, min(bm, _ceil8(M)), bn // nsg, 1, "B"
+        elif aligned & 3 == 3 and N <= 32 and _mpp_block(bm // nsg, min(bn, _ceil8(N))):
+            # MPS's thin-N branch streams A: the simdgroups split its rows (blocks no wider than N).
+            sm, sn, tm, tn, stream = nsg, 1, bm // nsg, min(bn, _ceil8(N)), "A"
+        if stream == "B":
+            pace, barrier_it, stage = 2, 1, 0   # neighbours read halves of the same lines of B: one step at a time
+        elif stream == "A" and tm <= 16:
+            stage = 3                            # the next step of A in flight
+        else:
+            # MPP owns the K loop (as one call by the whole threadgroup when a block is no MPP block, or under 32 wide
+            # in an oblong tile with unaligned rows), on Apple's (N tiles, M tiles, splits) grid unless M goes first.
+            whole_k = True
+            coop = ks == 1 and (not _mpp_block(tm, tn) or (aligned & 3 != 3 and min(tm, tn) < 32 and bm != bn))
+            if not rw:
+                lin, uber_n, grid2d = 0, _ceildiv(N, tn * sn), True
+    last = K - (splits - 1) * chunk
+    k_iters = _ceildiv(max(chunk, last), kc * ks)
+    if pace == 1 and k_iters <= 2:
+        pace = 0   # no simdgroup gets more than the kernel's LEAD (2) steps ahead
+    bm, bn, nb = tm * sm, tn * sn, batch or 1
+    tiles_m, tiles_n = _ceildiv(M, bm), _ceildiv(N, bn)
+    in_t, _, out_t = PROFILE[dtype]
+    bnz, anz = epilogue or (True, True)
+    if M < tm:
+        aligned |= 1   # an operand thinner than the block is only read through bounds-checked views
+    if N < tn:
+        aligned |= 2
+    gemm, reduce = kernels.apple_gemm(
+        in_t, out_t, tm, tn, sm, sn, ks, kc,
+        0 if whole_k else (_apple_stage(tm, tn, sm, sn, kc, aligned) if stage is None else stage), pace, rw,
+        lin, *((None, None) if grid2d else (uber_m, uber_n)), whole_k, coop, trans_a, trans_b,
+        M % bm == 0 and N % bn == 0, chunk % kc == 0 and last % kc == 0,
+        splitk=splits > 1, batched=batch is not None, epilogue=epilogue is not None, beta_nz=bnz, alpha_nz=anz,
+        store_tg=bool(ks == splits == 1 and k_iters == 1 and aligned & 4),
+        barrier_iterations=barrier_it, batch_rows=plane_rows)
+    group = (32 * sm * sn * ks, 1, 1)
+    line = tiles_m * uber_n if rw else tiles_n * uber_m
+    if lin:
+        threads = (group[0] * tiles_m * tiles_n * splits * nb, 1, 1)
+    else:
+        threads = (group[0] * uber_m * uber_n, _ceildiv(tiles_m, uber_m) * _ceildiv(tiles_n, uber_n), splits * nb)
+    return gemm, reduce, threads, group, (uber_n, uber_m, tiles_n, tiles_m, k_iters, chunk, splits, nb,
+                                          *_div_magic(line), *_div_magic(tiles_m * tiles_n))
+
+
+def _aligned(a_bits, b_bits, c_bits):
+    """Bits 0, 1 and 2: the rows (stride and offset) of A, B and C are 16-byte aligned."""
+    return int(not a_bits & 7) | 2 * int(not b_bits & 7) | 4 * int(not c_bits & 7)
+
+
+def _device_args(packed):
+    """Packed constant arguments as a device buffer: a cached launch binds it instead of re-encoding the list."""
+    return torch.tensor(packed, dtype=torch.int64, device="mps")
+
+
+_COMMIT_EVERY = 6     # our launches per commit
+_HANDOFF_EVERY = 32   # products handed to PyTorch per commit
+_commit = [0, 0, None]   # launches and hand-offs since the last commit, and the event whose record commits
+
+
+def _launched(handoff=False):
+    """Commit the command buffer every few launches, as newer PyTorch does every 16 kernels: queued kernels run only
+    once committed, so the GPU starts while Python encodes the next ones. Products handed to PyTorch count at a longer
+    interval: they encode in about a microsecond, and each commit leaves the GPU a short gap."""
+    _commit[handoff] += 1
+    if _commit[0] >= _COMMIT_EVERY or _commit[1] >= _HANDOFF_EVERY:
+        _commit[0] = _commit[1] = 0
+        if _commit[2] is None:
+            _commit[2] = torch.mps.Event()
+        _commit[2].record()
+
+
+_APPLE_FAST: dict = {}
+
+
+def _apple_fast(dtype, M, N, K, a_bits, b_bits):
+    """Kernel, launch and dimensions for a row-major product run on the MPP kernel without a K split, else False.
+    ``a_bits``/``b_bits`` are the low bits of each operand's row stride and offset."""
+    if _apple_route(dtype, M, N, K) != "mpp":
+        return False
+    gemm, reduce, threads, group, tail = _apple_plan(dtype, M, N, K, False, False, None, None,
+                                                     _aligned(a_bits, b_bits, N))
+    return reduce is None and (gemm, threads, group, _device_args(_pk(M, N, K, K, N, N, *tail)))
+
+
+def _apple_gemm(dtype, A, B, out, M, N, K, lda, ldb, ldc, trans_a, trans_b, *,
+                batch=None, epilogue=None, batch_strides=(0, 0, 0, 0)):
+    """Compute ``out = A @ B`` the way MPS would split it. ``batch_strides`` = per-batch (sA, sB, sC, sBias);
+    ``epilogue`` is (bias, packed bias strides, beta, alpha, beta != 0, alpha != 0)."""
+    sA, sB, sC, sBias = batch_strides
+    aligned = _aligned(lda | A.storage_offset() | sA, ldb | B.storage_offset() | sB, ldc | out.storage_offset() | sC)
+    rows = _plane_rows(batch, sA, sB, lda, ldb)
+    gemm, reduce, threads, group, tail = _apple_plan(dtype, M, N, K, trans_a, trans_b, batch,
+                                                     epilogue and epilogue[4:], aligned, rows)
+    dims = _pk(M, N, K, lda, ldb, ldc, *tail)
+    epi = epilogue[:4] if epilogue else ()
+    bat = (_pk(sA // lda, sB // ldb, sC, sBias) if rows else _pk(sA, sB, sC, sBias),) if batch is not None else ()
+    if reduce is None:
+        gemm(A, B, out, dims, *epi, *bat, threads=threads, group_size=group)
+        _launched()
+        return out
+    partial = _splitk_partial(out, (batch or 1) * tail[6], M, N)
+    gemm(A, B, partial, dims, *bat, threads=threads, group_size=group)
+    reduce(partial, out, dims, *epi, *bat, threads=(N, M, batch or 1), group_size=(32, 4, 1))
+    _launched()
+    return out
+
+
 def _build_splitk_plan(dtype, M, N, K, BM, BN, NSG, G):
     in_t, _, out_t = PROFILE[dtype]
     splitk_fn, reduce_fn = kernels.splitk_gemm(in_t, out_t, BM, BN, NSG, K // G, relaxed=True)
@@ -213,9 +426,10 @@ def _is_splitk_regime(M, N, K, dtype):
             and (min(M, N) <= 256 or K >= 8 * max(M, N)))
 
 
-def _splitk_specs(K):
+def _splitk_specs(M, N, K):
+    # The kernel reads and writes whole tiles, so only tiles that divide the output are safe.
     return [(BM, BN, NSG, G)
-            for BM, BN, NSG in ((128, 32, 2), (64, 64, 2), (32, 64, 2))
+            for BM, BN, NSG in ((128, 32, 2), (64, 64, 2), (32, 64, 2)) if M % BM == 0 and N % BN == 0
             for G in (2, 4) if K % G == 0 and (K // G) % 16 == 0]
 
 
@@ -267,7 +481,7 @@ def _is_flipt_regime(M, N, K, dtype):
 
 
 def _is_sgpipe_regime(M, N, K, dtype):
-    return (dtype is not torch.float32 and N in (8, 16, 32, 64, 128)
+    return (dtype is not torch.float32 and (N == 128 or (N <= 64 and N % 8 == 0))
             and M >= 1024 and K >= 1024 and K % 128 == 0)
 
 
@@ -276,7 +490,7 @@ def _sgpipe_specs(M, N, K):
         cands = [(32, 64, 64, 2, 1), (32, 64, 64, 2, 2)]
     elif N == 64:
         cands = [(16, 64, 64, 1, 2), (32, 64, 64, 1, 2)]
-    else:   # N in (8, 16, 32)
+    else:   # other multiples of 8 up to 56
         cands = [(16, N, 64, 1, 2), (32, N, 64, 1, 2),
                  (16, N, 64, 1, 4), (32, N, 64, 1, 1)]
     return [spec + (gk,) for spec in cands if M % (spec[4] * spec[0]) == 0
@@ -487,7 +701,7 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
     if cached is None:
         cands, margin = _mpp_tensor_tile_candidates(M, N, K, dtype)
         tune = _AUTOTUNE and a is not None
-        sk_specs = _splitk_specs(K) if tune and _is_splitk_regime(M, N, K, dtype) else ()
+        sk_specs = _splitk_specs(M, N, K) if tune and _is_splitk_regime(M, N, K, dtype) else ()
         conv_specs = _conv_specs(M, N) if tune and _is_conv_regime(M, N, K, dtype) else ()
         flip_specs = _flipt_specs(M, N, K, a) if tune and _is_flipt_regime(M, N, K, dtype) else ()
         sgp_specs = _sgpipe_specs(M, N, K) if tune and _is_sgpipe_regime(M, N, K, dtype) else ()
@@ -503,6 +717,17 @@ def _gemm_plan(dtype, M, N, K, a=None, b=None):
             plan = _build_mppt_plan(dtype, M, N, *tile)
         cached = _GEMM_PLAN[key] = plan, tile
     return cached
+
+
+def _run_gemm_plan(dtype, a, b, o, M, N, K):
+    """Run the packed plan for ``o = a @ b`` on row-major operands and output."""
+    plan, _ = _gemm_plan(dtype, M, N, K, a, b)
+    if type(plan) is tuple:
+        fn, thr, grp = plan
+        fn(a, b, o, _pk(M, N, K, K, N, N), threads=thr, group_size=grp)
+    else:
+        plan(a, b, o)
+    return o
 
 
 _GEMM_TRANS_PLAN: dict = {}
@@ -543,7 +768,7 @@ def _autotune_trans(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
 
 
 def _gemm_trans_plan(dtype, M, N, K, a, b, trans_a, trans_b, lda, ldb):
-    key = (dtype, M, N, K, trans_a, trans_b)
+    key = (dtype, M, N, K, trans_a, trans_b, lda, ldb)
     cached = _GEMM_TRANS_PLAN.get(key)
     if cached is None:
         if _AUTOTUNE:
@@ -744,12 +969,28 @@ def _classic_plan(backend, dtype, M, N, K, tile, trans_a, trans_b, swizzle,
 
 def matmul(a, b, *, backend=None, tile=None, swizzle_log=None, out=None):
     """Compute a 2-D floating-point matrix product."""
-    fast_path = backend is None and out is None and swizzle_log is None and a.is_mps
     M, K = a.shape
     K2, N = b.shape
     dtype = a.dtype
+    if ((M <= 16 or N <= 16) and backend in (None, "auto") and tile is None and swizzle_log is None
+            and _apple_route(dtype, M, N, K) == "mps" and a.is_mps):
+        out = torch.matmul(a, b) if out is None else torch.matmul(a, b, out=out)
+        _launched(True)
+        return out
+    fast_path = backend is None and out is None and swizzle_log is None and a.is_mps
     if fast_path and dtype in PROFILE and K == K2:
         packed = a.is_contiguous() and b.is_contiguous()
+        if packed:
+            key = (dtype, M, N, K, (K | a.storage_offset()) & 7, (N | b.storage_offset()) & 7)
+            fast = _APPLE_FAST.get(key)
+            if fast is None:
+                fast = _APPLE_FAST[key] = _apple_fast(*key)
+            if fast:
+                gemm, threads, group, dims = fast
+                o = _pooled_out(a, M, N)
+                gemm(a, b, o, dims, threads=threads, group_size=group)
+                _launched()
+                return o
         if packed and M == 1 and N >= 16:
             gt, thr, grp, dims = _gemv_plan(dtype, N, K)
             o = _pooled_out(b, 1, N)
@@ -762,18 +1003,13 @@ def matmul(a, b, *, backend=None, tile=None, swizzle_log=None, out=None):
             fn(a, b.view(-1), o.view(-1), [M | k_hi, k_lda],
                threads=(grp[0] * n_groups, 1, 1), group_size=grp)
             return o
+        if packed and _apple_route(dtype, M, N, K) == "mpp":
+            return _apple_gemm(dtype, a, b, _pooled_out(a, M, N), M, N, K, K, N, N, False, False)
+        tuned = K >= 64 and (N >= 32 or _is_sgpipe_regime(M, N, K, dtype))
         m4 = kernels.has_metal4()
-        if (m4 and packed and M >= 2 and K >= 64
-                and (N >= 32 or _is_sgpipe_regime(M, N, K, dtype))):
-            plan, _ = _gemm_plan(dtype, M, N, K, a, b)
-            o = _pooled_out(a, M, N)
-            if type(plan) is tuple:
-                fn, thr, grp = plan
-                fn(a, b, o, _pk(M, N, K, K, N, N), threads=thr, group_size=grp)
-            else:
-                plan(a, b, o)
-            return o
-        if m4:
+        if m4 and packed and M >= 2 and tuned:
+            return _run_gemm_plan(dtype, a, b, _pooled_out(a, M, N), M, N, K)
+        if m4 and not packed and not _apple_route(dtype, M, N, K):
             lay = _thin_trans_layout(a, b, M, N, K, dtype)
             if lay is not None:
                 trans_a, trans_b, lda, ldb = lay
@@ -800,6 +1036,25 @@ def matmul(a, b, *, backend=None, tile=None, swizzle_log=None, out=None):
     lda_, ldb_, ldc_ = int(lda), int(ldb), int(ldc)
 
     backend = backend or "auto"
+    if backend == "auto" and _apple_route(dtype, M_, N_, K_) == "mpp":
+        backend = "apple"
+
+    if backend == "auto" and not trans_a and lda_ == K_ and trans_b and kernels.has_metal4():
+        # Thin products with a transposed B run on the packed thin-N plans: a thin N on a row-major copy of the
+        # small B, a thin M as C^T = B^T @ A^T with A^T copied to row-major and padded to a multiple of 8 columns.
+        if ldc_ == N_ and _is_sgpipe_regime(M_, N_, K_, dtype):
+            return _run_gemm_plan(dtype, A_view, B_view.contiguous(), out, M_, N_, K_)
+        Mp = _ceildiv(M_, 8) * 8
+        if 16 < M_ <= 64 and ldb_ == K_ and _is_sgpipe_regime(N_, Mp, K_, dtype):
+            at = A_view.new_zeros(K_, Mp) if Mp > M_ else A_view.new_empty(K_, Mp)
+            at[:, :M_].copy_(A_view.t())
+            ct = _run_gemm_plan(dtype, B_view.t(), at, A_view.new_empty(N_, Mp), N_, Mp, K_)
+            return out.copy_(ct[:, :M_].t())
+
+    if backend == "apple":
+        if dtype not in (torch.float16, torch.bfloat16) or apple_heuristics.device() is None:
+            raise ValueError("backend='apple' needs float16 or bfloat16 operands on an M-series GPU")
+        return _apple_gemm(dtype, A_view, B_view, out, M_, N_, K_, lda_, ldb_, ldc_, trans_a, trans_b)
 
     if backend == "auto":
         is_lp = dtype != torch.float32
@@ -897,17 +1152,25 @@ def _run_gemv_nt(dtype, matrix, x, out, rows, k, ld, epilogue=None):
 def addmm(mat1, mat2, out, epilogue):
     x, br, bc, beta, alpha, bnz, anz = epilogue
     dtype = mat1.dtype
+    route = _apple_route(dtype, mat1.shape[0], mat2.shape[1], mat1.shape[1])
+    if route == "mps":
+        out = torch.addmm(x, mat1, mat2, beta=beta, alpha=alpha, out=out)
+        _launched(True)
+        return out
     A_view, B_view, M, N, K, lda, ldb, trans_a, trans_b = _resolve_inputs(mat1, mat2)
     if out is None:
         out = _pooled_out(mat1, M, N)
     ldc = out.stride(0)
+    M_, N_, K_, lda_, ldb_, ldc_ = int(M), int(N), int(K), int(lda), int(ldb), int(ldc)
+    if route == "mpp":
+        return _apple_gemm(dtype, A_view, B_view, out, M_, N_, K_, lda_, ldb_, ldc_, trans_a, trans_b,
+                           epilogue=(x, _pk(br, bc), float(beta), float(alpha), bnz, anz))
 
     if (M == 1 and N >= 16) or (N == 1 and M >= 16):
         return _dispatch_gemv(
             _run_gemv_t, _run_gemv_nt, A_view, B_view, M, N, K, lda, ldb,
             trans_a, trans_b, dtype, out, (x, br, bc, beta, alpha, bnz, anz))
 
-    M_, N_, K_, lda_, ldb_, ldc_ = int(M), int(N), int(K), int(lda), int(ldb), int(ldc)
     dims6 = _pk(M_, N_, K_, lda_, ldb_, ldc_)
     bstride = _pk(br, bc)
 
@@ -1020,7 +1283,8 @@ def _autotune_bmm(dtype, a, b, Bb, M, N, K, lda, ldb, trans_a, trans_b, sA, sB, 
 
 
 def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA=0, sB=0):
-    key = (dtype, M, N, K, trans_a, trans_b)
+    offsets = 0 if a is None else (int(a.storage_offset()) | int(b.storage_offset())) & 7
+    key = (dtype, M, N, K, trans_a, trans_b, lda, ldb, sA, sB, offsets)
     plan = _BMM_PLAN.get(key)
     if plan is None:
         cands = _bmm_candidates(M, N, K, dtype)
@@ -1046,12 +1310,65 @@ def _bmm_plan(dtype, M, N, K, lda, ldb, trans_a, trans_b, Bb, a=None, b=None, sA
     return plan
 
 
+_APPLE_BMM_FAST: dict = {}
+
+
+def _apple_bmm_fast(a, b):
+    """Kernel, launch and packed arguments for a batched product run as-is on MPS's choice, True for one left to
+    MPS, else False."""
+    route = _apple_route(a.dtype, a.shape[1], b.shape[2], a.shape[2])
+    if route != "mpp":
+        return route == "mps"
+    A, B, M, N, K, lda, ldb, ta, tb, sA, sB = _resolve_bmm_inputs(a, b)
+    if A is not a or B is not b:
+        return False
+    Bb = a.shape[0]
+    aligned = _aligned(lda | sA | a.storage_offset(), ldb | sB | b.storage_offset(), N)
+    rows = _plane_rows(Bb, sA, sB, lda, ldb)
+    gemm, reduce, threads, group, tail = _apple_plan(a.dtype, M, N, K, ta, tb, Bb, None, aligned, rows)
+    return reduce is None and (gemm, threads, group, _device_args(_pk(M, N, K, lda, ldb, N, *tail)),
+                               _device_args(_pk(sA // lda, sB // ldb, M * N, 0) if rows else _pk(sA, sB, M * N, 0)),
+                               M, N)
+
+
 def bmm(a, b, out=None, epilogue=None):
     """Launch the selected batched real kernel, optionally with a fused epilogue."""
     dtype, Bb = a.dtype, a.shape[0]
+    if out is None and epilogue is None:
+        key = (dtype, a.shape, b.shape, a.stride(), b.stride(), (a.storage_offset() | b.storage_offset()) & 7)
+        fast = _APPLE_BMM_FAST.get(key)
+        if fast is None:
+            fast = _APPLE_BMM_FAST[key] = _apple_bmm_fast(a, b)
+        if fast is True:
+            o = torch.bmm(a, b)
+            _launched(True)
+            return o
+        if fast:
+            gemm, threads, group, dims, strides, M, N = fast
+            o = a.new_empty(Bb, M, N)
+            gemm(a, b, o, dims, strides, threads=threads, group_size=group)
+            _launched()
+            return o
+    route = _apple_route(dtype, a.shape[1], b.shape[2], a.shape[2])
+    if route == "mps":
+        if epilogue is None:
+            o = torch.bmm(a, b, out=out)
+        else:
+            bias, br, bc, sBias, beta, alpha, bnz, anz = epilogue
+            o = torch.baddbmm(bias, a, b, beta=beta, alpha=alpha, out=out)
+        _launched(True)
+        return o
     A, B, M, N, K, lda, ldb, ta, tb, sA, sB = _resolve_bmm_inputs(a, b)
     o, copy_back = _bmm_out(a, out, Bb, M, N, dtype)
     ldc, sC = int(o.stride(1)), int(o.stride(0))
+    if route == "mpp":
+        epi, sBias = None, 0
+        if epilogue is not None:
+            bias, br, bc, sBias, beta, alpha, bnz, anz = epilogue
+            epi = (bias, _pk(br, bc), float(beta), float(alpha), bnz, anz)
+        _apple_gemm(dtype, A, B, o, M, N, K, lda, ldb, ldc, ta, tb, batch=Bb, epilogue=epi,
+                    batch_strides=(sA, sB, sC, sBias))
+        return out.copy_(o) if copy_back else o
     plan = _bmm_plan(dtype, M, N, K, lda, ldb, ta, tb, Bb, A, B, sA, sB)
     fused = epilogue is not None
     if fused:

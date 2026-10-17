@@ -5,6 +5,7 @@
 #include "simd_gemm.h"
 #include "mpp_gemm.h"
 #include "mpp_tensor.h"
+#include "apple_gemm.h"
 #include "splitk.h"
 #include "conv1x1.h"
 #include "mpp_sgpipe.h"
